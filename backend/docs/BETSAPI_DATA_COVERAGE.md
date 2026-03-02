@@ -180,19 +180,19 @@
 
 ```bash
 # Запустить загрузку архива (с 1 сентября 2016 по сегодня, пауза 7 сек между запросами)
-curl -X POST http://localhost:8000/api/v1/matches/load-history \
+curl -X POST http://localhost:11001/api/v1/matches/load-history \
   -H "Content-Type: application/json" \
   -d '{"day_from": "20180428", "day_to": null, "delay_seconds": 4}'
 
 # Ответ: {"task_id": "abc-123-...", "message": "Задача загрузки архива запущена..."}
 
 # Загрузить только за указанный период
-curl -X POST http://localhost:8000/api/v1/matches/load-history \
+curl -X POST http://localhost:11001/api/v1/matches/load-history \
   -H "Content-Type: application/json" \
   -d '{"day_from": "20250101", "day_to": "20250103", "delay_seconds": 7}'
 
 # Узнать, за какие дни всё уже обработано, за какие — ещё нет
-curl "http://localhost:8000/api/v1/matches/load-history/status?day_from=20160901&day_to=20251231"
+curl "http://localhost:11001/api/v1/matches/load-history/status?day_from=20160901&day_to=20251231"
 
 # Ответ: {"day_from": "20160901", "day_to": "20251231", "completed": ["20160901", "20160902", ...], "not_completed": ["20160905", ...]}
 ```

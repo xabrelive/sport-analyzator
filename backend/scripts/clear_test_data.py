@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("DATABASE_URL", "postgresql://sport:sport@localhost:5432/sport_analyzator")
+os.environ.setdefault("DATABASE_URL", "postgresql://sport:sport@localhost:11002/sport_analyzator")
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker

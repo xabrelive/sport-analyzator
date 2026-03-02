@@ -1,7 +1,7 @@
 // В браузере — относительный путь (Next.js rewrites проксирует на backend). На сервере — BACKEND_URL или localhost.
 function getApiBase(): string {
   if (typeof window !== "undefined") return "";
-  return process.env.BACKEND_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  return process.env.BACKEND_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:11001";
 }
 const API_BASE = getApiBase();
 
@@ -10,7 +10,7 @@ function apiUrl(path: string): string {
   const base = getApiBase();
   return base ? `${base.replace(/\/$/, "")}/api/v1/${path}` : `/api/v1/${path}`;
 }
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:11001";
 
 const AUTH_TOKEN_KEY = "sport_analyzator_token";
 
@@ -104,7 +104,7 @@ export async function fetchMatches(
   const url =
     typeof window !== "undefined"
       ? pathWithQuery
-      : new URL(pathWithQuery, "http://localhost:3000").toString();
+      : new URL(pathWithQuery, "http://localhost:11000").toString();
   const res = await fetch(url, { next: { revalidate: 0 } });
   if (!res.ok) throw new Error(res.statusText);
   return res.json();
@@ -125,7 +125,7 @@ export async function fetchFinishedMatches(params?: {
 }): Promise<FinishedMatchesResponse> {
   const url = new URL(
     apiUrl("matches/finished"),
-    typeof window !== "undefined" ? window.location.origin : "http://localhost:3000"
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
   );
   if (params) {
     Object.entries(params).forEach(([k, v]) => {
@@ -138,7 +138,10 @@ export async function fetchFinishedMatches(params?: {
 }
 
 export async function fetchMatchesByLeague(leagueId: string, status?: string): Promise<Match[]> {
-  const url = new URL(apiUrl("matches"), typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+  const url = new URL(
+    apiUrl("matches"),
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
+  );
   url.searchParams.set("league_id", leagueId);
   if (status) url.searchParams.set("status", status);
   const res = await fetch(url.toString(), { next: { revalidate: 0 } });
@@ -203,7 +206,10 @@ export async function fetchLiveRecommendations(matchId: string): Promise<LiveRec
 }
 
 export async function fetchLeagues(params?: Record<string, string | number>): Promise<League[]> {
-  const url = new URL(apiUrl("leagues"), typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+  const url = new URL(
+    apiUrl("leagues"),
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
+  );
   if (params) {
     Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, String(v)));
   }
@@ -236,7 +242,10 @@ export async function fetchPlayer(id: string): Promise<Player> {
 }
 
 export async function fetchPlayers(params?: { search?: string; limit?: number; offset?: number }): Promise<Player[]> {
-  const url = new URL(apiUrl("players"), typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+  const url = new URL(
+    apiUrl("players"),
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
+  );
   if (params) {
     Object.entries(params).forEach(([k, v]) => {
       if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
@@ -257,7 +266,10 @@ export async function fetchPlayerMatches(
   id: string,
   params?: { status?: string; limit?: number; offset?: number }
 ): Promise<Match[]> {
-  const url = new URL(apiUrl(`players/${id}/matches`), typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+  const url = new URL(
+    apiUrl(`players/${id}/matches`),
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
+  );
   if (params) {
     Object.entries(params).forEach(([k, v]) => {
       if (v !== undefined) url.searchParams.set(k, String(v));
@@ -273,13 +285,13 @@ export function getWsUrl(): string {
   const base =
     typeof window !== "undefined"
       ? (envWs ? envWs.replace(/^http/, "ws") : "")
-      : (envWs ? envWs.replace(/^http/, "ws") : "ws://localhost:8000");
+      : (envWs ? envWs.replace(/^http/, "ws") : "ws://localhost:11001");
   if (base) {
     return base.endsWith("/ws") ? base : `${base.replace(/\/$/, "")}/ws`;
   }
   return typeof window !== "undefined"
     ? `${(window as unknown as { location: { origin: string } }).location.origin.replace(/^http/, "ws")}/ws`
-    : "ws://localhost:8000/ws";
+    : "ws://localhost:11001/ws";
 }
 
 export async function login(email: string, password: string): Promise<{ access_token: string }> {
@@ -509,7 +521,7 @@ export async function fetchMeAccess(): Promise<AccessSummaryResponse> {
   const url =
     typeof window !== "undefined"
       ? apiUrl("me/access")
-      : new URL(apiUrl("me/access"), "http://localhost:3000").toString();
+      : new URL(apiUrl("me/access"), "http://localhost:11000").toString();
   const res = await fetch(url, { headers: { ...authHeaders() }, cache: "no-store" });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -522,7 +534,7 @@ export async function fetchMySubscriptions(): Promise<SubscriptionOut[]> {
   const url =
     typeof window !== "undefined"
       ? apiUrl("me/subscriptions")
-      : new URL(apiUrl("me/subscriptions"), "http://localhost:3000").toString();
+      : new URL(apiUrl("me/subscriptions"), "http://localhost:11000").toString();
   const res = await fetch(url, { headers: { ...authHeaders() }, cache: "no-store" });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -546,7 +558,7 @@ export async function grantSubscription(body: GrantSubscriptionBody): Promise<Su
 
 export async function fetchSports(): Promise<SportOption[]> {
   const res = await fetch(
-    typeof window !== "undefined" ? apiUrl("sports") : new URL(apiUrl("sports"), "http://localhost:3000").toString(),
+    typeof window !== "undefined" ? apiUrl("sports") : new URL(apiUrl("sports"), "http://localhost:11000").toString(),
     { next: { revalidate: 60 } }
   );
   if (!res.ok) throw new Error(res.statusText);

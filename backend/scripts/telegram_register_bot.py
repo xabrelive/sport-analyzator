@@ -2,7 +2,7 @@
 """
 Telegram bot for PingWin registration.
 User sends /start -> bot asks date of birth (YYYY-MM-DD) -> optional email -> calls backend API.
-Run: TELEGRAM_BOT_TOKEN=... BACKEND_URL=http://localhost:8000 python -m scripts.telegram_register_bot
+Run: TELEGRAM_BOT_TOKEN=... BACKEND_URL=http://localhost:11001 python -m scripts.telegram_register_bot
 """
 from datetime import datetime
 import logging
@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/")
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:11001").rstrip("/")
 
 DOB, EMAIL = 1, 2
 

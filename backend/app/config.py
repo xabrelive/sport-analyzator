@@ -10,17 +10,17 @@ class Settings(BaseSettings):
     )
 
     # Database
-    database_url: str = "postgresql://sport:sport@localhost:5432/sport_analyzator"
+    database_url: str = "postgresql://sport:sport@localhost:11002/sport_analyzator"
     database_url_async: str | None = None
 
     # Redis
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://localhost:11003/0"
 
     # Auth
     secret_key: str = "change-me"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24 * 7
-    frontend_url: str = "http://localhost:3000"  # for email verification link
+    frontend_url: str = "http://localhost:11000"  # for email verification link
 
     # API
     api_v1_prefix: str = "/api/v1"

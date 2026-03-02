@@ -14,7 +14,7 @@ import asyncio
 import os
 import sys
 
-os.environ.setdefault("DATABASE_URL", "postgresql://sport:sport@localhost:5432/sport_analyzator")
+os.environ.setdefault("DATABASE_URL", "postgresql://sport:sport@localhost:11002/sport_analyzator")
 
 import httpx
 

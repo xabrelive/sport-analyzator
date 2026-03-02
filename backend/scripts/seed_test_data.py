@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-os.environ.setdefault("DATABASE_URL", "postgresql://sport:sport@localhost:5432/sport_analyzator")
+os.environ.setdefault("DATABASE_URL", "postgresql://sport:sport@localhost:11002/sport_analyzator")
 
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
