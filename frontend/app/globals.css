@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0f172a;
+  --surface: #1e293b;
+  --brand: #14b8a6;
+  --brand-light: #2dd4bf;
+}
+
+body {
+  font-family: var(--font-sans), system-ui, -apple-system, sans-serif;
+  background-color: var(--bg);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+.stagger > * {
+  opacity: 0;
+  animation: fadeInUp 0.6s ease-out forwards;
+}
+.stagger > *:nth-child(1) { animation-delay: 0.05s; }
+.stagger > *:nth-child(2) { animation-delay: 0.1s; }
+.stagger > *:nth-child(3) { animation-delay: 0.15s; }
+.stagger > *:nth-child(4) { animation-delay: 0.2s; }
+.stagger > *:nth-child(5) { animation-delay: 0.25s; }
+.stagger > *:nth-child(6) { animation-delay: 0.3s; }
+.stagger > *:nth-child(7) { animation-delay: 0.35s; }
+.stagger > *:nth-child(8) { animation-delay: 0.4s; }
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.gradient-text {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-teal-400 via-teal-300 to-teal-500;
+}
