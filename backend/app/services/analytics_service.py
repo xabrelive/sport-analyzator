@@ -1,11 +1,16 @@
-"""Match analytics: recommendations (≥70%), strengths/weaknesses per player, justification."""
+"""Match analytics: recommendations, strengths/weaknesses per player, justification."""
 from typing import NamedTuple
 
 from app.schemas.player import PlayerStats
 
 
-CONFIDENCE_THRESHOLD = 0.70
-MIN_MATCHES_FOR_RECOMMENDATION = 2
+# Пороги для сохранённых рекомендаций (линия/лайв). При 85% создавалось 0 записей — ослаблено до рабочих.
+CONFIDENCE_THRESHOLD = 0.72
+CONFIDENCE_THRESHOLD_MATCH = 0.75
+MIN_MATCHES_FOR_RECOMMENDATION = 3
+MIN_MATCHES_FOR_MATCH_RECOMMENDATION = 6
+# Минимальный отрыв лучшего исхода от второго по тому же рынку — избегаем 52/48.
+MIN_CONFIDENCE_MARGIN = 0.05
 
 
 class MatchRecommendation(NamedTuple):
@@ -114,38 +119,45 @@ def build_match_recommendations(
     p_home_set2: float,
     p_away_set2: float,
     threshold: float = CONFIDENCE_THRESHOLD,
+    threshold_match: float = CONFIDENCE_THRESHOLD_MATCH,
 ) -> list[MatchRecommendation]:
-    """Build list of recommendations only when confidence >= threshold."""
+    """Рекомендации только при уверенности >= threshold (85%)."""
     recs: list[MatchRecommendation] = []
 
-    if p_home_win >= threshold:
+    if p_home_win >= threshold_match and (p_home_win - p_away_win) >= MIN_CONFIDENCE_MARGIN:
         recs.append(MatchRecommendation(f"П1 победа в матче ({p_home_win * 100:.0f}%)", p_home_win * 100))
-    if p_away_win >= threshold:
+    if p_away_win >= threshold_match and (p_away_win - p_home_win) >= MIN_CONFIDENCE_MARGIN:
         recs.append(MatchRecommendation(f"П2 победа в матче ({p_away_win * 100:.0f}%)", p_away_win * 100))
 
-    if p_home_set1 >= threshold:
+    if p_home_set1 >= threshold and (p_home_set1 - p_away_set1) >= MIN_CONFIDENCE_MARGIN:
         recs.append(MatchRecommendation(f"П1 выиграет 1-й сет ({p_home_set1 * 100:.0f}%)", p_home_set1 * 100))
-    if p_away_set1 >= threshold:
+    if p_away_set1 >= threshold and (p_away_set1 - p_home_set1) >= MIN_CONFIDENCE_MARGIN:
         recs.append(MatchRecommendation(f"П2 выиграет 1-й сет ({p_away_set1 * 100:.0f}%)", p_away_set1 * 100))
 
-    if p_home_set2 >= threshold:
+    if p_home_set2 >= threshold and (p_home_set2 - p_away_set2) >= MIN_CONFIDENCE_MARGIN:
         recs.append(MatchRecommendation(f"П1 выиграет 2-й сет ({p_home_set2 * 100:.0f}%)", p_home_set2 * 100))
-    if p_away_set2 >= threshold:
+    if p_away_set2 >= threshold and (p_away_set2 - p_home_set2) >= MIN_CONFIDENCE_MARGIN:
         recs.append(MatchRecommendation(f"П2 выиграет 2-й сет ({p_away_set2 * 100:.0f}%)", p_away_set2 * 100))
 
     return recs
+
+
+def _is_match_win_rec(text: str) -> bool:
+    return "победа в матче" in text
 
 
 def first_recommendation_text(
     stats_home: PlayerStats | None,
     stats_away: PlayerStats | None,
     min_matches: int = MIN_MATCHES_FOR_RECOMMENDATION,
+    threshold: float | None = None,
+    threshold_match: float | None = None,
+    min_matches_for_match: int | None = None,
 ) -> str | None:
     """
-    Возвращает текст приоритетной рекомендации по матчу только если у обоих игроков
-    достаточно истории (минимум min_matches завершённых матчей). Иначе None.
-    Выбирается исход, в котором мы наиболее уверены (максимальная вероятность) —
-    либо победа в матче, либо победа в конкретном сете — чтобы доля угаданных была выше.
+    Возвращает текст приоритетной рекомендации по матчу только при высокой уверенности (цель ≥85% угаданных).
+    Требования: минимум min_matches у обоих; для победы в матче — min_matches_for_match или MIN_MATCHES_FOR_MATCH_RECOMMENDATION.
+    Пороги threshold/threshold_match — при None используются константы (85%).
     """
     n_home = (stats_home.total_matches or 0) if stats_home else 0
     n_away = (stats_away.total_matches or 0) if stats_away else 0
@@ -154,14 +166,61 @@ def first_recommendation_text(
     p_home_win, p_away_win, p_home_set1, p_away_set1, p_home_set2, p_away_set2 = pre_match_probs(
         stats_home, stats_away
     )
+    thr = threshold if threshold is not None else CONFIDENCE_THRESHOLD
+    thr_m = threshold_match if threshold_match is not None else CONFIDENCE_THRESHOLD_MATCH
     recs = build_match_recommendations(
-        p_home_win, p_away_win, p_home_set1, p_away_set1, p_home_set2, p_away_set2
+        p_home_win, p_away_win, p_home_set1, p_away_set1, p_home_set2, p_away_set2,
+        threshold=thr, threshold_match=thr_m,
     )
     if not recs:
         return None
-    # Наиболее уверенный исход — матч или сет — тот, у которого максимальная вероятность
+
+    # Рекомендацию на победу в матче учитываем только при достаточной истории
+    min_match_rec = min_matches_for_match if min_matches_for_match is not None else MIN_MATCHES_FOR_MATCH_RECOMMENDATION
+    if n_home < min_match_rec or n_away < min_match_rec:
+        recs = [r for r in recs if not _is_match_win_rec(r.text)]
+    if not recs:
+        return None
+
+    # Выбираем исход с максимальной уверенностью — без предпочтения сет/матч
     best = max(recs, key=lambda r: r.confidence_pct)
     return best.text
+
+
+def first_recommendation_text_and_confidence(
+    stats_home: PlayerStats | None,
+    stats_away: PlayerStats | None,
+    min_matches: int = MIN_MATCHES_FOR_RECOMMENDATION,
+    threshold: float | None = None,
+    threshold_match: float | None = None,
+    min_matches_for_match: int | None = None,
+) -> tuple[str | None, float]:
+    """
+    То же, что first_recommendation_text, но возвращает (текст, confidence_pct).
+    confidence_pct в диапазоне 0–100; 0 если рекомендации нет.
+    """
+    n_home = (stats_home.total_matches or 0) if stats_home else 0
+    n_away = (stats_away.total_matches or 0) if stats_away else 0
+    if n_home < min_matches or n_away < min_matches:
+        return None, 0.0
+    p_home_win, p_away_win, p_home_set1, p_away_set1, p_home_set2, p_away_set2 = pre_match_probs(
+        stats_home, stats_away
+    )
+    thr = threshold if threshold is not None else CONFIDENCE_THRESHOLD
+    thr_m = threshold_match if threshold_match is not None else CONFIDENCE_THRESHOLD_MATCH
+    recs = build_match_recommendations(
+        p_home_win, p_away_win, p_home_set1, p_away_set1, p_home_set2, p_away_set2,
+        threshold=thr, threshold_match=thr_m,
+    )
+    if not recs:
+        return None, 0.0
+    min_match_rec = min_matches_for_match if min_matches_for_match is not None else MIN_MATCHES_FOR_MATCH_RECOMMENDATION
+    if n_home < min_match_rec or n_away < min_match_rec:
+        recs = [r for r in recs if not _is_match_win_rec(r.text)]
+    if not recs:
+        return None, 0.0
+    best = max(recs, key=lambda r: r.confidence_pct)
+    return best.text, best.confidence_pct
 
 
 def build_justification(

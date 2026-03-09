@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { Match, OddsSnapshot } from "@/lib/api";
-import { setsTotal, formatSetScoresTT, formatTimeOnly } from "@/lib/format";
+import { setsTotal, formatSetScoresTT, formatTimeOnly, formatDateTimeWithYear } from "@/lib/format";
 
 const WINNER_MARKETS = ["winner", "win", "92_1"];
 
@@ -68,6 +68,7 @@ export function LiveMatchRow({ match, recommendation, showAnalyticsBlur }: LiveM
   const winnerName = isCancelled ? null : (match.result?.winner_name ?? null);
 
   const startTimeStr = formatTimeOnly(match.started_at ?? match.start_time);
+  const startDateTimeFull = formatDateTimeWithYear(match.start_time);
 
   const showOdds = !isFinished && !isCancelled;
   const oddsHomeDisplay = showOdds ? oddsHome : "–";
@@ -117,6 +118,9 @@ export function LiveMatchRow({ match, recommendation, showAnalyticsBlur }: LiveM
             </span>
           )}
         </div>
+      </td>
+      <td className="py-2.5 pr-3 text-slate-400 text-xs whitespace-nowrap">
+        {startDateTimeFull}
       </td>
       <td className="py-2.5 pr-3 min-w-0">
         {homeHref ? (
@@ -182,7 +186,7 @@ export function LiveMatchRow({ match, recommendation, showAnalyticsBlur }: LiveM
       </td>
       <td className="py-2.5 pl-2 max-w-[220px]">
         {showAnalyticsBlur ? (
-          <Link href={`/match/${match.id}`} onClick={(e) => e.stopPropagation()} className="text-teal-400 hover:text-teal-300 text-xs">
+          <Link href={`/match/${match.id}`} prefetch={false} onClick={(e) => e.stopPropagation()} className="text-teal-400 hover:text-teal-300 text-xs">
             <span className="text-transparent select-none blur-sm bg-white/20 rounded">Подробнее</span>
           </Link>
         ) : (
@@ -192,6 +196,7 @@ export function LiveMatchRow({ match, recommendation, showAnalyticsBlur }: LiveM
             </span>
             <Link
               href={`/match/${match.id}`}
+              prefetch={false}
               className="inline-flex items-center gap-1 text-xs font-medium text-teal-400 hover:text-teal-300 w-fit"
               onClick={(e) => e.stopPropagation()}
             >

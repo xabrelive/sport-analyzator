@@ -48,23 +48,56 @@ async def list_signals(
 
 @router.get("/stats", response_model=SignalStats)
 async def get_signals_stats(
-    days: int = Query(7, ge=1, le=90),
+    days: int | None = Query(7, ge=1, le=90),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
     session: AsyncSession = Depends(get_async_session),
 ):
-    """Статистика: всего дано, выиграло, проиграло; за последние N дней — разбивка по дням."""
+    """
+    Статистика сигналов.
+
+    Поддерживает 2 режима:
+    - rolling window: ?days=N  -> от текущего момента минус N дней до сейчас
+    - fixed dates: ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD (включительно)
+    """
+    now = datetime.now(timezone.utc)
+    since: datetime | None = None
+    until: datetime | None = None
+    if date_from is not None or date_to is not None:
+        if date_from is None:
+            date_from = date_to
+        if date_to is None:
+            date_to = date_from
+        assert date_from is not None and date_to is not None
+        if date_from > date_to:
+            date_from, date_to = date_to, date_from
+        since = datetime.combine(date_from, time.min, tzinfo=timezone.utc)
+        until = datetime.combine(date_to, time.max, tzinfo=timezone.utc)
+    else:
+        window_days = days or 7
+        since = now - timedelta(days=window_days)
+        until = now
+
+    filters = []
+    if since is not None:
+        filters.append(Signal.created_at >= since)
+    if until is not None:
+        filters.append(Signal.created_at <= until)
+
     q_totals = select(
         func.count(Signal.id).label("total"),
         func.count(Signal.id).filter(Signal.outcome == SignalOutcome.WON).label("won"),
         func.count(Signal.id).filter(Signal.outcome == SignalOutcome.LOST).label("lost"),
         func.count(Signal.id).filter(Signal.outcome == SignalOutcome.PENDING).label("pending"),
     )
+    if filters:
+        q_totals = q_totals.where(*filters)
     row = (await session.execute(q_totals)).one()
     total = row.total or 0
     won = row.won or 0
     lost = row.lost or 0
     pending = row.pending or 0
 
-    since = datetime.now(timezone.utc) - timedelta(days=days)
     q_day = (
         select(
             func.date(Signal.created_at).label("d"),
@@ -73,7 +106,7 @@ async def get_signals_stats(
             func.count(Signal.id).filter(Signal.outcome == SignalOutcome.LOST).label("lost"),
             func.count(Signal.id).filter(Signal.outcome == SignalOutcome.PENDING).label("pending"),
         )
-        .where(Signal.created_at >= since)
+        .where(*filters)
         .group_by(func.date(Signal.created_at))
         .order_by(func.date(Signal.created_at).desc())
     )

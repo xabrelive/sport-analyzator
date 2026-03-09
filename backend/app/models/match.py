@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -15,6 +15,7 @@ def _utc_now() -> datetime:
 
 
 class MatchStatus(str, Enum):
+    PENDING_ODDS = "pending_odds"
     SCHEDULED = "scheduled"
     LIVE = "live"
     FINISHED = "finished"
@@ -24,16 +25,16 @@ class MatchStatus(str, Enum):
 
 class Match(Base):
     __tablename__ = "matches"
+    __table_args__ = (UniqueConstraint("provider", "provider_match_id", name="uq_matches_provider_provider_match_id"),)
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
     )
-    provider_match_id: Mapped[str] = mapped_column(
-        String(100), nullable=False, unique=True, index=True
-    )
+    provider_match_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    sport_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)  # e.g. "table_tennis" for filtering signals by subscription
     league_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("leagues.id", ondelete="SET NULL"),
@@ -80,6 +81,20 @@ class Match(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
     )
+    # Догрузка результата при сбоях: не более 3 попыток на матч (2ч, 7ч, 24ч от начала)
+    result_fetch_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_result_fetch_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Коэффициенты в лайве: фиксируем на старте матча, дальше не обновляем
+    live_odds_fixed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Матч пропал из inplay без результата: повторные запросы через 15 мин, 1 ч, 2 ч
+    next_disappeared_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    disappeared_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     league: Mapped["League | None"] = relationship("League", back_populates="matches")
     home_player: Mapped["Player"] = relationship(

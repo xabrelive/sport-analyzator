@@ -10,8 +10,12 @@ import {
   type Player,
 } from "@/lib/api";
 import { ResultsMatchRow } from "@/components/ResultsMatchRow";
+import { useWebSocket } from "@/hooks/useWebSocket";
+import { getCached, setCached } from "@/lib/viewCache";
 
 const PAGE_SIZE = 50;
+const RESULTS_CACHE_KEY = "view:results";
+const RESULTS_CACHE_MAX_AGE_MS = 90_000;
 
 /** Сегодня в формате YYYY-MM-DD для фильтра по умолчанию. */
 function todayISO(): string {
@@ -63,6 +67,7 @@ export default function ResultsPage() {
 
   const [leagues, setLeagues] = useState<League[]>([]);
   const [leagueOpen, setLeagueOpen] = useState<Record<string, boolean>>({});
+  const [isHydratedFromCache, setIsHydratedFromCache] = useState(false);
 
   const loadLeagues = useCallback(async () => {
     try {
@@ -92,6 +97,15 @@ export default function ResultsPage() {
       const data = await fetchFinishedMatches(params);
       setItems(data.items);
       setTotal(data.total);
+      setCached(RESULTS_CACHE_KEY, {
+        items: data.items,
+        total: data.total,
+        page,
+        dateFrom,
+        dateTo,
+        leagueId,
+        playerId,
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка загрузки");
       setItems([]);
@@ -101,9 +115,40 @@ export default function ResultsPage() {
     }
   }, [page, dateFrom, dateTo, leagueId, playerId]);
 
+  useWebSocket((message) => {
+    if (message?.type === "matches_updated") void loadResults();
+  });
+
   useEffect(() => {
-    loadResults();
-  }, [loadResults]);
+    const cached = getCached<{
+      items: Match[];
+      total: number;
+      page: number;
+      dateFrom: string;
+      dateTo: string;
+      leagueId: string;
+      playerId: string;
+    }>(RESULTS_CACHE_KEY, RESULTS_CACHE_MAX_AGE_MS);
+    if (!cached) return;
+    setItems(cached.items);
+    setTotal(cached.total);
+    setPage(cached.page);
+    setDateFrom(cached.dateFrom);
+    setDateTo(cached.dateTo);
+    setLeagueId(cached.leagueId);
+    setPlayerId(cached.playerId);
+    setLoading(false);
+    setIsHydratedFromCache(true);
+  }, []);
+
+  useEffect(() => {
+    if (isHydratedFromCache) {
+      setIsHydratedFromCache(false);
+      void loadResults();
+      return;
+    }
+    void loadResults();
+  }, [loadResults, isHydratedFromCache]);
 
   useEffect(() => {
     if (!playerQuery.trim()) {

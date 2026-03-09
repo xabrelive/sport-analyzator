@@ -10,8 +10,9 @@ from sqlalchemy.orm import selectinload
 
 from app.db.session import get_async_session
 from app.models import Match
+from app.config import settings
 from app.services.probability_engine import MatchFormat, from_scores_list, set_win_probability_markov
-from app.services.player_stats_service import compute_player_stats
+from app.services.player_stats_service import compute_player_stats, get_stats_for_recommendation
 from app.services.analytics_service import (
     build_strengths_weaknesses,
     build_match_recommendations,
@@ -106,8 +107,19 @@ async def get_match_analytics(
     if match is None:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    stats_home = await compute_player_stats(session, match.home_player_id) if match.home_player_id else None
-    stats_away = await compute_player_stats(session, match.away_player_id) if match.away_player_id else None
+    if match.home_player_id and match.away_player_id:
+        stats_home, stats_away = await get_stats_for_recommendation(
+            session,
+            match.home_player_id,
+            match.away_player_id,
+            league_id=getattr(match, "league_id", None),
+            lookback_days=settings.recommendation_lookback_days,
+            prefer_recent_days=getattr(settings, "recommendation_prefer_recent_days", None),
+            min_matches_in_league=getattr(settings, "recommendation_min_matches_in_league", 3),
+        )
+    else:
+        stats_home = None
+        stats_away = None
 
     scores = [
         {"set_number": s.set_number, "home_score": s.home_score, "away_score": s.away_score}

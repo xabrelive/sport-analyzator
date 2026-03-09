@@ -2,13 +2,18 @@
 
 import Link from "next/link";
 import Image from "next/image";
-import { useEffect, useState } from "react";
-import { fetchMatches, fetchSignalsLandingStats, type Match } from "@/lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { fetchMatchesOverview, fetchSignalsLandingStats, type Match } from "@/lib/api";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { LandingMatchRow } from "@/components/LandingMatchRow";
+import { getCached, setCached } from "@/lib/viewCache";
+import { setCachedMatches, invalidateMatchIds, mergeMatchesWithCache } from "@/lib/matchCache";
 
 const DEMO_LIVE = 4;
 const DEMO_LINE = 4;
+const LANDING_CACHE_KEY = "view:landing";
+/** Кэш главной: показываем при повторном заходе только если свежее 20 сек */
+const LANDING_CACHE_MAX_AGE_MS = 20_000;
 
 function byStartTime(a: Match, b: Match): number {
   return new Date(a.start_time).getTime() - new Date(b.start_time).getTime();
@@ -26,48 +31,65 @@ export default function LandingPage() {
     paid_subscription: { day: { total: number; won: number; lost: number }; week: { total: number; won: number; lost: number }; month: { total: number; won: number; lost: number } };
   } | null>(null);
   const [signalsStatsLoaded, setSignalsStatsLoaded] = useState(false);
-  const connected = useWebSocket();
+  const isFetchingRef = useRef(false);
+  const fetchAgainRef = useRef(false);
+
+  const loadMatches = useCallback(async () => {
+    if (isFetchingRef.current) {
+      fetchAgainRef.current = true;
+      return;
+    }
+    isFetchingRef.current = true;
+    try {
+      const { live: liveList, upcoming: lineList } = await fetchMatchesOverview({
+        limit_live: DEMO_LIVE * 2,
+        limit_upcoming: DEMO_LINE * 2,
+      });
+      const nextLive = mergeMatchesWithCache(liveList.slice().sort(byStartTime).slice(0, DEMO_LIVE));
+      const nextLine = mergeMatchesWithCache(lineList.slice().sort(byStartTime).slice(0, DEMO_LINE));
+      setLive(nextLive);
+      setLine(nextLine);
+      setLiveLoaded(true);
+      setLineLoaded(true);
+      setLiveError(null);
+      setLineError(null);
+      setCached(LANDING_CACHE_KEY, { live: nextLive, line: nextLine });
+      setCachedMatches([...nextLive, ...nextLine]);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Ошибка загрузки";
+      setLiveLoaded(true);
+      setLineLoaded(true);
+      setLiveError(message);
+      setLineError(message);
+    } finally {
+      isFetchingRef.current = false;
+      if (fetchAgainRef.current) {
+        fetchAgainRef.current = false;
+        void loadMatches();
+      }
+    }
+  }, []);
+
+  const connected = useWebSocket((message) => {
+    if (message?.type === "matches_updated") {
+      const ids = Array.isArray(message.match_ids) ? message.match_ids : [];
+      if (ids.length) invalidateMatchIds(ids);
+      void loadMatches();
+    }
+  });
 
   useEffect(() => {
-    let cancelled = false;
-    setLiveError(null);
-    setLineError(null);
-    function load() {
-      fetchMatches("matches/live")
-        .then((d) => {
-          if (!cancelled) {
-            const list = Array.isArray(d) ? d : [];
-            setLive(list.slice().sort(byStartTime).slice(0, DEMO_LIVE));
-            setLiveLoaded(true);
-            setLiveError(null);
-          }
-        })
-        .catch((e) => {
-          if (!cancelled) {
-            setLiveLoaded(true);
-            setLiveError(e instanceof Error ? e.message : "Ошибка загрузки");
-          }
-        });
-      fetchMatches("matches/upcoming")
-        .then((d) => {
-          if (!cancelled) {
-            const list = Array.isArray(d) ? d : [];
-            setLine(list.slice().sort(byStartTime).slice(0, DEMO_LINE));
-            setLineLoaded(true);
-            setLineError(null);
-          }
-        })
-        .catch((e) => {
-          if (!cancelled) {
-            setLineLoaded(true);
-            setLineError(e instanceof Error ? e.message : "Ошибка загрузки");
-          }
-        });
+    const cached = getCached<{ live: Match[]; line: Match[] }>(LANDING_CACHE_KEY, LANDING_CACHE_MAX_AGE_MS);
+    if (cached) {
+      setLive(cached.live);
+      setLine(cached.line);
+      setLiveLoaded(true);
+      setLineLoaded(true);
     }
-    load();
-    const t = setInterval(load, 5000); // лайв обновляется на бэке каждые 2–3 сек
-    return () => { cancelled = true; clearInterval(t); };
-  }, []);
+    void loadMatches();
+    const t = setInterval(() => void loadMatches(), 6000);
+    return () => clearInterval(t);
+  }, [loadMatches]);
 
   useEffect(() => {
     fetchSignalsLandingStats()

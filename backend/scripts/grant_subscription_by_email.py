@@ -1,5 +1,6 @@
 """
 Выдать подписку пользователю по email (например после оплаты или вручную).
+Дни прибавляются к текущей подписке того же типа (суммирование), если она ещё действует.
 
 Пример:
   uv run python scripts/grant_subscription_by_email.py xabre@live.ru 7
@@ -41,7 +42,7 @@ def main() -> None:
         print("days must be >= 1")
         sys.exit(1)
 
-    valid_until = date.today() + timedelta(days=days)
+    today = datetime.now(timezone.utc).date()
 
     with Session(engine) as session:
         user = session.execute(select(User).where(User.email == email)).scalar_one_or_none()
@@ -50,15 +51,34 @@ def main() -> None:
             sys.exit(1)
 
         for access_type in ("tg_analytics", "signals"):
+            scope = "all"
+            sport_key = None
+            # Текущая макс. дата окончания по такому же типу — суммируем дни
+            q = (
+                select(UserSubscription.valid_until)
+                .where(
+                    UserSubscription.user_id == user.id,
+                    UserSubscription.access_type == access_type,
+                    UserSubscription.scope == scope,
+                    UserSubscription.sport_key.is_(None),
+                )
+            )
+            existing = [row[0] for row in session.execute(q).all()]
+            base_date = max(existing) if existing else today
+            if base_date < today:
+                base_date = today
+            valid_until = base_date + timedelta(days=days)
+
             sub = UserSubscription(
                 user_id=user.id,
                 access_type=access_type,
-                scope="all",
-                sport_key=None,
+                scope=scope,
+                sport_key=sport_key,
                 valid_until=valid_until,
             )
             session.add(sub)
         session.commit()
+        # Показываем итоговую дату (одинакова для обоих типов при одинаковом base)
         print(f"Granted {days}-day subscription (tg_analytics + signals, all) to {email}, valid until {valid_until}")
 
 

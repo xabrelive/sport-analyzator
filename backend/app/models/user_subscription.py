@@ -69,5 +69,9 @@ class UserSubscription(Base):
         default=_utc_now,
         nullable=False,
     )
+    expiry_telegram_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     user = relationship("User", back_populates="subscriptions")

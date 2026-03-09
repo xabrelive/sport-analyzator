@@ -53,6 +53,7 @@ export function MatchCard({ match, showOdds, showResult, compact, showStartsIn, 
   return (
     <Link
       href={`/match/${match.id}`}
+      prefetch={false}
       className={`block rounded-xl border border-slate-700 bg-slate-800/60 hover:border-teal-500/30 hover:bg-slate-800 transition-all ${compact ? "p-2.5" : "p-4"}`}
     >
       <div className="flex items-center justify-between gap-2 mb-1">

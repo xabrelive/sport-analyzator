@@ -1,29 +1,58 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { fetchMatches, type Match } from "@/lib/api";
+import { fetchFinishedMatches, type Match } from "@/lib/api";
 import { MatchTable } from "@/components/MatchTable";
+import { useWebSocket } from "@/hooks/useWebSocket";
+import { getCached, setCached } from "@/lib/viewCache";
+
+const FINISHED_CACHE_KEY = "view:finished";
+const FINISHED_CACHE_MAX_AGE_MS = 120_000;
 
 export default function FinishedPage() {
   const [matches, setMatches] = useState<Match[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const isFetchingRef = useRef(false);
+  const fetchAgainRef = useRef(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      try {
-        const data = await fetchMatches("matches/finished");
-        if (!cancelled) setMatches(data);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : "Ошибка загрузки");
-      } finally {
-        if (!cancelled) setLoading(false);
+  const load = useCallback(async () => {
+    if (isFetchingRef.current) {
+      fetchAgainRef.current = true;
+      return;
+    }
+    isFetchingRef.current = true;
+    try {
+      const data = await fetchFinishedMatches({ limit: 200 });
+      setMatches(data.items);
+      setCached<Match[]>(FINISHED_CACHE_KEY, data.items);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ошибка загрузки");
+    } finally {
+      isFetchingRef.current = false;
+      setLoading(false);
+      if (fetchAgainRef.current) {
+        fetchAgainRef.current = false;
+        void load();
       }
     }
-    load();
   }, []);
+
+  useWebSocket((message) => {
+    if (message?.type === "matches_updated") void load();
+  });
+
+  useEffect(() => {
+    const cached = getCached<Match[]>(FINISHED_CACHE_KEY, FINISHED_CACHE_MAX_AGE_MS);
+    if (cached) {
+      setMatches(cached);
+      setLoading(false);
+    }
+    void load();
+    const t = setInterval(() => void load(), 30_000);
+    return () => clearInterval(t);
+  }, [load]);
 
   return (
     <main className="max-w-6xl mx-auto p-6">

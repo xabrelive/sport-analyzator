@@ -8,8 +8,14 @@ from app.models.match_result import MatchResult
 from app.models.match_recommendation import MatchRecommendation
 from app.models.user import User
 from app.models.user_subscription import UserSubscription, AccessType, SubscriptionScope
+from app.models.invoice import Invoice
+from app.models.payment_method import PaymentMethod
+from app.models.product import Product
+from app.models.subscription_grant_log import SubscriptionGrantLog
 from app.models.signal import Signal, SignalOutcome, SignalChannel
 from app.models.betsapi_archive_progress import BetsapiArchiveProgress
+from app.models.user_signal_delivery import UserSignalDelivery
+from app.models.scheduled_telegram_post import ScheduledTelegramPost
 
 __all__ = [
     "League",
@@ -25,8 +31,14 @@ __all__ = [
     "UserSubscription",
     "AccessType",
     "SubscriptionScope",
+    "Invoice",
+    "PaymentMethod",
+    "Product",
+    "SubscriptionGrantLog",
     "Signal",
     "SignalOutcome",
     "SignalChannel",
     "BetsapiArchiveProgress",
+    "UserSignalDelivery",
+    "ScheduledTelegramPost",
 ]

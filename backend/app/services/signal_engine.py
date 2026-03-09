@@ -1,10 +1,6 @@
-"""Signal engine: filter value bets and send to Telegram."""
+"""Signal engine: filter value bets, build message. Доставка — через telegram_sender и email сервисы."""
 from decimal import Decimal
-from typing import Any
 
-import httpx
-
-from app.config import settings
 from app.services.value_engine import expected_value, is_value
 
 
@@ -27,21 +23,15 @@ def build_signal_message(
     )
 
 
-async def send_telegram_signal(message: str) -> bool:
-    if not settings.telegram_bot_token or not settings.telegram_signals_chat_id:
+async def send_telegram_signal(message: str, chat_id: str | int | None = None) -> bool:
+    """Отправить сигнал в Telegram: в chat_id или в общий telegram_signals_chat_id."""
+    from app.config import settings
+    from app.services.telegram_sender import send_telegram_message_async
+
+    target = chat_id if chat_id is not None else (settings.telegram_signals_chat_id or None)
+    if not target:
         return False
-    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
-    payload: dict[str, Any] = {
-        "chat_id": settings.telegram_signals_chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-    }
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.post(url, json=payload, timeout=30.0)
-            return r.is_success
-        except Exception:
-            return False
+    return await send_telegram_message_async(target, message)
 
 
 def should_send_signal(

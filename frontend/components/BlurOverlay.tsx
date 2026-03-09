@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 
-const PROTECTED_PREFIXES = ["/dashboard", "/line", "/live", "/results", "/stats", "/leagues", "/sports", "/match", "/player", "/players", "/signals"];
+const PROTECTED_PREFIXES = ["/dashboard", "/line", "/live", "/results", "/stats", "/leagues", "/sports", "/match", "/player", "/players", "/signals", "/me"];
 
 export function BlurOverlay() {
   return (

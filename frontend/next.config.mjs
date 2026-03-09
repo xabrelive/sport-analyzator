@@ -10,8 +10,8 @@ const nextConfig = {
     const backend =
       process.env.BACKEND_URL ||
       (process.env.BACKEND_PORT
-        ? `http://localhost:${process.env.BACKEND_PORT}`
-        : "http://localhost:11001");
+        ? `http://backend:${process.env.BACKEND_PORT}`
+        : "http://backend:11001");
     return [{ source: "/api/:path*", destination: `${backend}/api/:path*` }];
   },
 };

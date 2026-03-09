@@ -1,14 +1,17 @@
 """Normalizer: raw payload -> internal models, write to DB."""
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import League, Match, MatchResult, MatchScore, MatchStatus, OddsSnapshot, Player
+
+logger = logging.getLogger(__name__)
 
 # В архиве нет времени окончания; используем время начала + 20 мин как приближение
 ARCHIVE_FINISHED_AT_OFFSET_MINUTES = 20
@@ -153,11 +156,15 @@ class Normalizer:
         # Матчи из текущего батча (игроки + время) — чтобы не помечать как отменённые, если тот же матч пришёл под другим id
         seen_players_time: list[tuple[UUID, UUID, datetime]] = []
         provider = "betsapi"
+        skipped_no_time = 0
+        skipped_no_match = 0
 
         for event in events:
             if not isinstance(event, dict):
                 continue
-            eid = event.get("id")
+            eid = event.get("id") or event.get("event_id")
+            if eid is None and isinstance(event.get("event"), dict):
+                eid = event["event"].get("id") or event["event"].get("event_id")
             if not eid:
                 continue
             eid_str = str(eid)
@@ -182,14 +189,29 @@ class Normalizer:
                 away_name = str(away_obj) if away_obj else "Away"
                 away_pid = away_image_id = away_cc = None
 
-            time_val = event.get("time")
+            time_val = event.get("time") or event.get("starts_at") or event.get("start_time")
             if time_val is not None:
                 if isinstance(time_val, str) and time_val.isdigit():
                     time_val = int(time_val)
-                st = datetime.fromtimestamp(int(time_val), tz=timezone.utc) if time_val else None
+                if isinstance(time_val, (int, float)):
+                    ts = int(time_val)
+                    # Unix в секундах до ~год 2030; иначе считаем миллисекунды
+                    if ts > 2_000_000_000:
+                        ts = ts // 1000
+                    st = datetime.fromtimestamp(ts, tz=timezone.utc)
+                elif isinstance(time_val, str):
+                    try:
+                        st = datetime.fromisoformat(time_val.replace("Z", "+00:00"))
+                        if st.tzinfo is None:
+                            st = st.replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        st = None
+                else:
+                    st = None
             else:
                 st = None
             if st is None:
+                skipped_no_time += 1
                 continue
 
             league_id = None
@@ -202,99 +224,19 @@ class Normalizer:
                     country=league_obj.get("cc") or league_obj.get("country"),
                 )
 
-            if source == "ended":
-                existing_match = (
-                    await self.session.execute(
-                        select(Match).where(
-                            Match.provider == provider,
-                            Match.provider_match_id == eid_str,
-                        )
-                    )
-                ).scalars().first()
-                if existing_match is not None:
-                    match = existing_match
-                else:
-                    home_player = await self._get_or_create_player(home_name, provider, str(home_pid) if home_pid is not None else None)
-                    away_player = await self._get_or_create_player(away_name, provider, str(away_pid) if away_pid is not None else None)
-                    if home_player and away_player:
-                        candidate = await self._find_scheduled_match_by_players_and_time(
-                            provider, home_player.id, away_player.id, st, MATCH_SAME_EVENT_WINDOW_MINUTES
-                        )
-                        if candidate is not None:
-                            candidate.provider_match_id = eid_str
-                            if league_id is not None:
-                                candidate.league_id = league_id
-                            await self.session.flush()
-                            match = candidate
-                        else:
-                            match = await self._get_or_create_match(
-                                provider=provider,
-                                provider_match_id=eid_str,
-                                home_name=home_name,
-                                away_name=away_name,
-                                start_time=st.isoformat(),
-                                league_id=league_id,
-                                home_provider_id=str(home_pid) if home_pid is not None else None,
-                                away_provider_id=str(away_pid) if away_pid is not None else None,
-                            )
-                    else:
-                        match = await self._get_or_create_match(
-                            provider=provider,
-                            provider_match_id=eid_str,
-                            home_name=home_name,
-                            away_name=away_name,
-                            start_time=st.isoformat(),
-                            league_id=league_id,
-                            home_provider_id=str(home_pid) if home_pid is not None else None,
-                            away_provider_id=str(away_pid) if away_pid is not None else None,
-                        )
-            elif source == "inplay":
-                existing_match = (
-                    await self.session.execute(
-                        select(Match).where(
-                            Match.provider == provider,
-                            Match.provider_match_id == eid_str,
-                        )
-                    )
-                ).scalars().first()
-                if existing_match is not None:
-                    match = existing_match
-                else:
-                    home_player = await self._get_or_create_player(home_name, provider, str(home_pid) if home_pid is not None else None)
-                    away_player = await self._get_or_create_player(away_name, provider, str(away_pid) if away_pid is not None else None)
-                    if home_player and away_player:
-                        # Линия под одним id, лайв под другим — в узком окне (30 мин) считаем одним матчем
-                        candidate = await self._find_scheduled_match_by_players_and_time(
-                            provider, home_player.id, away_player.id, st, MATCH_SAME_EVENT_WINDOW_MINUTES, include_live=True
-                        )
-                        if candidate is not None:
-                            candidate.provider_match_id = eid_str
-                            if league_id is not None:
-                                candidate.league_id = league_id
-                            await self.session.flush()
-                            match = candidate
-                        else:
-                            match = await self._get_or_create_match(
-                                provider=provider,
-                                provider_match_id=eid_str,
-                                home_name=home_name,
-                                away_name=away_name,
-                                start_time=st.isoformat(),
-                                league_id=league_id,
-                                home_provider_id=str(home_pid) if home_pid is not None else None,
-                                away_provider_id=str(away_pid) if away_pid is not None else None,
-                            )
-                    else:
-                        match = await self._get_or_create_match(
-                            provider=provider,
-                            provider_match_id=eid_str,
-                            home_name=home_name,
-                            away_name=away_name,
-                            start_time=st.isoformat(),
-                            league_id=league_id,
-                            home_provider_id=str(home_pid) if home_pid is not None else None,
-                            away_provider_id=str(away_pid) if away_pid is not None else None,
-                        )
+            if source in ("ended", "inplay"):
+                # Упрощённый realtime-путь: только match_id от провайдера.
+                # Убираем "поиск похожего матча" (он создавал тяжёлые SELECT и блокировки).
+                match = await self._get_or_create_match(
+                    provider=provider,
+                    provider_match_id=eid_str,
+                    home_name=home_name,
+                    away_name=away_name,
+                    start_time=st.isoformat(),
+                    league_id=league_id,
+                    home_provider_id=str(home_pid) if home_pid is not None else None,
+                    away_provider_id=str(away_pid) if away_pid is not None else None,
+                )
             else:
                 match = await self._get_or_create_match(
                     provider=provider,
@@ -307,6 +249,7 @@ class Normalizer:
                     away_provider_id=str(away_pid) if away_pid is not None else None,
                 )
             if not match:
+                skipped_no_match += 1
                 continue
             match_ids.append(match.id)
             seen_players_time.append((match.home_player_id, match.away_player_id, match.start_time))
@@ -424,6 +367,30 @@ class Normalizer:
                         )
                     )
                     await self.session.flush()
+            elif source == "upcoming":
+                # Для линии показываем только матчи, у которых уже есть коэффициенты.
+                # Если коэффициентов нет — держим отдельный статус до момента, когда odds появятся.
+                # ВАЖНО: не затираем LIVE/FINISHED обратно в SCHEDULED/PENDING_ODDS.
+                has_line_odds_now = isinstance(event.get("odds") or event.get("bookmakers"), list) and bool(
+                    event.get("odds") or event.get("bookmakers")
+                )
+                has_line_odds_in_db = bool(event.get("_line_odds_in_db"))
+                await self.session.execute(
+                    update(Match)
+                    .where(
+                        Match.id == match.id,
+                        Match.status.in_(
+                            [MatchStatus.SCHEDULED.value, MatchStatus.PENDING_ODDS.value]
+                        ),
+                    )
+                    .values(
+                        status=(
+                            MatchStatus.SCHEDULED.value
+                            if (has_line_odds_now or has_line_odds_in_db)
+                            else MatchStatus.PENDING_ODDS.value
+                        )
+                    )
+                )
 
             odds_data = event.get("odds") or event.get("bookmakers")
             if match and odds_data and isinstance(odds_data, list):
@@ -471,6 +438,13 @@ class Normalizer:
                 if event.get("odds_stats") is not None:
                     await self.session.execute(
                         update(Match).where(Match.id == match.id).values(odds_stats=event["odds_stats"])
+                    )
+                # В лайве коэффициенты фиксируем один раз на старте матча; дальше не обновляем
+                if source == "inplay":
+                    await self.session.execute(
+                        update(Match)
+                        .where(Match.id == match.id)
+                        .values(live_odds_fixed_at=datetime.now(timezone.utc))
                     )
 
         if current_event_ids is not None and len(current_event_ids) > 0:
@@ -534,9 +508,23 @@ class Normalizer:
                         update(Match).where(Match.id.in_(to_cancel)).values(status=MatchStatus.CANCELLED.value)
                     )
 
-        # Дополнительно: матчи уже в статусе FINISHED без MatchResult, но с MatchScore — подтягиваем результат (подстраховка и бэкфилл)
-        await self._create_result_from_scores_for_finished_without_result()
-
+        if events or skipped_no_time or skipped_no_match:
+            logger.info(
+                "normalize_betsapi: events=%s normalized=%s skipped_no_time=%s skipped_no_match=%s",
+                len(events),
+                len(match_ids),
+                skipped_no_time,
+                skipped_no_match,
+            )
+        if events and not match_ids and (skipped_no_time or skipped_no_match):
+            first = events[0] if isinstance(events[0], dict) else {}
+            logger.warning(
+                "normalize_betsapi: all events skipped. First event keys: %s, time=%s home=%s away=%s",
+                list(first.keys()),
+                first.get("time"),
+                type(first.get("home")).__name__ if first.get("home") is not None else None,
+                type(first.get("away")).__name__ if first.get("away") is not None else None,
+            )
         await self.session.commit()
         return list(dict.fromkeys(match_ids))
 
@@ -595,21 +583,6 @@ class Normalizer:
                 )
             )
 
-    async def _create_result_from_scores_for_finished_without_result(self) -> None:
-        """Находит матчи со статусом FINISHED без MatchResult, но с хотя бы одним MatchScore, и создаёт для них MatchResult (бэкфилл и подстраховка)."""
-        from sqlalchemy import exists
-        has_score = select(MatchScore.match_id).where(MatchScore.match_id == Match.id).limit(1)
-        r = await self.session.execute(
-            select(Match.id).where(
-                Match.status == MatchStatus.FINISHED.value,
-                ~Match.id.in_(select(MatchResult.match_id)),
-                exists(has_score),
-            )
-        )
-        ids = [row[0] for row in r.all()]
-        if ids:
-            await self._create_result_from_scores_for_matches(ids)
-
     async def _update_match_from_event(self, match: Match, event: dict[str, Any]) -> None:
         """Обновляет Match полями из event/view: extra.bestofsets → sets_to_win, timeline, extra, timer, confirmed_at, bet365_id, started_at, finished_at."""
         vals: dict[str, Any] = {}
@@ -666,7 +639,11 @@ class Normalizer:
         away_image_id: str | None = None,
         away_country: str | None = None,
     ) -> None:
-        """Обновляет Player: image_id и country из event (home/away)."""
+        """Обновляет Player: image_id и country из event (home/away).
+
+        Пишем в БД только если значение реально изменилось, чтобы не создавать
+        лишнюю нагрузку и блокировки на таблице players при частых live-циклах.
+        """
         if home_image_id is not None or home_country is not None:
             v = {}
             if home_image_id is not None:
@@ -674,8 +651,20 @@ class Normalizer:
             if home_country is not None:
                 v["country"] = str(home_country)[:100]
             if v:
+                conds = []
+                if "image_id" in v:
+                    conds.append(Player.image_id.is_distinct_from(v["image_id"]))
+                if "country" in v:
+                    conds.append(Player.country.is_distinct_from(v["country"]))
                 await self.session.execute(
-                    update(Player).where(Player.id == match.home_player_id).values(**v)
+                    update(Player)
+                    .where(
+                        and_(
+                            Player.id == match.home_player_id,
+                            or_(*conds),
+                        )
+                    )
+                    .values(**v)
                 )
         if away_image_id is not None or away_country is not None:
             v = {}
@@ -684,8 +673,20 @@ class Normalizer:
             if away_country is not None:
                 v["country"] = str(away_country)[:100]
             if v:
+                conds = []
+                if "image_id" in v:
+                    conds.append(Player.image_id.is_distinct_from(v["image_id"]))
+                if "country" in v:
+                    conds.append(Player.country.is_distinct_from(v["country"]))
                 await self.session.execute(
-                    update(Player).where(Player.id == match.away_player_id).values(**v)
+                    update(Player)
+                    .where(
+                        and_(
+                            Player.id == match.away_player_id,
+                            or_(*conds),
+                        )
+                    )
+                    .values(**v)
                 )
 
     async def _get_or_create_league(
@@ -756,9 +757,11 @@ class Normalizer:
                 match.league_id = league_id
             return match
 
+        sport_key = "table_tennis" if provider == "betsapi" else None
         match = Match(
             provider_match_id=provider_match_id,
             provider=provider,
+            sport_key=sport_key,
             league_id=league_id,
             home_player_id=home_player.id,
             away_player_id=away_player.id,
@@ -807,24 +810,28 @@ class Normalizer:
     ) -> Player | None:
         if provider_player_id:
             existing = await self.session.execute(
-                select(Player).where(
+                select(Player)
+                .where(
                     Player.provider == provider,
                     Player.provider_player_id == provider_player_id,
                 )
+                .limit(1)
             )
-            p = existing.scalar_one_or_none()
+            p = existing.scalars().first()
             if p:
                 if p.name != name:
                     p.name = name
                 return p
         else:
             existing = await self.session.execute(
-                select(Player).where(
+                select(Player)
+                .where(
                     Player.provider == provider,
                     Player.name == name,
                 )
+                .limit(1)
             )
-            p = existing.scalar_one_or_none()
+            p = existing.scalars().first()
             if p:
                 return p
         p = Player(name=name, provider=provider, provider_player_id=provider_player_id)

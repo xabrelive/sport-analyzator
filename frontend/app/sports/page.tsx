@@ -7,7 +7,7 @@ export default function SportsPage() {
 
   return (
     <main className="max-w-3xl mx-auto px-4 py-12">
-      <Link href="/" className="text-slate-400 hover:text-white text-sm mb-6 inline-block">← На главную</Link>
+      <Link href="/" prefetch={false} className="text-slate-400 hover:text-white text-sm mb-6 inline-block">← На главную</Link>
       <h1 className="text-3xl font-bold text-white mb-2">Виды спорта</h1>
       <p className="text-slate-400 text-sm mb-8">
         Выберите вид спорта — лайв-сетка и линия с аналитикой.
@@ -26,12 +26,14 @@ export default function SportsPage() {
             <div className="flex gap-2 shrink-0">
               <Link
                 href={`/sports/${s.slug}/live`}
+                prefetch={false}
                 className="px-3 py-1.5 rounded-lg bg-slate-700 text-slate-200 hover:bg-slate-600 text-sm"
               >
                 Лайв
               </Link>
               <Link
                 href={`/sports/${s.slug}/line`}
+                prefetch={false}
                 className="px-3 py-1.5 rounded-lg bg-teal-600 text-white hover:bg-teal-500 text-sm"
               >
                 Линия

@@ -2,13 +2,13 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import type { TelegramAuthPayload } from "@/lib/api";
 
 const TELEGRAM_BOT_USERNAME = process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME || "PingWinBot";
 
-export default function LoginPage() {
+function LoginPageContent() {
   const { login, loginWithTelegram, saveToken } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -26,6 +26,7 @@ export default function LoginPage() {
     if (err) {
       if (err === "invalid_token") setError("Ссылка подтверждения недействительна или истекла.");
       else if (err === "user_not_found") setError("Пользователь не найден.");
+      else if (err === "blocked") setError("Аккаунт заблокирован. Обратитесь в поддержку.");
       else setError("Произошла ошибка.");
       return;
     }
@@ -143,5 +144,13 @@ export default function LoginPage() {
         </p>
       </div>
     </main>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<main className="min-h-[80vh] flex items-center justify-center px-4 text-slate-500">Загрузка...</main>}>
+      <LoginPageContent />
+    </Suspense>
   );
 }

@@ -8,6 +8,7 @@
 По завершённым матчам view и odds не запрашиваем.
 """
 import asyncio
+import logging
 from typing import Any
 
 import httpx
@@ -24,6 +25,21 @@ BETSAPI_BASE_URLS = [
 BETSAPI_BASE_V1 = "https://api.b365api.com/v1"
 BETSAPI_BASE_V2 = "https://api.b365api.com/v2"
 EVENT_VIEW_BATCH_SIZE = 10
+
+
+logger = logging.getLogger(__name__)
+
+
+class BetsApiRateLimitError(Exception):
+    """Сигнализирует о том, что BetsAPI вернуло 429 Too Many Requests."""
+
+    pass
+
+
+class BetsapiEndedRequestError(Exception):
+    """Ошибка запроса GET /v3/events/ended (HTTP или success=false). Не трактовать как «пустая страница»."""
+
+    pass
 
 
 def _parse_line_value(raw: Any) -> float | None:
@@ -189,26 +205,111 @@ class BetsApiCollector(BaseCollector):
         if events_from_lists is None:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 if include_upcoming:
-                    r = await client.get(f"{base}/events/upcoming", params=params)
-                    if not r.is_success and r.status_code == 403:
-                        for alt in BETSAPI_BASE_URLS:
-                            if alt == base:
-                                continue
-                            r = await client.get(f"{alt}/events/upcoming", params=params)
-                            if r.is_success:
-                                base = alt
-                                break
-                            await asyncio.sleep(rate_limit_seconds)
-                    if r.is_success:
-                        data = r.json()
-                        if data.get("success") and isinstance(data.get("results"), list):
-                            for e in data["results"]:
+                    # Пагинация: загружаем все страницы upcoming, чтобы получить матчи и через 1–2–3+ часа.
+                    # Если какая‑то страница долго не отвечает или даёт timeout, не роняем весь цикл линии —
+                    # используем уже собранные страницы как усечённый список.
+                    page = 1
+                    max_upcoming_pages = 50  # разумный лимит, чтобы не упереться в лимит API
+                    while page <= max_upcoming_pages:
+                        try:
+                            r = await client.get(
+                                f"{base}/events/upcoming",
+                                params={**params, "page": page},
+                            )
+                        except httpx.ReadTimeout:
+                            logger.warning(
+                                "BetsAPI events/upcoming: timeout on page=%s sport_id=%s, total_so_far=%s. "
+                                "Stopping pagination and using collected events.",
+                                page,
+                                sid,
+                                len(events_by_id),
+                            )
+                            break
+                        if r.status_code == 429:
+                            logger.warning(
+                                "BetsAPI rate limit (429) on events/upcoming for sport_id=%s", sid
+                            )
+                            raise BetsApiRateLimitError("events/upcoming 429 Too Many Requests")
+                        if not r.is_success and r.status_code == 403:
+                            for alt in BETSAPI_BASE_URLS:
+                                if alt == base:
+                                    continue
+                                r = await client.get(f"{alt}/events/upcoming", params={**params, "page": page})
+                                if r.is_success:
+                                    base = alt
+                                    break
+                                await asyncio.sleep(rate_limit_seconds)
+                        if not r.is_success:
+                            logger.warning(
+                                "BetsAPI events/upcoming: HTTP %s body=%s",
+                                r.status_code,
+                                (r.text or "")[:200],
+                            )
+                            break
+                        try:
+                            data = r.json() or {}
+                        except Exception:
+                            data = {}
+                        results_raw = data.get("results") or data.get("events") or data.get("data")
+                        if isinstance(results_raw, list):
+                            res_list = results_raw
+                        elif isinstance(results_raw, dict):
+                            res_list = []
+                            for eid, ev in results_raw.items():
+                                if isinstance(ev, dict):
+                                    if ev.get("id") is None:
+                                        ev = dict(ev)
+                                        ev["id"] = eid
+                                    res_list.append(ev)
+                        else:
+                            res_list = []
+                        api_ok = data.get("success") in (True, 1, "1")
+                        if not api_ok:
+                            top_keys = list(data.keys())[:15] if isinstance(data, dict) else []
+                            logger.warning(
+                                "BetsAPI events/upcoming: success=%s results_type=%s count=%s message=%s keys=%s",
+                                data.get("success"),
+                                type(results_raw).__name__ if results_raw is not None else "NoneType",
+                                len(res_list),
+                                data.get("message") or data.get("error") or "",
+                                top_keys,
+                            )
+                            break
+                        if not res_list:
+                            break
+                        for e in res_list:
+                            if isinstance(e, dict):
                                 e["_source"] = "upcoming"
-                                events_by_id[str(e.get("id"))] = e
-                    await asyncio.sleep(rate_limit_seconds)
+                                eid_key = str(e.get("id"))
+                                if eid_key:
+                                    events_by_id[eid_key] = e
+                        logger.info(
+                            "BetsAPI events/upcoming: page=%s sport_id=%s count=%s total_so_far=%s",
+                            page,
+                            sid,
+                            len(res_list),
+                            len(events_by_id),
+                        )
+                        # Следующая страница только если получили полную страницу (обычно 50)
+                        pager = data.get("pager")
+                        per_page = 50
+                        if isinstance(pager, dict) and pager.get("per_page") is not None:
+                            try:
+                                per_page = int(pager["per_page"]) or 50
+                            except (TypeError, ValueError):
+                                pass
+                        if len(res_list) < per_page:
+                            break
+                        page += 1
+                        await asyncio.sleep(rate_limit_seconds)
 
                 if include_inplay:
                     r2 = await client.get(f"{base}/events/inplay", params=params)
+                    if r2.status_code == 429:
+                        logger.warning(
+                            "BetsAPI rate limit (429) on events/inplay for sport_id=%s", sid
+                        )
+                        raise BetsApiRateLimitError("events/inplay 429 Too Many Requests")
                     if r2.is_success:
                         data2 = r2.json()
                         if data2.get("success") and isinstance(data2.get("results"), list):
@@ -336,13 +437,15 @@ class BetsApiCollector(BaseCollector):
             r = await client.get(f"{base}/events/ended", params=params)
             await asyncio.sleep(rate_limit_seconds)
             if not r.is_success:
-                return [], None
+                if r.status_code == 429:
+                    raise BetsApiRateLimitError(f"BetsAPI 429: {r.text[:200]}")
+                raise BetsapiEndedRequestError(f"BetsAPI events/ended HTTP {r.status_code}: {r.text[:200]}")
             data = r.json()
             if not data.get("success"):
-                return [], None
+                raise BetsapiEndedRequestError(f"BetsAPI events/ended success=false: {str(data.get('error', data))[:200]}")
             results = data.get("results")
             if not isinstance(results, list):
-                return [], None
+                raise BetsapiEndedRequestError(f"BetsAPI events/ended results not list: {type(results).__name__}")
             for e in results:
                 e["_source"] = "ended"
             return results, data.get("pager")

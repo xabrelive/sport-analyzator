@@ -2,7 +2,17 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { fetchSignalsStats, fetchRecommendationsStats, type SignalStatsResponse, type RecommendationStatsResponse, type RecommendationResultFilter } from "@/lib/api";
+import {
+  fetchSignalsStats,
+  fetchRecommendationsStats,
+  fetchVipChannelStats,
+  fetchFreeChannelStats,
+  type SignalStatsResponse,
+  type RecommendationStatsResponse,
+  type RecommendationResultFilter,
+  type VipChannelStatsResponse,
+  type FreeChannelStatsResponse,
+} from "@/lib/api";
 
 const RESULT_FILTERS: { value: RecommendationResultFilter; label: string }[] = [
   { value: "all", label: "Все" },
@@ -26,14 +36,19 @@ function formatMatchStart(iso: string | null | undefined): string {
 export default function StatsPage() {
   const [stats, setStats] = useState<SignalStatsResponse | null>(null);
   const [recStats, setRecStats] = useState<RecommendationStatsResponse | null>(null);
+  const [vipStats, setVipStats] = useState<VipChannelStatsResponse | null>(null);
+  const [freeStats, setFreeStats] = useState<FreeChannelStatsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [recLoading, setRecLoading] = useState(true);
+  const [channelLoading, setChannelLoading] = useState(true);
   const [recPage, setRecPage] = useState(1);
   const [recPerPage, setRecPerPage] = useState(20);
   const [recResultFilter, setRecResultFilter] = useState<RecommendationResultFilter>("all");
   const [recOddsMin, setRecOddsMin] = useState("");
   const [recOddsMax, setRecOddsMax] = useState("");
   const [days, setDays] = useState(7);
+  const [channelDays, setChannelDays] = useState(7);
+  const [channelTab, setChannelTab] = useState<"vip" | "free">("vip");
 
   useEffect(() => {
     let cancelled = false;
@@ -80,6 +95,28 @@ export default function StatsPage() {
     };
   }, [recPage, recPerPage, recResultFilter, recOddsMin, recOddsMax]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setChannelLoading(true);
+    Promise.all([fetchVipChannelStats(channelDays), fetchFreeChannelStats(channelDays)])
+      .then(([vip, free]) => {
+        if (cancelled) return;
+        setVipStats(vip);
+        setFreeStats(free);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setVipStats(null);
+        setFreeStats(null);
+      })
+      .finally(() => {
+        if (!cancelled) setChannelLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [channelDays]);
+
   const loadingAny = loading;
 
   if (loadingAny) {
@@ -96,6 +133,14 @@ export default function StatsPage() {
       <p className="text-slate-400 text-sm mb-6">
         Сколько сигналов выдано, сколько сыграло (угадано) и сколько не сыграло. Данные только для информации — мы предоставляем аналитику, а не рекомендации к ставкам.
       </p>
+      <div className="mb-6">
+        <Link
+          href="/stats/calculator"
+          className="inline-flex items-center px-4 py-2 rounded-lg bg-teal-600 text-white text-sm font-medium hover:bg-teal-500"
+        >
+          Открыть калькулятор ставок
+        </Link>
+      </div>
 
       <div className="flex flex-wrap gap-2 mb-6">
         {[1, 7, 14, 30].map((d) => (
@@ -190,7 +235,7 @@ export default function StatsPage() {
           <p className="text-rose-400 text-sm">Не удалось загрузить</p>
         ) : (
           <>
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-6">
+            <div className="grid grid-cols-2 sm:grid-cols-6 gap-4 mb-6">
               <div className="rounded-lg bg-slate-800/80 p-4 text-center">
                 <p className="text-2xl font-bold text-white">{recStats.total}</p>
                 <p className="text-slate-400 text-sm">Рекомендаций выдано</p>
@@ -352,6 +397,107 @@ export default function StatsPage() {
               </div>
             )}
           </>
+        )}
+      </section>
+
+      <section className="rounded-xl border border-slate-700/80 bg-slate-900/60 p-6 mt-8">
+        <h2 className="text-lg font-semibold text-white mb-2">Статистика по каналам (VIP и бесплатный)</h2>
+        <p className="text-slate-400 text-sm mb-4">Сводка по ставкам, которые отправлялись в Telegram‑каналы.</p>
+        <div className="flex flex-wrap items-center gap-3 mb-4">
+          <div className="inline-flex rounded-lg bg-slate-800 p-1">
+            <button
+              type="button"
+              onClick={() => setChannelTab("vip")}
+              className={`px-3 py-1.5 text-sm font-medium rounded-md ${
+                channelTab === "vip" ? "bg-teal-600 text-white" : "text-slate-300 hover:bg-slate-700"
+              }`}
+            >
+              VIP‑канал
+            </button>
+            <button
+              type="button"
+              onClick={() => setChannelTab("free")}
+              className={`px-3 py-1.5 text-sm font-medium rounded-md ${
+                channelTab === "free" ? "bg-teal-600 text-white" : "text-slate-300 hover:bg-slate-700"
+              }`}
+            >
+              Бесплатный канал
+            </button>
+          </div>
+          <span className="text-slate-400 text-sm">Период:</span>
+          <div className="flex flex-wrap gap-2">
+            {[7, 14, 30].map((d) => (
+              <button
+                key={d}
+                type="button"
+                onClick={() => setChannelDays(d)}
+                className={`px-3 py-1.5 rounded-lg text-sm font-medium ${
+                  channelDays === d ? "bg-emerald-600 text-white" : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                }`}
+              >
+                {d} дней
+              </button>
+            ))}
+          </div>
+        </div>
+        {channelLoading ? (
+          <p className="text-slate-500 text-sm">Загрузка...</p>
+        ) : channelTab === "vip" ? (
+          !vipStats ? (
+            <p className="text-rose-400 text-sm">Не удалось загрузить статистику VIP‑канала</p>
+          ) : (
+            <div>
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-4">
+                <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                  <p className="text-2xl font-bold text-white">{vipStats.total}</p>
+                  <p className="text-slate-400 text-sm">Всего прогнозов</p>
+                </div>
+                <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                  <p className="text-2xl font-bold text-emerald-400">{vipStats.won}</p>
+                  <p className="text-slate-400 text-sm">Угадали</p>
+                </div>
+                <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                  <p className="text-2xl font-bold text-rose-400">{vipStats.lost}</p>
+                  <p className="text-slate-400 text-sm">Не угадали</p>
+                </div>
+                <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                  <p className="text-2xl font-bold text-slate-400">{vipStats.pending}</p>
+                  <p className="text-slate-400 text-sm">Ещё в игре</p>
+                </div>
+                <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                  <p className="text-2xl font-bold text-amber-400/90">{vipStats.missed}</p>
+                  <p className="text-slate-400 text-sm">Отмена / нет данных</p>
+                </div>
+              </div>
+            </div>
+          )
+        ) : !freeStats ? (
+          <p className="text-rose-400 text-sm">Не удалось загрузить статистику бесплатного канала</p>
+        ) : (
+          <div>
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-4">
+              <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                <p className="text-2xl font-bold text-white">{freeStats.total}</p>
+                <p className="text-slate-400 text-sm">Всего прогнозов</p>
+              </div>
+              <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                <p className="text-2xl font-bold text-emerald-400">{freeStats.won}</p>
+                <p className="text-slate-400 text-sm">Угадали</p>
+              </div>
+              <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                <p className="text-2xl font-bold text-rose-400">{freeStats.lost}</p>
+                <p className="text-slate-400 text-sm">Не угадали</p>
+              </div>
+              <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                <p className="text-2xl font-bold text-slate-400">{freeStats.pending}</p>
+                <p className="text-slate-400 text-sm">Ещё в игре</p>
+              </div>
+              <div className="rounded-lg bg-slate-800/80 p-4 text-center">
+                <p className="text-2xl font-bold text-amber-400/90">{freeStats.missed}</p>
+                <p className="text-slate-400 text-sm">Отмена / нет данных</p>
+              </div>
+            </div>
+          </div>
         )}
       </section>
     </main>

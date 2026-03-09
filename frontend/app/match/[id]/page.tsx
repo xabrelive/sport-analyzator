@@ -1,9 +1,11 @@
 "use client";
 
-import React, { useMemo, useState, useEffect } from "react";
+import React, { useMemo, useState, useEffect, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { fetchMatch, fetchPlayerStats, fetchMatchAnalytics, fetchStoredRecommendation, fetchLiveRecommendations, type Match, type OddsSnapshot, type PlayerStats, type MatchAnalytics, type LiveRecommendationItem } from "@/lib/api";
+import { getCachedMatch, setCachedMatches, isMatchNewerThan } from "@/lib/matchCache";
+import { useWebSocket } from "@/hooks/useWebSocket";
 import { formatStartTime, formatDateTimeWithYear, setsTotal, getSetsDisplay, formatOddsTime } from "@/lib/format";
 
 const MARKET_ORDER = ["winner", "win", "92_1", "92_2", "92_3", "92_4", "92_5", "92_6", "92_7", "92_8", "92_9", "92_10", "92_11", "92_12", "92_13", "92_14", "92_15", "92_16", "92_17", "92_18", "92_19", "92_20", "92_21", "set_winner", "total", "handicap"];
@@ -87,11 +89,10 @@ function selectionLabel(selection: string, market: string, lineValue?: string | 
   return selection;
 }
 
-/** Для лайва — последние коэффициенты при текущем счёте; иначе последние по времени. Один ряд на (market, selection). */
+/** Для лайва показываем только коэффициенты на старте матча (первый снимок по времени), без привязки к текущему счёту. */
 function useLatestOddsByMarket(match: Match) {
   const snapshots = match.odds_snapshots ?? [];
   const isLive = match.status === "live";
-  const currentScore = isLive ? setsTotal(match) : null;
 
   return useMemo(() => {
     const byKey = new Map<string, OddsSnapshot[]>();
@@ -106,12 +107,7 @@ function useLatestOddsByMarket(match: Match) {
       const sorted = [...list].sort((a, b) => {
         const timeA = a.snapshot_time || a.timestamp || "";
         const timeB = b.snapshot_time || b.timestamp || "";
-        if (currentScore) {
-          const matchA = (a.score_at_snapshot || "").trim() === currentScore ? 1 : 0;
-          const matchB = (b.score_at_snapshot || "").trim() === currentScore ? 1 : 0;
-          if (matchB !== matchA) return matchB - matchA;
-        }
-        return new Date(timeB).getTime() - new Date(timeA).getTime();
+        return new Date(timeA).getTime() - new Date(timeB).getTime();
       });
       const first = sorted[0];
       if (first) latest.push({ market, selection, snapshot: first, history: sorted });
@@ -129,8 +125,8 @@ function useLatestOddsByMarket(match: Match) {
         return a.selection.localeCompare(b.selection);
       });
     }
-    return { byMarket, currentScore };
-  }, [snapshots, currentScore]);
+    return { byMarket, currentScore: null };
+  }, [snapshots]);
 }
 
 function OddsGrid({ match }: { match: Match }) {
@@ -162,9 +158,9 @@ function OddsGrid({ match }: { match: Match }) {
 
   return (
     <div className="space-y-6">
-      {currentScore && (
+      {isLive && (
         <p className="text-slate-400 text-sm">
-          При текущем счёте по сетам <span className="font-mono text-white">{currentScore}</span> показаны последние полученные коэффициенты. Нажмите на коэффициент — откроется история изменений.
+          Показаны коэффициенты на старте матча (в лайве не обновляются). Нажмите на коэффициент — откроется история снимков.
         </p>
       )}
       <div className="overflow-x-auto">
@@ -256,19 +252,20 @@ function OddsGrid({ match }: { match: Match }) {
               <tbody>
                 {(() => {
                   // Один ряд на счёт: для каждого score_at_snapshot оставляем только последний по времени снимок (убираем дубли)
+                  const ts = (v?: string | null): number => (v ? new Date(v).getTime() : 0);
                   const byScore = new Map<string, OddsSnapshot>();
                   for (const o of modal.history) {
                     const score = (o.score_at_snapshot || "").trim() || "—";
                     const existing = byScore.get(score);
-                    const t = (o.snapshot_time || o.timestamp || "") ? new Date(o.snapshot_time || o.timestamp).getTime() : 0;
-                    if (!existing || t > new Date(existing.snapshot_time || existing.timestamp || "").getTime()) {
+                    const t = ts(o.snapshot_time ?? o.timestamp ?? null);
+                    if (!existing || t > ts(existing.snapshot_time ?? existing.timestamp ?? null)) {
                       byScore.set(score, o);
                     }
                   }
                   const deduped = [...byScore.values()].sort((a, b) => {
-                    const ta = a.snapshot_time || a.timestamp || "";
-                    const tb = b.snapshot_time || b.timestamp || "";
-                    return new Date(tb).getTime() - new Date(ta).getTime();
+                    const ta = ts(a.snapshot_time ?? a.timestamp ?? null);
+                    const tb = ts(b.snapshot_time ?? b.timestamp ?? null);
+                    return tb - ta;
                   });
                   return deduped.map((o, i) => (
                     <tr key={i} className="border-b border-slate-800">
@@ -298,7 +295,7 @@ function OddsGrid({ match }: { match: Match }) {
 export default function MatchDetailPage() {
   const params = useParams();
   const id = params?.id as string | undefined;
-  const [match, setMatch] = useState<Match | null>(null);
+  const [match, setMatch] = useState<Match | null>(() => (id ? getCachedMatch(id) ?? null : null));
   const [statsHome, setStatsHome] = useState<PlayerStats | null>(null);
   const [statsAway, setStatsAway] = useState<PlayerStats | null>(null);
   const [analytics, setAnalytics] = useState<MatchAnalytics | null>(null);
@@ -306,6 +303,25 @@ export default function MatchDetailPage() {
   const [liveRecs, setLiveRecs] = useState<LiveRecommendationItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const refetchMatch = useCallback(() => {
+    if (!id) return;
+    fetchMatch(id)
+      .then((m) => {
+        const current = getCachedMatch(id);
+        if (!current || isMatchNewerThan(m, current)) {
+          setMatch(m);
+          setCachedMatches([m]);
+        }
+      })
+      .catch(() => {});
+  }, [id]);
+
+  useWebSocket((message) => {
+    if (message?.type === "matches_updated" && id && Array.isArray(message.match_ids) && message.match_ids.includes(id)) {
+      refetchMatch();
+    }
+  });
 
   React.useEffect(() => {
     if (!id) return;
@@ -317,7 +333,10 @@ export default function MatchDetailPage() {
     ])
       .then(([m, a, rec]) => {
         if (!cancelled) {
-          setMatch(m);
+          const current = getCachedMatch(id);
+          const nextMatch = !current || isMatchNewerThan(m, current) ? m : current;
+          setMatch(nextMatch);
+          setCachedMatches([nextMatch]);
           setAnalytics(a);
           setStoredRec(rec);
         }
@@ -457,17 +476,17 @@ export default function MatchDetailPage() {
           </div>
         )}
         <div className="border-t border-slate-700 pt-4">
-          <div className="text-slate-500 text-xs uppercase tracking-wider mb-2">Рекомендации по матчу</div>
+          <div className="text-slate-500 text-xs uppercase tracking-wider mb-2">Прогнозы по матчу</div>
 
           <div className="mb-4 p-3 rounded-lg bg-slate-800/60 border border-slate-700/80">
-            <div className="text-slate-400 text-xs uppercase tracking-wider mb-1">Полные рекомендации (прематч)</div>
+            <div className="text-slate-400 text-xs uppercase tracking-wider mb-1">Полный прогноз (прематч)</div>
             {storedRec ? (
               <>
                 <p className="text-emerald-400/95 text-sm font-medium">{storedRec}</p>
-                <p className="text-slate-500 text-xs mt-1">Сохранённая рекомендация из таблицы линии/лайва. Не пересчитывается.</p>
+                <p className="text-slate-500 text-xs mt-1">Сохранённый прогноз из таблицы линии/лайва. Не пересчитывается.</p>
               </>
             ) : (
-              <p className="text-slate-500 text-sm">Нет сохранённой рекомендации (прематч).</p>
+              <p className="text-slate-500 text-sm">Нет сохранённого прогноза (прематч).</p>
             )}
           </div>
 
@@ -485,7 +504,7 @@ export default function MatchDetailPage() {
                   ))}
                 </ul>
               ) : (
-                <p className="text-slate-500 text-sm">Нет рекомендаций в моменте: нет коэффициентов ≥ 1.3 на следующий сет или недостаточная вероятность.</p>
+                <p className="text-slate-500 text-sm">Нет прогнозов в моменте: нет коэффициентов ≥ 1.3 на следующий сет или недостаточная вероятность.</p>
               )}
             </div>
           )}

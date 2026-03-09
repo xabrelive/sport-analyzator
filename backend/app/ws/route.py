@@ -11,9 +11,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await ws_manager.connect(websocket)
     try:
         while True:
-            data = await websocket.receive_text()
-            # Optional: handle client messages (e.g. subscribe to match_id)
-            # For now we only broadcast from backend on match/odds updates
-            await websocket.send_json({"type": "pong", "data": data})
+            # Keep connection alive; updates are pushed by backend publishers.
+            await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)

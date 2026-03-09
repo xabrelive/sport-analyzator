@@ -17,12 +17,15 @@ from app.config import settings
 from app.db.session import get_async_session
 from app.models.user import User
 from app.schemas.auth import (
+    LinkTelegramBody,
+    LinkTelegramByCodeBody,
     RegisterTelegramBody,
     TelegramAuthPayload,
     TokenResponse,
     UserLogin,
     UserRegister,
 )
+from app.services.telegram_link_service import get_user_id_by_code, get_user_id_by_token
 from app.services.email import send_verification_email
 
 router = APIRouter()
@@ -56,6 +59,8 @@ async def get_current_user(
     user = r.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=401, detail="Пользователь не найден")
+    if getattr(user, "is_blocked", False):
+        raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
     return user
 
 
@@ -140,7 +145,8 @@ async def register(data: UserRegister, session: AsyncSession = Depends(get_async
         await session.commit()
         await session.refresh(user)
         token = create_verify_email_token(str(user.id))
-        verify_link = f"{settings.frontend_url}/verify-email?token={token}"
+        base = (settings.frontend_public_url or settings.frontend_url or "").rstrip("/")
+        verify_link = f"{base}/verify-email?token={token}"
         try:
             send_verification_email(data.email, verify_link)
         except Exception as e:
@@ -162,23 +168,27 @@ async def verify_email(
     session: AsyncSession = Depends(get_async_session),
 ):
     """Confirm email; redirect to login with success or error."""
+    base = (settings.frontend_public_url or settings.frontend_url or "").rstrip("/")
     user_id = decode_verify_email_token(token)
     if not user_id:
-        return RedirectResponse(url=f"{settings.frontend_url}/login?error=invalid_token", status_code=302)
+        return RedirectResponse(url=f"{base}/login?error=invalid_token", status_code=302)
     try:
         user_uuid = UUID(user_id)
     except ValueError:
-        return RedirectResponse(url=f"{settings.frontend_url}/login?error=invalid_token", status_code=302)
+        return RedirectResponse(url=f"{base}/login?error=invalid_token", status_code=302)
     r = await session.execute(select(User).where(User.id == user_uuid))
     user = r.scalar_one_or_none()
     if not user:
-        return RedirectResponse(url=f"{settings.frontend_url}/login?error=user_not_found", status_code=302)
+        return RedirectResponse(url=f"{base}/login?error=user_not_found", status_code=302)
+    if getattr(user, "is_blocked", False):
+        return RedirectResponse(url=f"{base}/login?error=blocked", status_code=302)
     user.email_verified = True
+    user.last_login_at = datetime.now(timezone.utc)
     await session.commit()
     # Optional: auto-login by redirecting with token
     access_token = create_access_token(str(user.id))
     return RedirectResponse(
-        url=f"{settings.frontend_url}/login?verified=1&token={access_token}",
+        url=f"{base}/login?verified=1&token={access_token}",
         status_code=302,
     )
 
@@ -194,6 +204,10 @@ async def login(data: UserLogin, session: AsyncSession = Depends(get_async_sessi
         raise HTTPException(status_code=403, detail="Подтвердите почту по ссылке из письма")
     if not user.hashed_password or not verify_password(data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
+    if getattr(user, "is_blocked", False):
+        raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
+    user.last_login_at = datetime.now(timezone.utc)
+    await session.commit()
     token = create_access_token(str(user.id))
     return TokenResponse(access_token=token)
 
@@ -213,24 +227,94 @@ async def register_telegram(
 ):
     """Called by Telegram bot after user confirmed and sent DOB + optional email. Creates user and returns token."""
     r = await session.execute(select(User).where(User.telegram_id == data.telegram_id))
-    if r.scalar_one_or_none() is not None:
+    existing = r.scalar_one_or_none()
+    if existing is not None:
+        if getattr(existing, "is_blocked", False):
+            raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
         raise HTTPException(status_code=400, detail="Telegram already registered")
     email = data.email if data.email else User.email_placeholder(data.telegram_id)
     r = await session.execute(select(User).where(User.email == email))
     if r.scalar_one_or_none() is not None:
         raise HTTPException(status_code=400, detail="Email already registered")
+    telegram_username = (data.username or "").strip().lstrip("@") or None
     user = User(
         email=email,
         hashed_password=None,
         email_verified=True,
         telegram_id=data.telegram_id,
+        telegram_username=telegram_username,
         date_of_birth=data.date_of_birth,
     )
     session.add(user)
     await session.commit()
     await session.refresh(user)
+    user.last_login_at = datetime.now(timezone.utc)
+    await session.commit()
     token = create_access_token(str(user.id))
     return TokenResponse(access_token=token)
+
+
+@router.post("/link-telegram")
+async def link_telegram(
+    data: LinkTelegramBody,
+    _: bool = Depends(require_bot_token),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Привязка Telegram к существующему аккаунту (вызов от бота после /start link_XXX)."""
+    user_id = await get_user_id_by_token(data.token)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Неверная или просроченная ссылка. Запросите новую в личном кабинете.")
+    r = await session.execute(select(User).where(User.id == user_id))
+    user = r.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    if getattr(user, "is_blocked", False):
+        raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
+    if user.telegram_id is not None:
+        raise HTTPException(status_code=400, detail="К аккаунту уже привязан другой Telegram.")
+    r = await session.execute(select(User).where(User.telegram_id == data.telegram_id))
+    if r.scalar_one_or_none() is not None:
+        raise HTTPException(status_code=400, detail="Этот Telegram уже привязан к другому аккаунту.")
+    telegram_username = (data.username or "").strip().lstrip("@") or None
+    user.telegram_id = data.telegram_id
+    user.telegram_username = telegram_username
+    await session.commit()
+    return {"ok": True, "message": "Telegram привязан к аккаунту."}
+
+
+@router.post("/link-telegram-by-code")
+async def link_telegram_by_code(
+    data: LinkTelegramByCodeBody,
+    _: bool = Depends(require_bot_token),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Привязка Telegram по коду: пользователь получает код в личном кабинете и отправляет его боту. Один аккаунт — один Telegram."""
+    user_id = await get_user_id_by_code(data.code)
+    if not user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Неверный или просроченный код. Запросите новый в личном кабинете.",
+        )
+    r = await session.execute(select(User).where(User.id == user_id))
+    user = r.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    if getattr(user, "is_blocked", False):
+        raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
+    if user.telegram_id is not None:
+        raise HTTPException(status_code=400, detail="К аккаунту уже привязан Telegram.")
+    r = await session.execute(select(User).where(User.telegram_id == data.telegram_id))
+    other = r.scalar_one_or_none()
+    if other is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Этот Telegram уже привязан к другому аккаунту. Один Telegram — один аккаунт.",
+        )
+    telegram_username = (data.username or "").strip().lstrip("@") or None
+    user.telegram_id = data.telegram_id
+    user.telegram_username = telegram_username
+    await session.commit()
+    return {"ok": True, "message": "Telegram привязан к аккаунту."}
 
 
 @router.post("/login-telegram", response_model=TokenResponse)
@@ -248,5 +332,9 @@ async def login_telegram(
             status_code=404,
             detail="Сначала зарегистрируйтесь через бота в Telegram",
         )
+    if getattr(user, "is_blocked", False):
+        raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
+    user.last_login_at = datetime.now(timezone.utc)
+    await session.commit()
     token = create_access_token(str(user.id))
     return TokenResponse(access_token=token)

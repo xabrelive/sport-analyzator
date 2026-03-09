@@ -8,14 +8,11 @@ import { SPORTS } from "@/lib/sports";
 const SPORT_LINKS = [
   { href: "/line", label: "Линия" },
   { href: "/live", label: "Лайв" },
-  { href: "/results", label: "Результаты" },
-  { href: "/leagues", label: "Лиги" },
-] as const;
-
-const OTHER_LINKS = [
-  { href: "/players", label: "Игроки" },
   { href: "/signals", label: "Сигналы" },
   { href: "/stats", label: "Статистика" },
+  { href: "/results", label: "Результаты" },
+  { href: "/leagues", label: "Лиги" },
+  { href: "/players", label: "Игроки" },
 ] as const;
 
 function NavLink({
@@ -30,6 +27,7 @@ function NavLink({
   return (
     <Link
       href={href}
+      prefetch={false}
       className={`block px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
         isActive
           ? "bg-teal-500/20 text-teal-400 border-l-2 border-teal-500"
@@ -52,6 +50,11 @@ export function Sidebar() {
           href="/dashboard"
           label="Дашборд"
           isActive={pathname === "/dashboard"}
+        />
+        <NavLink
+          href="/me"
+          label="Кабинет"
+          isActive={pathname === "/me"}
         />
         <div className="pt-4 space-y-0.5">
           {SPORTS.map((sport) => {
@@ -79,6 +82,7 @@ export function Sidebar() {
                   {sport.available ? (
                     <Link
                       href={`/sports/${sport.slug}`}
+                      prefetch={false}
                       className={`flex-1 min-w-0 py-2 pr-2 rounded-lg text-xs font-semibold uppercase tracking-wider truncate transition-colors ${
                         isSportPage
                           ? "text-teal-400 bg-teal-500/10"
@@ -101,12 +105,6 @@ export function Sidebar() {
                 {hasSubLinks && isExpanded && (
                   <div className="mt-0.5 pl-5 space-y-0.5">
                     {SPORT_LINKS.map(({ href, label }) => {
-                      const isActive = pathname === href || pathname.startsWith(href + "/");
-                      return (
-                        <NavLink key={href} href={href} label={label} isActive={isActive} />
-                      );
-                    })}
-                    {OTHER_LINKS.map(({ href, label }) => {
                       const isActive = pathname === href || pathname.startsWith(href + "/");
                       return (
                         <NavLink key={href} href={href} label={label} isActive={isActive} />

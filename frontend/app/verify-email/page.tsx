@@ -1,11 +1,11 @@
 "use client";
 
+import { Suspense, useEffect } from "react";
 import { useSearchParams } from "next/navigation";
-import { useEffect } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:11001";
 
-export default function VerifyEmailPage() {
+function VerifyEmailContent() {
   const searchParams = useSearchParams();
   const token = searchParams.get("token");
 
@@ -34,5 +34,21 @@ export default function VerifyEmailPage() {
         <p className="mt-2 text-sm">Вы будете перенаправлены на страницу входа.</p>
       </div>
     </main>
+  );
+}
+
+export default function VerifyEmailPage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="min-h-[80vh] flex items-center justify-center px-4">
+          <div className="text-center text-slate-400">
+            <p>Подтверждение почты…</p>
+          </div>
+        </main>
+      }
+    >
+      <VerifyEmailContent />
+    </Suspense>
   );
 }

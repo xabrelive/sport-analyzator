@@ -21,11 +21,15 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24 * 7
     frontend_url: str = "http://localhost:11000"  # for email verification link
+    # Публичный URL для ссылок в сообщениях (TG, email). Если задан — в ссылках используется он вместо frontend_url (например https://pingwin.pro).
+    frontend_public_url: str = ""
 
     # API
     api_v1_prefix: str = "/api/v1"
     debug: bool = False
     admin_secret: str = ""  # X-Admin-Key для выдачи подписок по user_id
+    # Доп. CORS origins (через запятую), например http://192.168.31.130:3000 для доступа по LAN
+    cors_extra_origins: str = ""
 
     # Providers
     sportradar_api_key: str = ""
@@ -37,9 +41,32 @@ class Settings(BaseSettings):
     # Ранее лимит на кол-во матчей для event/odds; сейчас: лайв — все, линия — один раз (не используется)
     betsapi_max_events_for_odds: int = 50
 
-    # Telegram (for signal engine)
+    # Telegram (for signal engine and per-user delivery)
     telegram_bot_token: str = ""
-    telegram_signals_chat_id: str = ""
+    telegram_bot_username: str = ""  # для ссылки привязки: t.me/{username}?start=link_XXX
+    # Каналы рассылки: бесплатный и платный (ID чата/канала или @username)
+    telegram_signals_chat_id: str = ""           # бесплатные сигналы (3–4 в сутки, кф ≤2, уверенность ~100%)
+    telegram_signals_paid_chat_id: str = ""      # платные сигналы
+    # Бесплатный канал: пока не отправляем (free_channel_enabled=False). При True — до 3–4 в сутки.
+    free_channel_enabled: bool = False
+    free_channel_max_per_day: int = 4
+    free_channel_min_confidence_pct: float = 98.0   # уверенность близкая к 100%
+    free_channel_max_odds: float = 2.0               # кф до 2
+    free_channel_min_minutes_before_start: int = 60  # до начала матча не менее 60 мин
+    free_channel_window_start_hour_msk: int = 9      # окно рассылки МСК: с 9:00
+    free_channel_window_end_hour_msk: int = 21      # по 21:00
+    free_channel_min_interval_minutes: int = 60     # минимум 1 час между сообщениями
+    # Платный канал: 1–3 раза в час, один прогноз с макс. вероятностью захода (по спорту); экспресс — позже
+    paid_channel_max_per_hour: int = 3
+    paid_channel_min_interval_minutes: int = 20    # минимум ~20 мин между сообщениями (чтобы не больше 3/час)
+
+    # Email (SMTP для рассылки сигналов и писем; если не задано — только логирование)
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_use_tls: bool = True
 
     # Value / Probability
     value_ev_threshold: float = 0.05
@@ -47,13 +74,54 @@ class Settings(BaseSettings):
     max_odds: float = 50.0
 
     # Интервалы опроса внешних API (BetsAPI, The Odds API, Sportradar)
-    live_poll_interval_seconds: int = 3   # 1 запрос/цикл → раз в 3 сек ≈ 1200/час, счёт по сетам в реальном времени
-    live_odds_poll_interval_seconds: int = 30  # inplay + event/odds по каждому — раз в 30 сек, актуальные коэффициенты
-    prematch_poll_interval_seconds: int = 600  # линия+лайв полный цикл (view+odds) — раз в 5–10 мин
+    # Лайв каждые 5 с при многих inplay может дать >3600/час; 8 с оставляет запас (линия + disappeared + архив).
+    live_poll_interval_seconds: int = 8
+    live_odds_poll_interval_seconds: int = 30  # The Odds API (если задан ключ)
+    prematch_poll_interval_seconds: int = 900  # Линия: upcoming + view + odds (до перехода в лайв). Увеличено для снижения нагрузки.
 
-    # Флаг для остановки всех периодических запросов к внешним API (игры, обновления, коэффициенты).
-    # По умолчанию выключено, чтобы не опрашивать поставщиков, пока не включим явно через .env.
-    enable_scheduled_collectors: bool = False
+    # Лимит запросов BetsAPI: 3600/час — распределяем между линией, лайвом, архивом, disappeared
+    betsapi_rate_limit_per_hour: int = 3600
+    # За один цикл линии — макс. запросов event/odds (остальное — upcoming + view). Больше = быстрее появятся кф у всех.
+    betsapi_line_max_odds_requests_per_run: int = 100
+
+    # Авто-загрузка архива BetsAPI: раз в 2 часа, за текущий и предыдущий день
+    betsapi_history_auto_interval_seconds: int = 7200  # 2 часа
+    betsapi_history_auto_days: int = 2  # сегодня + вчера
+    betsapi_history_delay_seconds: float = 2.0         # пауза между страницами day/page при автозагрузке
+    # Авто-backfill рекомендаций для активных матчей (чтобы stats/таблицы не отставали).
+    recommendations_backfill_interval_seconds: int = 60
+    recommendations_backfill_active_limit: int = 300
+    # Рекомендации: учитывать только матчи за последние N дней (приоритет свежей формы).
+    recommendation_lookback_days: int = 180
+    # При достаточном кол-ве матчей за последние N дней — использовать это окно (неделя/месяц).
+    recommendation_prefer_recent_days: int | None = 30
+    # Минимум матчей в лиге у каждого игрока, чтобы использовать статистику по лиге; иначе — по всем лигам.
+    recommendation_min_matches_in_league: int = 3
+    # Backpressure для ручной/авто загрузки архива: не даём history забить очередь normalize
+    # Для больших ручных прогонов история может стартовать при уже большой очереди normalize.
+    # Низкий порог полностью "замораживает" загрузку на часы.
+    betsapi_history_normalize_queue_max_depth: int = 10000
+    betsapi_history_backpressure_sleep_seconds: float = 0.5
+
+    # Догрузка результатов при сбоях: матчи без результата, старт > 2ч назад; не более 3 попыток (2ч, 7ч, 24ч от начала)
+    result_backfill_interval_seconds: int = 120  # раз в 2 минуты проверять и догружать
+    result_backfill_batch_size: int = 10  # макс. матчей за один запуск
+
+    # Матч пропал из inplay без результата: повторные запросы через 15 мин, 1 ч, 2 ч (в секундах)
+    disappeared_retry_delays_seconds: tuple[int, ...] = (15 * 60, 60 * 60, 2 * 60 * 60)
+    disappeared_retry_max_attempts: int = 3
+
+    # Биллинг (YooKassa)
+    yookassa_shop_id: str = ""
+    yookassa_secret_key: str = ""
+    yookassa_webhook_secret: str = ""  # опционально для проверки подписи
+    billing_return_url: str = ""  # куда вернуть после оплаты (frontend URL)
+    billing_success_path: str = "/pricing?paid=1"
+    enable_demo_grant: bool = False  # если True — POST /me/subscriptions выдаёт подписку без оплаты (для тестов)
+
+    # Флаги для управления плановыми задачами
+    enable_scheduled_collectors: bool = False          # включить live/full/odds
+    enable_betsapi_history_auto: bool = False          # включить автоматическую загрузку архива (только за сегодня)
 
     @property
     def async_database_url(self) -> str:

@@ -7,7 +7,6 @@ Run: TELEGRAM_BOT_TOKEN=... BACKEND_URL=http://localhost:11001 python -m scripts
 from datetime import datetime
 import logging
 import os
-import re
 
 import httpx
 from telegram import Update
@@ -32,7 +31,70 @@ def parse_date(text: str) -> datetime | None:
         return None
 
 
+async def link_by_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Привязка по коду: пользователь отправил 6-значный код с сайта."""
+    code = update.message.text.strip()
+    user = update.effective_user
+    if not user:
+        await update.message.reply_text("Ошибка: не удалось определить пользователя.")
+        return
+    headers = {"Content-Type": "application/json", "X-Bot-Token": TELEGRAM_BOT_TOKEN}
+    payload = {
+        "code": code,
+        "telegram_id": user.id,
+        "username": user.username,
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{BACKEND_URL}/api/v1/auth/link-telegram-by-code",
+                json=payload,
+                headers=headers,
+                timeout=10.0,
+            )
+        if r.status_code == 200:
+            await update.message.reply_text("Telegram привязан к вашему аккаунту. Уведомления о прогнозах будут приходить только вам в этот чат.")
+        else:
+            err = r.json().get("detail", r.text) if r.headers.get("content-type", "").startswith("application/json") else r.text
+            await update.message.reply_text(f"Не удалось привязать: {err}\n\nЗапросите новый код в личном кабинете на сайте.")
+    except Exception as e:
+        logger.exception("link-telegram-by-code request failed: %s", e)
+        await update.message.reply_text("Сервис временно недоступен. Попробуйте позже.")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Привязка Telegram к аккаунту (ссылка из личного кабинета)
+    if context.args and context.args[0].startswith("link_"):
+        token = context.args[0][5:]
+        user = update.effective_user
+        if not user:
+            await update.message.reply_text("Ошибка: не удалось определить пользователя.")
+            return ConversationHandler.END
+        headers = {"Content-Type": "application/json", "X-Bot-Token": TELEGRAM_BOT_TOKEN}
+        payload = {
+            "token": token,
+            "telegram_id": user.id,
+            "username": user.username,
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    f"{BACKEND_URL}/api/v1/auth/link-telegram",
+                    json=payload,
+                    headers=headers,
+                    timeout=10.0,
+                )
+            if r.status_code == 200:
+                await update.message.reply_text("Telegram привязан к вашему аккаунту. Уведомления будут приходить только вам в этот чат.")
+            else:
+                err = r.json().get("detail", r.text) if r.headers.get("content-type", "").startswith("application/json") else r.text
+                await update.message.reply_text(f"Не удалось привязать: {err}")
+        except Exception as e:
+            logger.exception("link-telegram request failed: %s", e)
+            await update.message.reply_text("Сервис временно недоступен. Попробуйте позже.")
+        return ConversationHandler.END
+
+    # Регистрация нового пользователя
     await update.message.reply_text(
         "Подтвердите регистрацию в PingWin.\n\n"
         "Укажите дату рождения в формате ГГГГ-ММ-ДД (например 1990-05-15):"
@@ -113,6 +175,10 @@ def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Привязка по коду (6 цифр) — обрабатываем до регистрации, чтобы код с сайта сработал
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^\d{6}$"), link_by_code),
+    )
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={

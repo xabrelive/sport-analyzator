@@ -103,6 +103,7 @@ export function ResultsMatchRow({ match }: ResultsMatchRowProps) {
       <td className="py-2 pl-2">
         <Link
           href={`/match/${match.id}`}
+          prefetch={false}
           className="inline-flex items-center gap-1 text-xs font-medium text-teal-400 hover:text-teal-300 w-fit"
           onClick={(e) => e.stopPropagation()}
         >

@@ -42,3 +42,17 @@ class TelegramAuthPayload(BaseModel):
     photo_url: str | None = None
     auth_date: int
     hash: str
+
+
+# Привязка Telegram к аккаунту (вызов от бота после /start link_XXX)
+class LinkTelegramBody(BaseModel):
+    token: str
+    telegram_id: int
+    username: str | None = None
+
+
+# Привязка по коду: пользователь получает код на сайте и пишет его боту
+class LinkTelegramByCodeBody(BaseModel):
+    code: str
+    telegram_id: int
+    username: str | None = None

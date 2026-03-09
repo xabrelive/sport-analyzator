@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { Match, OddsSnapshot } from "@/lib/api";
-import { formatHoursUntil } from "@/lib/format";
+import { formatHoursUntil, formatDateTimeWithYear } from "@/lib/format";
 
 /** Рынок «победитель матча»: winner/win (общие) или 92_1 (BetsAPI Match Winner 2-Way). */
 const WINNER_MARKETS = ["winner", "win", "92_1"];
@@ -44,12 +44,12 @@ function getWinnerOdds(odds: OddsSnapshot[] | undefined): { home: string; away: 
 
 export interface LineMatchRowProps {
   match: Match;
-  /** Текст рекомендации по матчу (из сигнала или расчёта); null = мало данных */
+  /** Текст прогноза по матчу (из сигнала или расчёта); null = мало данных */
   recommendation?: string | null;
   showAnalyticsBlur?: boolean;
 }
 
-/** Форматирует сигнал в короткую рекомендацию для линии. */
+/** Форматирует сигнал в короткий прогноз для линии. */
 export function formatSignalRecommendation(marketType: string, selection: string): string {
   const m = marketType.toLowerCase();
   const s = (selection || "").toLowerCase();
@@ -114,6 +114,9 @@ export function LineMatchRow({ match, recommendation, showAnalyticsBlur }: LineM
       <td className="py-2.5 pr-3 text-slate-400 text-sm whitespace-nowrap">
         {formatHoursUntil(match.start_time)}
       </td>
+      <td className="py-2.5 pr-3 text-slate-400 text-xs whitespace-nowrap">
+        {formatDateTimeWithYear(match.start_time)}
+      </td>
       <td className="py-2.5 pr-3 min-w-0">
         {homeHref ? (
           <span
@@ -170,7 +173,7 @@ export function LineMatchRow({ match, recommendation, showAnalyticsBlur }: LineM
       </td>
       <td className="py-2.5 pl-2 max-w-[220px]">
         {showAnalyticsBlur ? (
-          <Link href={`/match/${match.id}`} onClick={(e) => e.stopPropagation()} className="text-teal-400 hover:text-teal-300 text-xs">
+          <Link href={`/match/${match.id}`} prefetch={false} onClick={(e) => e.stopPropagation()} className="text-teal-400 hover:text-teal-300 text-xs">
             <span className="text-transparent select-none blur-sm bg-white/20 rounded">Подробнее</span>
           </Link>
         ) : (
@@ -180,6 +183,7 @@ export function LineMatchRow({ match, recommendation, showAnalyticsBlur }: LineM
             </span>
             <Link
               href={`/match/${match.id}`}
+              prefetch={false}
               className="inline-flex items-center gap-1 text-xs font-medium text-teal-400 hover:text-teal-300 w-fit"
               onClick={(e) => e.stopPropagation()}
             >

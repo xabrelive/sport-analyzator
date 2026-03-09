@@ -5,37 +5,74 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, or_, select, func
+from sqlalchemy import and_, or_, select, func, exists, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import set_committed_value
+
+import httpx
 
 from app.db.session import get_async_session
+from app.config import settings
+from app.api.v1.admin import require_admin
 from app.models import Match, MatchStatus, BetsapiArchiveProgress
 from app.models.match_result import MatchResult
 from app.models.match_recommendation import MatchRecommendation
 from app.models.odds_snapshot import OddsSnapshot
 from app.schemas.match import MatchDetail, MatchList, MatchListWithOdds, MatchListWithResult, FinishedMatchesResponse
-from app.services.player_stats_service import compute_player_stats
-from app.services.analytics_service import first_recommendation_text
-from app.worker.tasks.collect_betsapi import load_betsapi_history_task
+from app.worker.tasks.collect_betsapi import load_betsapi_history_task, backfill_missing_results_task
+from app.services.normalizer import Normalizer
+
+
+class MatchesOverviewResponse(BaseModel):
+    """Лайв и линия в одном ответе — один запрос вместо двух."""
+    live: list[MatchListWithOdds] = Field(default_factory=list, description="Матчи в лайве + недавно завершённые")
+    upcoming: list[MatchListWithOdds] = Field(default_factory=list, description="Матчи в линии (до начала)")
+
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 LIVE_RECENTLY_FINISHED_MINUTES = 5
-# В «линии» показываем только матчи, время начала которых ещё не прошло (или прошло не более 15 мин — запас на переход в лайв)
+# В «линии» показываем только матчи, время начала которых ещё не прошло (или прошло не более 15 мин — буфер).
 UPCOMING_START_CUTOFF_MINUTES = 15
+
+# Минимальный коэффициент, при котором рекомендация считается «играбельной».
+MIN_RECOMMENDATION_ODDS = 1.4
 
 
 class LoadHistoryRequest(BaseModel):
     """Параметры ручной загрузки архива завершённых матчей BetsAPI."""
     day_from: str = Field(default="20160901", description="Начальная дата YYYYMMDD (min 20160901)")
     day_to: str | None = Field(default=None, description="Конечная дата YYYYMMDD, по умолчанию сегодня")
-    delay_seconds: float = Field(default=7.0, ge=1, le=60, description="Пауза между запросами к API (сек)")
+    delay_seconds: float = Field(default=1.0, ge=0, le=60, description="Пауза между запросами к API (сек)")
+    resume_from_progress: bool = Field(
+        default=True,
+        description="Продолжить с незавершённой даты/следующей после последней завершённой в диапазоне",
+    )
 
 
 class LoadHistoryResponse(BaseModel):
     task_id: str
+    message: str
+
+
+class BackfillResultsResponse(BaseModel):
+    task_id: str
+    message: str
+
+
+class ResetProgressRequest(BaseModel):
+    day_from: str = Field(description="Начало диапазона YYYYMMDD")
+    day_to: str = Field(description="Конец диапазона YYYYMMDD")
+    reset_single_page_only: bool = Field(
+        default=True,
+        description="Сбросить только дни с last_processed_page=1 (пересобрать «одностраничные» дни)",
+    )
+
+
+class ResetProgressResponse(BaseModel):
+    reset_days: list[str] = Field(description="Дни, для которых сброшен прогресс")
     message: str
 
 
@@ -51,6 +88,62 @@ class LoadHistoryStatusResponse(BaseModel):
     completed: list[str]
     not_completed: list[str]
     progress: list[DayProgress] = Field(default_factory=list, description="По дням: страница и признак завершения")
+    single_page_days: list[str] = Field(
+        default_factory=list,
+        description="Дни, помеченные завершёнными с last_processed_page=1 (кандидаты на пересборку)",
+    )
+
+
+class LineStatusResponse(BaseModel):
+    """Диагностика: запрашивается ли линия, почему может быть пустой."""
+    scheduler_enabled: bool = Field(description="ENABLE_SCHEDULED_COLLECTORS — задача линии в расписании Beat")
+    token_set: bool = Field(description="BETSAPI_TOKEN задан")
+    upcoming_in_db: int = Field(description="Матчей в БД (scheduled/pending_odds, start_time >= now-15min)")
+    line_rate_limited_ttl_sec: int | None = Field(default=None, description="Пауза после 429 (сек до возобновления)")
+    debug_hint: str | None = Field(default=None, description="Подсказка по отладке при пустой линии")
+
+
+@router.get("/line-status", response_model=LineStatusResponse)
+async def get_line_status(session: AsyncSession = Depends(get_async_session)):
+    """Диагностика линии: включён ли планировщик, задан ли токен, сколько матчей в БД, пауза после 429."""
+    now = datetime.now(timezone.utc)
+    upcoming_cutoff = now - timedelta(minutes=UPCOMING_START_CUTOFF_MINUTES)
+    scheduler_enabled = getattr(settings, "enable_scheduled_collectors", False)
+    token_set = bool((settings.betsapi_token or "").strip())
+    q = select(func.count(Match.id)).where(
+        or_(
+            Match.status == MatchStatus.SCHEDULED.value,
+            Match.status == MatchStatus.PENDING_ODDS.value,
+        ),
+        Match.start_time >= upcoming_cutoff,
+    )
+    upcoming_in_db = (await session.execute(q)).scalar() or 0
+    line_rate_limited_ttl_sec: int | None = None
+    try:
+        from redis.asyncio import from_url as redis_from_url
+        r = redis_from_url(settings.redis_url, decode_responses=True)
+        try:
+            ttl = await r.ttl("betsapi:line_rate_limited")
+            if ttl > 0:
+                line_rate_limited_ttl_sec = ttl
+        finally:
+            await r.aclose()
+    except Exception:
+        pass
+    debug_hint: str | None = None
+    if upcoming_in_db == 0 and token_set and scheduler_enabled:
+        debug_hint = (
+            "Запустите задачу линии вручную и смотрите логи celery_betsapi_worker: "
+            "«BetsAPI events/upcoming» (пришли ли события), «BetsAPI line: got N events», «normalize_betsapi: events=...» (сколько сохранено). "
+            "Команда: docker compose run --rm celery_betsapi_worker uv run celery -A app.worker.celery_app call app.worker.tasks.collect_betsapi.fetch_betsapi_table_tennis_task --kwargs='{\"mode\": \"line\"}'"
+        )
+    return LineStatusResponse(
+        scheduler_enabled=scheduler_enabled,
+        token_set=token_set,
+        upcoming_in_db=upcoming_in_db,
+        line_rate_limited_ttl_sec=line_rate_limited_ttl_sec,
+        debug_hint=debug_hint,
+    )
 
 
 def _days_in_range(day_from: str, day_to: str) -> list[str]:
@@ -62,6 +155,138 @@ def _days_in_range(day_from: str, day_to: str) -> list[str]:
         out.append(d.strftime("%Y%m%d"))
         d += timedelta(days=1)
     return out
+
+
+async def _attach_latest_odds_snapshots(session: AsyncSession, matches: list[Match]) -> None:
+    """Attach latest odds snapshot per (market, selection, phase) for each match."""
+    if not matches:
+        return
+    match_ids = [m.id for m in matches]
+    ranked = (
+        select(
+            OddsSnapshot.id.label("snapshot_id"),
+            func.row_number().over(
+                partition_by=(
+                    OddsSnapshot.match_id,
+                    OddsSnapshot.market,
+                    OddsSnapshot.selection,
+                    OddsSnapshot.phase,
+                ),
+                order_by=func.coalesce(OddsSnapshot.snapshot_time, OddsSnapshot.timestamp).desc(),
+            ).label("rn"),
+        )
+        .where(OddsSnapshot.match_id.in_(match_ids))
+        .subquery()
+    )
+    latest_q = (
+        select(OddsSnapshot)
+        .join(ranked, ranked.c.snapshot_id == OddsSnapshot.id)
+        .where(ranked.c.rn == 1)
+    )
+    latest = (await session.execute(latest_q)).scalars().all()
+    grouped: dict[UUID, list[OddsSnapshot]] = {}
+    for item in latest:
+        grouped.setdefault(item.match_id, []).append(item)
+    for match in matches:
+        set_committed_value(match, "odds_snapshots", grouped.get(match.id, []))
+
+
+async def _attach_earliest_odds_snapshots_for_live(session: AsyncSession, match: Match) -> None:
+    """Для лайв-матча оставляет только снимки на старте (earliest по времени) — кф в лайве не обновляются."""
+    if not match.id or (match.status or "").strip().lower() != MatchStatus.LIVE.value:
+        return
+    ranked = (
+        select(
+            OddsSnapshot.id.label("snapshot_id"),
+            func.row_number().over(
+                partition_by=(
+                    OddsSnapshot.market,
+                    OddsSnapshot.selection,
+                    OddsSnapshot.phase,
+                ),
+                order_by=func.coalesce(OddsSnapshot.snapshot_time, OddsSnapshot.timestamp).asc(),
+            ).label("rn"),
+        )
+        .where(OddsSnapshot.match_id == match.id)
+        .subquery()
+    )
+    earliest_q = (
+        select(OddsSnapshot)
+        .join(ranked, ranked.c.snapshot_id == OddsSnapshot.id)
+        .where(ranked.c.rn == 1)
+    )
+    earliest = (await session.execute(earliest_q)).scalars().all()
+    set_committed_value(match, "odds_snapshots", list(earliest))
+
+
+async def _refresh_live_from_betsapi(session: AsyncSession) -> int:
+    """
+    Fallback: если в БД нет лайв-матчей, один раз подтягиваем события из BetsAPI /events/inplay
+    и нормализуем их напрямую, без очереди Celery.
+    """
+    token = (settings.betsapi_token or "").strip()
+    if not token:
+        return 0
+    sid = getattr(settings, "betsapi_table_tennis_sport_id", 92)
+    base = "https://api.b365api.com/v3"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(f"{base}/events/inplay", params={"sport_id": sid, "token": token})
+        if not r.is_success:
+            logger.warning("BetsAPI live fallback: HTTP %s body=%s", r.status_code, (r.text or "")[:200])
+            return 0
+        data = r.json() or {}
+    except Exception as e:
+        logger.warning("BetsAPI live fallback request failed: %s", e)
+        return 0
+
+    results_raw = data.get("results") or data.get("events") or data.get("data")
+    if not isinstance(results_raw, list) or not results_raw:
+        return 0
+
+    events: list[dict] = []
+    current_ids: set[str] = set()
+    for ev in results_raw:
+        if not isinstance(ev, dict):
+            continue
+        e = dict(ev)
+        e["_source"] = "inplay"
+        eid = e.get("id") or e.get("event_id")
+        if eid is None:
+            continue
+        eid_str = str(eid)
+        current_ids.add(eid_str)
+        events.append(e)
+    if not events:
+        return 0
+
+    norm = Normalizer(session)
+    try:
+        match_ids = await norm.normalize_betsapi_response(events, current_event_ids=current_ids)
+        # Гарантируем, что все текущие inplay‑матчи помечены как LIVE, а не застряли
+        # в scheduled/pending_odds (как бывает при рассинхроне пайплайнов линии/лайва).
+        from sqlalchemy import update
+        from app.models import MatchStatus as _MS
+
+        if current_ids:
+            try:
+                stmt = (
+                    update(Match)
+                    .where(
+                        Match.provider == "betsapi",
+                        Match.provider_match_id.in_(list(current_ids)),
+                        Match.status.in_([_MS.SCHEDULED.value, _MS.PENDING_ODDS.value]),
+                    )
+                    .values(status=_MS.LIVE.value)
+                )
+                await session.execute(stmt)
+                await session.commit()
+            except Exception as e2:
+                logger.warning("live fallback: failed to force LIVE status for inplay matches: %s", e2)
+        return len(match_ids)
+    except Exception as e:
+        logger.warning("BetsAPI live fallback normalize failed: %s", e)
+        return 0
 
 
 @router.get("", response_model=list[MatchList])
@@ -99,10 +324,8 @@ async def get_matches_recommendations(
     session: AsyncSession = Depends(get_async_session),
 ):
     """
-    Рекомендация по матчу для отображения в таблице линия/лайв.
-    Если рекомендация уже сохранена (MatchRecommendation) — возвращаем её (как в статистике).
-    Иначе считаем first_recommendation_text и при наличии — сохраняем и возвращаем.
-    Возвращает: { "match_id_uuid": "П1 победа в матче (72%)" или null }.
+    Только сохранённые прогнозы (те же, что в статистике).
+    Расчёт выполняется автоматически воркером для матчей линии/лайва (после сбора кф); фронт запрашивает по id матчей с коэффициентами и отображает в таблице.
     """
     out: dict[str, str | None] = {}
     raw = [x.strip() for x in match_ids.split(",") if x.strip()]
@@ -115,92 +338,92 @@ async def get_matches_recommendations(
     ids = list(dict.fromkeys(ids))[:150]
     if not ids:
         return out
-    # Сначала загружаем сохранённые рекомендации — в таблице показываем то же, что в статистике
-    stored_q = select(MatchRecommendation.match_id, MatchRecommendation.recommendation_text).where(
-        MatchRecommendation.match_id.in_(ids)
+    # Сначала загружаем сохранённые прогнозы — в таблице показываем то же, что в статистике.
+    # Игнорируем прогнозы с заведомо низким коэффициентом (ниже MIN_RECOMMENDATION_ODDS).
+    stored_q = (
+        select(
+            MatchRecommendation.match_id,
+            MatchRecommendation.recommendation_text,
+            MatchRecommendation.odds_at_recommendation,
+        )
+        .where(MatchRecommendation.match_id.in_(ids))
+        .where(
+            (MatchRecommendation.odds_at_recommendation.is_(None))
+            | (MatchRecommendation.odds_at_recommendation >= MIN_RECOMMENDATION_ODDS)
+        )
     )
     stored_r = await session.execute(stored_q)
     stored = {str(row[0]): row[1] for row in stored_r.all()}
-    need_compute = [mid for mid in ids if str(mid) not in stored or stored.get(str(mid)) is None]
     for mid in ids:
         if str(mid) in stored and stored[str(mid)]:
             out[str(mid)] = stored[str(mid)]
             continue
         out[str(mid)] = None
-    if not need_compute:
-        return out
-    q = select(Match).where(Match.id.in_(need_compute))
-    result = await session.execute(q)
-    matches = {m.id: m for m in result.scalars().all()}
-    for mid in need_compute:
-        match = matches.get(mid)
-        if not match or not match.home_player_id or not match.away_player_id:
-            continue
-        stats_home = await compute_player_stats(session, match.home_player_id)
-        stats_away = await compute_player_stats(session, match.away_player_id)
-        rec = first_recommendation_text(stats_home, stats_away)
-        out[str(mid)] = rec
-        if rec:
-            existing = await session.execute(select(MatchRecommendation).where(MatchRecommendation.match_id == mid))
-            if existing.scalar_one_or_none() is None:
-                odds_val: float | None = None
-                rec_lower = rec.lower()
-                if "п1" in rec_lower:
-                    side = "home"
-                elif "п2" in rec_lower:
-                    side = "away"
-                else:
-                    side = None
-                if side is not None:
-                    odds_q = (
-                        select(OddsSnapshot)
-                        .where(
-                            OddsSnapshot.match_id == mid,
-                            OddsSnapshot.market.in_(["winner", "92_1", "win"]),
-                        )
-                        .order_by(
-                            OddsSnapshot.snapshot_time.asc().nullslast(),
-                            OddsSnapshot.timestamp.asc().nullslast(),
-                        )
-                        .limit(50)
-                    )
-                    odds_result = await session.execute(odds_q)
-                    snaps = odds_result.scalars().all()
-                    for s in snaps:
-                        sel = (s.selection or "").lower()
-                        if odds_val is None and side == "home" and sel in ("home", "1"):
-                            odds_val = float(s.odds)
-                            break
-                        if odds_val is None and side == "away" and sel in ("away", "2"):
-                            odds_val = float(s.odds)
-                            break
-                session.add(MatchRecommendation(match_id=mid, recommendation_text=rec, odds_at_recommendation=odds_val))
-                logger.info(
-                    "recommendation_saved match_id=%s recommendation_text=%s odds=%s",
-                    str(mid),
-                    rec[:200] if len(rec) > 200 else rec,
-                    odds_val,
-                )
-    try:
-        await session.commit()
-    except Exception as e:
-        logger.warning("Failed to persist match recommendations: %s", e)
+    missing_count = sum(1 for mid in ids if out.get(str(mid)) is None)
+    if missing_count:
+        logger.info("matches/recommendations: %s match(es) have no stored recommendation", missing_count)
     return out
 
 
 @router.post("/load-history", response_model=LoadHistoryResponse)
-async def load_history(body: LoadHistoryRequest):
+async def load_history(
+    body: LoadHistoryRequest,
+    session: AsyncSession = Depends(get_async_session),
+):
     """Ручной запуск загрузки архива BetsAPI (GET /v3/events/ended по дням).
     Задача выполняется в Celery: раз в delay_seconds запрос по страницам, с 2016 года.
     Матчи пишутся в Match + MatchScore + MatchResult; если матч с таким provider_match_id уже есть — пропускаем."""
-    task = load_betsapi_history_task.delay(
-        day_from=body.day_from,
-        day_to=body.day_to,
-        delay_seconds=body.delay_seconds,
+    day_to = body.day_to or datetime.now(timezone.utc).strftime("%Y%m%d")
+    day_from = body.day_from
+
+    if body.resume_from_progress:
+        # Первый день в диапазоне, который нужно догрузить: нет записи или запись с completed_at=NULL.
+        all_days = _days_in_range(day_from, day_to)
+        r = await session.execute(
+            select(
+                BetsapiArchiveProgress.day_yyyymmdd,
+                BetsapiArchiveProgress.completed_at,
+            ).where(
+                BetsapiArchiveProgress.provider == "betsapi",
+                BetsapiArchiveProgress.day_yyyymmdd >= day_from,
+                BetsapiArchiveProgress.day_yyyymmdd <= day_to,
+            )
+        )
+        rows = r.all()
+        completed_set = {row[0] for row in rows if row[1] is not None}
+        not_completed = [d for d in all_days if d not in completed_set]
+        if not_completed:
+            day_from = not_completed[0]
+
+    task = load_betsapi_history_task.apply_async(
+        kwargs={
+            "day_from": day_from,
+            "day_to": day_to,
+            "delay_seconds": body.delay_seconds,
+        },
+        queue="history",
     )
     return LoadHistoryResponse(
         task_id=task.id,
-        message="Задача загрузки архива запущена. Результат смотрите в логах Celery или по task_id.",
+        message=f"Задача загрузки архива запущена с day_from={day_from}, day_to={day_to}. "
+                "Результат смотрите в логах Celery или по task_id.",
+    )
+
+
+@router.post("/backfill-results", response_model=BackfillResultsResponse)
+async def backfill_results(
+    _: bool = Depends(require_admin),
+):
+    """Ручной запуск догрузки результатов по матчам без результата (только для админа).
+
+    1) Создание MatchResult из MatchScore для всех finished без результата (по итоговому счёту).
+    2) Сброс счётчика попыток у зависших матчей (старт > 7 дней назад).
+    3) Дозапрос event/view у BetsAPI по матчам без результата (до 3 попыток на матч).
+    Задача выполняется в Celery."""
+    task = backfill_missing_results_task.apply_async(queue="default")
+    return BackfillResultsResponse(
+        task_id=task.id,
+        message="Задача догрузки результатов запущена. Результат в логах Celery.",
     )
 
 
@@ -230,6 +453,10 @@ async def load_history_status(
     completed = sorted(d for d in all_days if d in completed_set)
     not_completed = sorted(d for d in all_days if d not in completed_set)
     by_day = {row[0]: (row[1], row[2] is not None) for row in rows}
+    single_page_days = sorted(
+        d for d in completed_set
+        if by_day[d][0] == 1
+    )
     progress = [
         DayProgress(
             day=d,
@@ -244,74 +471,166 @@ async def load_history_status(
         completed=completed,
         not_completed=not_completed,
         progress=progress,
+        single_page_days=single_page_days,
     )
 
 
-@router.get("/live", response_model=list[MatchListWithOdds])
-async def list_live_matches(
+@router.post("/load-history/reset-progress", response_model=ResetProgressResponse)
+async def reset_archive_progress(
+    body: ResetProgressRequest,
     session: AsyncSession = Depends(get_async_session),
 ):
-    """Матчи в лайве + недавно завершённые (до 5 минут после окончания), затем они уходят в результаты. Отменённые и отложенные не показываем."""
-    try:
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=LIVE_RECENTLY_FINISHED_MINUTES)
-        q = (
-            select(Match)
-            .where(
-                Match.status.notin_([MatchStatus.CANCELLED.value, MatchStatus.POSTPONED.value]),
-                or_(
-                    Match.status == MatchStatus.LIVE.value,
-                    and_(
-                        Match.status == MatchStatus.FINISHED.value,
-                        Match.result.has(MatchResult.finished_at >= cutoff),
-                    ),
-                ),
+    """Сбросить прогресс загрузки архива по указанным дням, чтобы пересобрать данные.
+    По умолчанию сбрасываются только дни с last_processed_page=1 (завершённые одной страницей).
+    После сброса запустите POST /matches/load-history с тем же day_from/day_to и resume_from_progress=true."""
+    day_from = body.day_from
+    day_to = body.day_to
+    if body.reset_single_page_only:
+        r = await session.execute(
+            select(BetsapiArchiveProgress.day_yyyymmdd).where(
+                BetsapiArchiveProgress.provider == "betsapi",
+                BetsapiArchiveProgress.day_yyyymmdd >= day_from,
+                BetsapiArchiveProgress.day_yyyymmdd <= day_to,
+                BetsapiArchiveProgress.last_processed_page == 1,
+                BetsapiArchiveProgress.completed_at.is_not(None),
             )
-            .options(
-                selectinload(Match.league),
-                selectinload(Match.home_player),
-                selectinload(Match.away_player),
-                selectinload(Match.scores),
-                selectinload(Match.odds_snapshots),
-                selectinload(Match.result).selectinload(MatchResult.winner),
-            )
-            .order_by(Match.start_time.desc())
         )
-        result = await session.execute(q)
-        return result.scalars().all()
-    except Exception as e:
-        logger.exception("list_live_matches failed: %s", e)
-        raise
+        to_reset = sorted(r.scalars().all())
+    else:
+        r = await session.execute(
+            select(BetsapiArchiveProgress.day_yyyymmdd).where(
+                BetsapiArchiveProgress.provider == "betsapi",
+                BetsapiArchiveProgress.day_yyyymmdd >= day_from,
+                BetsapiArchiveProgress.day_yyyymmdd <= day_to,
+            )
+        )
+        to_reset = sorted(r.scalars().all())
+    if not to_reset:
+        return ResetProgressResponse(
+            reset_days=[],
+            message="Нет дней для сброса в указанном диапазоне.",
+        )
+    stmt = (
+        update(BetsapiArchiveProgress)
+        .where(
+            BetsapiArchiveProgress.provider == "betsapi",
+            BetsapiArchiveProgress.day_yyyymmdd.in_(to_reset),
+        )
+        .values(completed_at=None, last_processed_page=None)
+    )
+    await session.execute(stmt)
+    await session.commit()
+    logger.info("reset_archive_progress: сброшено %s дней: %s", len(to_reset), to_reset[:10])
+    return ResetProgressResponse(
+        reset_days=to_reset,
+        message=f"Сброшен прогресс по {len(to_reset)} дням. Запустите POST /matches/load-history с day_from={day_from}, day_to={day_to}, resume_from_progress=true.",
+    )
 
 
-@router.get("/upcoming", response_model=list[MatchListWithOdds])
-async def list_upcoming_matches(
-    limit: int = Query(50, le=200),
+@router.get("/overview", response_model=MatchesOverviewResponse)
+async def list_matches_overview(
+    limit_live: int = Query(100, ge=0, le=200, description="Макс. матчей в лайве (0 — не запрашивать)"),
+    limit_upcoming: int = Query(100, ge=0, le=200, description="Макс. матчей в линии (0 — не запрашивать)"),
     session: AsyncSession = Depends(get_async_session),
 ):
-    """Матчи в линии (запланированы). Только те, у которых время начала ещё не прошло (или прошло не более 15 мин)."""
+    """Лайв и линия в одном запросе. Один источник данных, меньше запросов с фронта. Лимит 0 — не запрашивать соответствующую выборку."""
     try:
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=UPCOMING_START_CUTOFF_MINUTES)
-        q = (
-            select(Match)
-            .where(
+        now = datetime.now(timezone.utc)
+        live_cutoff = now - timedelta(minutes=LIVE_RECENTLY_FINISHED_MINUTES)
+        upcoming_cutoff = now - timedelta(minutes=UPCOMING_START_CUTOFF_MINUTES)
+
+        live_matches: list[Match] = []
+        if limit_live > 0:
+            def _live_query():
+                return (
+                    select(Match)
+                    .where(
+                        Match.status.notin_([MatchStatus.CANCELLED.value, MatchStatus.POSTPONED.value]),
+                        or_(
+                            # Показываем только действительно «живые» матчи: обновлялись недавно.
+                            and_(
+                                Match.status == MatchStatus.LIVE.value,
+                                Match.updated_at >= live_cutoff,
+                            ),
+                            and_(
+                                Match.status == MatchStatus.FINISHED.value,
+                                Match.result.has(MatchResult.finished_at >= live_cutoff),
+                            ),
+                        ),
+                    )
+                    .options(
+                        selectinload(Match.league),
+                        selectinload(Match.home_player),
+                        selectinload(Match.away_player),
+                        selectinload(Match.scores),
+                        selectinload(Match.result).selectinload(MatchResult.winner),
+                    )
+                    .order_by(Match.start_time.desc())
+                    .limit(limit_live)
+                )
+
+            res_live = await session.execute(_live_query())
+            live_matches = list(res_live.scalars().all())
+            if not live_matches:
+                # Если в БД нет лайва (например, Celery live-пайплайн ещё не отработал),
+                # один раз пробуем подтянуть inplay напрямую из BetsAPI и перечитать выборку.
+                created = await _refresh_live_from_betsapi(session)
+                if created:
+                    res_live = await session.execute(_live_query())
+                    live_matches = list(res_live.scalars().all())
+            await _attach_latest_odds_snapshots(session, live_matches)
+
+        upcoming_matches: list[Match] = []
+        if limit_upcoming > 0:
+            status_ok = or_(
                 Match.status == MatchStatus.SCHEDULED.value,
-                Match.start_time >= cutoff,
+                Match.status == MatchStatus.PENDING_ODDS.value,
             )
-            .options(
-                selectinload(Match.league),
-                selectinload(Match.home_player),
-                selectinload(Match.away_player),
-                selectinload(Match.scores),
-                selectinload(Match.odds_snapshots),
-                selectinload(Match.result).selectinload(MatchResult.winner),
+            q_upcoming = (
+                select(Match)
+                .where(
+                    status_ok,
+                    Match.start_time >= upcoming_cutoff,
+                )
+                .options(
+                    selectinload(Match.league),
+                    selectinload(Match.home_player),
+                    selectinload(Match.away_player),
+                    selectinload(Match.scores),
+                    selectinload(Match.result).selectinload(MatchResult.winner),
+                )
+                .order_by(Match.start_time.asc())
+                .limit(limit_upcoming)
             )
-            .order_by(Match.start_time.asc())
-            .limit(limit)
-        )
-        result = await session.execute(q)
-        return result.scalars().all()
+            res_upcoming = await session.execute(q_upcoming)
+            upcoming_matches = list(res_upcoming.scalars().all())
+            if limit_upcoming > 0 and not upcoming_matches:
+                # Диагностика: сколько в БД матчей линии без учёта времени
+                count_line_in_db = await session.execute(
+                    select(func.count(Match.id)).where(
+                        or_(
+                            Match.status == MatchStatus.SCHEDULED.value,
+                            Match.status == MatchStatus.PENDING_ODDS.value,
+                        )
+                    )
+                )
+                total_line = count_line_in_db.scalar() or 0
+                logger.info(
+                    "matches/overview: 0 upcoming (line). DB has %s scheduled/pending_odds total. Check BETSAPI_TOKEN, ENABLE_SCHEDULED_COLLECTORS and Celery line task.",
+                    total_line,
+                )
+            await _attach_latest_odds_snapshots(session, upcoming_matches)
+            for m in upcoming_matches:
+                snapshots = getattr(m, "odds_snapshots", None) or []
+                # Для линии оставляем только прематчевые кф (phase is NULL or 'line'),
+                # но **не** фильтруем сами матчи по наличию коэффициентов: фронт может
+                # показать матч с прочерком в колонке кф, пока линия у букмекера не появилась.
+                line_only = [s for s in snapshots if getattr(s, "phase", None) in (None, "line")]
+                set_committed_value(m, "odds_snapshots", line_only)
+
+        return MatchesOverviewResponse(live=live_matches, upcoming=upcoming_matches)
     except Exception as e:
-        logger.exception("list_upcoming_matches failed: %s", e)
+        logger.exception("list_matches_overview failed: %s", e)
         raise
 
 
@@ -373,7 +692,7 @@ async def get_stored_recommendation(
     match_id: UUID,
     session: AsyncSession = Depends(get_async_session),
 ):
-    """Рекомендация, сохранённая из таблицы линии/лайва (прематч). Та же, что в колонке «Рекомендация»."""
+    """Прогноз, сохранённый из таблицы линии/лайва (прематч). Тот же, что в колонке «Прогноз»."""
     q = select(MatchRecommendation).where(MatchRecommendation.match_id == match_id)
     r = await session.execute(q)
     rec = r.scalar_one_or_none()
@@ -403,4 +722,6 @@ async def get_match(
     match = result.scalar_one_or_none()
     if match is None:
         raise HTTPException(status_code=404, detail="Match not found")
+    if (match.status or "").strip().lower() == MatchStatus.LIVE.value:
+        await _attach_earliest_odds_snapshots_for_live(session, match)
     return match

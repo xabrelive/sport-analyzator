@@ -1,4 +1,5 @@
 """Player stats computation (shared by players API and analytics)."""
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import select
@@ -9,8 +10,69 @@ from app.models import Match, MatchStatus
 from app.schemas.player import PlayerStats
 
 
-async def compute_player_stats(session: AsyncSession, player_id: UUID) -> PlayerStats | None:
-    """Compute stats for a player from finished matches. Returns None if player not found."""
+async def get_stats_for_recommendation(
+    session: AsyncSession,
+    home_player_id: UUID,
+    away_player_id: UUID,
+    league_id: UUID | None,
+    lookback_days: int,
+    prefer_recent_days: int | None,
+    min_matches_in_league: int,
+) -> tuple[PlayerStats | None, PlayerStats | None]:
+    """
+    Статистика для рекомендации: приоритет — лига и короткое окно (неделя/месяц).
+    1) prefer_recent_days + лига, если у обоих достаточно матчей в лиге.
+    2) lookback_days + лига.
+    3) Fallback: lookback_days по всем лигам.
+    """
+    def enough_in_league(sh: PlayerStats | None, sa: PlayerStats | None) -> bool:
+        if league_id is None:
+            return True
+        return (
+            sh is not None and sa is not None
+            and (sh.total_matches or 0) >= min_matches_in_league
+            and (sa.total_matches or 0) >= min_matches_in_league
+        )
+
+    if prefer_recent_days is not None:
+        sh = await compute_player_stats(
+            session, home_player_id, last_days=prefer_recent_days, league_id=league_id
+        )
+        sa = await compute_player_stats(
+            session, away_player_id, last_days=prefer_recent_days, league_id=league_id
+        )
+        if enough_in_league(sh, sa):
+            return sh, sa
+
+    sh = await compute_player_stats(
+        session, home_player_id, last_days=lookback_days, league_id=league_id
+    )
+    sa = await compute_player_stats(
+        session, away_player_id, last_days=lookback_days, league_id=league_id
+    )
+    if enough_in_league(sh, sa):
+        return sh, sa
+
+    sh = await compute_player_stats(
+        session, home_player_id, last_days=lookback_days, league_id=None
+    )
+    sa = await compute_player_stats(
+        session, away_player_id, last_days=lookback_days, league_id=None
+    )
+    return sh, sa
+
+
+async def compute_player_stats(
+    session: AsyncSession,
+    player_id: UUID,
+    last_days: int | None = None,
+    league_id: UUID | None = None,
+) -> PlayerStats | None:
+    """
+    Статистика игрока по завершённым матчам.
+    - last_days: только матчи за последние N дней (по start_time).
+    - league_id: только матчи данной лиги (форма в лиге может отличаться от других турниров).
+    """
     from app.models import Player
     from app.models.match_result import MatchResult
 
@@ -23,6 +85,12 @@ async def compute_player_stats(session: AsyncSession, player_id: UUID) -> Player
         .where((Match.home_player_id == player_id) | (Match.away_player_id == player_id))
         .options(selectinload(Match.result), selectinload(Match.scores))
     )
+    if last_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=last_days)
+        q = q.where(Match.start_time >= cutoff)
+    if league_id is not None:
+        q = q.where(Match.league_id == league_id)
+    q = q.order_by(Match.start_time.desc())
     matches = (await session.execute(q)).unique().scalars().all()
     total = len(matches)
     wins = sum(1 for m in matches if m.result and m.result.winner_id == player_id)

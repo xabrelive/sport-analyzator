@@ -49,3 +49,4 @@ class GrantSubscriptionBody(BaseModel):
     sport_key: str | None = None  # обязателен при scope=one_sport
     valid_until: date  # до какой даты включительно
     user_id: str | None = None  # если не указан — текущий пользователь (для /me)
+    comment: str | None = None  # комментарий при выдаче через админку

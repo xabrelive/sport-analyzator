@@ -1,15 +1,28 @@
 "use client";
 
-import Link from "next/link";
-import { useEffect, useState, useMemo } from "react";
-import { fetchMatches, fetchSignals, fetchMatchRecommendations, type Match } from "@/lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { fetchMatchesOverview, fetchSignals, fetchMatchRecommendations, type Match } from "@/lib/api";
 import { LiveMatchRow } from "@/components/LiveMatchRow";
 import { formatSignalRecommendation } from "@/components/LineMatchRow";
 import { useWebSocket } from "@/hooks/useWebSocket";
-import { useAuth } from "@/contexts/AuthContext";
-import { useSubscription, FREE_LIVE_MATCHES_LIMIT } from "@/contexts/SubscriptionContext";
+import { useSubscription } from "@/contexts/SubscriptionContext";
+import { getCached, setCached } from "@/lib/viewCache";
+import { setCachedMatches, invalidateMatchIds, isMatchNewerThan } from "@/lib/matchCache";
 
 const SIGNALS_LIMIT = 200;
+const LIVE_CACHE_KEY = "view:live";
+/** Показываем кэш при открытии только если он свежее 15 сек — лайв должен быть актуальным */
+const LIVE_CACHE_MAX_AGE_MS = 15_000;
+const LIVE_VIRTUALIZE_FROM = 120;
+const LIVE_ROW_HEIGHT = 64;
+const LIVE_VIEWPORT_HEIGHT = 560;
+const LIVE_OVERSCAN = 8;
+
+type LiveCachePayload = {
+  matches: Match[];
+  signals: Awaited<ReturnType<typeof fetchSignals>>;
+  modelRecs: Record<string, string | null>;
+};
 
 function groupByLeague(matches: Match[]): Map<string | null, Match[]> {
   const map = new Map<string | null, Match[]>();
@@ -52,18 +65,82 @@ export default function LivePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [leagueOpen, setLeagueOpen] = useState<Record<string, boolean>>({});
+  const [leagueScrollTop, setLeagueScrollTop] = useState<Record<string, number>>({});
   const [leagueFilter, setLeagueFilter] = useState<string | null>(null);
   const [onlyWithRecommendations, setOnlyWithRecommendations] = useState(false);
-  const connected = useWebSocket();
-  const { isAuthenticated } = useAuth();
+  const knownRecIdsRef = useRef<Set<string>>(new Set());
+  const lastWsRefreshAtRef = useRef<number>(0);
+  const isFetchingMatchesRef = useRef(false);
+  const fetchMatchesAgainRef = useRef(false);
+  const matchesRef = useRef<Match[]>([]);
   const { hasFullAccess } = useSubscription();
 
-  const displayMatches = isAuthenticated && !hasFullAccess
-    ? matches.slice(0, FREE_LIVE_MATCHES_LIMIT)
-    : matches;
-  const hasMoreThanFree = matches.length > FREE_LIVE_MATCHES_LIMIT && isAuthenticated && !hasFullAccess;
+  const displayMatches = matches;
+  matchesRef.current = matches;
 
   const recommendationByMatch = useMemo(() => buildRecommendationByMatch(signals), [signals]);
+
+  const loadRecommendationsFor = useCallback(async (items: Match[]) => {
+    const missing = items
+      .map((m) => m.id)
+      .filter((id) => !knownRecIdsRef.current.has(id));
+    if (missing.length === 0) return;
+    const recs = await fetchMatchRecommendations(missing);
+    const nonNullEntries = Object.entries(recs).filter(([, value]) => Boolean(value));
+    if (nonNullEntries.length === 0) return;
+    for (const [id] of nonNullEntries) knownRecIdsRef.current.add(id);
+    setModelRecs((prev) => ({ ...prev, ...Object.fromEntries(nonNullEntries) }));
+  }, []);
+
+  const loadMatchesOnly = useCallback(async () => {
+    if (isFetchingMatchesRef.current) {
+      fetchMatchesAgainRef.current = true;
+      return;
+    }
+    isFetchingMatchesRef.current = true;
+    try {
+      const { live } = await fetchMatchesOverview({ limit_live: 200, limit_upcoming: 0 });
+      await loadRecommendationsFor(live);
+      const prev = matchesRef.current;
+      const byId = new Map(prev.map((x) => [x.id, x]));
+      const merged = live.map((m) => {
+        const p = byId.get(m.id);
+        return p && isMatchNewerThan(p, m) ? p : m;
+      });
+      setMatches(merged);
+      setCachedMatches(merged);
+      setError(null);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      setError(e instanceof Error ? e.message : "Ошибка загрузки лайва");
+    } finally {
+      isFetchingMatchesRef.current = false;
+      if (fetchMatchesAgainRef.current) {
+        fetchMatchesAgainRef.current = false;
+        void loadMatchesOnly();
+      }
+    }
+  }, [loadRecommendationsFor]);
+
+  const loadSignalsOnly = useCallback(async () => {
+    try {
+      const signalsRes = await fetchSignals({ limit: SIGNALS_LIMIT });
+      setSignals(signalsRes);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+    }
+  }, []);
+
+  const connected = useWebSocket((message) => {
+    if (message?.type === "matches_updated") {
+      const ids = Array.isArray(message.match_ids) ? message.match_ids : [];
+      if (ids.length) invalidateMatchIds(ids);
+      const now = Date.now();
+      if (now - lastWsRefreshAtRef.current < 500) return;
+      lastWsRefreshAtRef.current = now;
+      void loadMatchesOnly();
+    }
+  });
 
   const filteredMatches = useMemo(() => {
     let list = displayMatches;
@@ -81,35 +158,43 @@ export default function LivePage() {
   );
 
   useEffect(() => {
+    const cached = getCached<LiveCachePayload>(LIVE_CACHE_KEY, LIVE_CACHE_MAX_AGE_MS);
+    if (cached) {
+      setMatches(cached.matches);
+      setSignals(cached.signals);
+      setModelRecs(cached.modelRecs);
+      knownRecIdsRef.current = new Set(Object.keys(cached.modelRecs));
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
-    async function load() {
+    async function boot() {
       try {
-        const [data, signalsRes] = await Promise.all([
-          fetchMatches("matches/live"),
-          fetchSignals({ limit: SIGNALS_LIMIT }),
-        ]);
-        if (!cancelled) {
-          setMatches(data);
-          setSignals(signalsRes);
-        }
-        const ids = data.map((m) => m.id);
-        if (ids.length > 0) {
-          const recs = await fetchMatchRecommendations(ids);
-          if (!cancelled) setModelRecs(recs);
-        }
+        await loadMatchesOnly();
+        if (!cancelled) setLoading(false);
+        void loadSignalsOnly();
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : "Ошибка загрузки");
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
-    load();
-    const t = setInterval(load, 5000);
+    void boot();
+    const matchesTimer = setInterval(() => void loadMatchesOnly(), 5000);
+    const signalsTimer = setInterval(() => void loadSignalsOnly(), 30000);
     return () => {
       cancelled = true;
-      clearInterval(t);
+      clearInterval(matchesTimer);
+      clearInterval(signalsTimer);
     };
-  }, []);
+  }, [loadMatchesOnly, loadSignalsOnly]);
+
+  useEffect(() => {
+    if (loading) return;
+    setCached<LiveCachePayload>(LIVE_CACHE_KEY, { matches, signals, modelRecs });
+  }, [matches, signals, modelRecs, loading]);
 
   const toggleLeague = (key: string) => {
     setLeagueOpen((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -139,12 +224,6 @@ export default function LivePage() {
         </span>
       </div>
       {error && <p className="text-rose-400 mb-4">{error}</p>}
-      {hasMoreThanFree && (
-        <p className="text-slate-400 text-sm mb-3">
-          Бесплатно показаны первые {FREE_LIVE_MATCHES_LIMIT} матчей.{" "}
-          <Link href="/pricing#analytics" className="text-teal-400 hover:underline">Полный лайв по подписке</Link>
-        </p>
-      )}
       {loading ? (
         <p className="text-slate-500">Загрузка...</p>
       ) : matches.length === 0 ? (
@@ -172,7 +251,7 @@ export default function LivePage() {
                 onChange={(e) => setOnlyWithRecommendations(e.target.checked)}
                 className="rounded border-slate-600 bg-slate-800 text-teal-500"
               />
-              Только с рекомендациями
+              Только с прогнозами
             </label>
             {(leagueFilter !== null || onlyWithRecommendations) && (
               <span className="text-slate-500 text-sm">
@@ -188,6 +267,8 @@ export default function LivePage() {
             const key = leagueId ?? "no-league";
             const name = leagueMatches[0]?.league?.name ?? "Без лиги";
             const open = isLeagueOpen(key);
+            const sortedMatches = sortMatchesByStart(leagueMatches);
+            const useVirtualization = sortedMatches.length > LIVE_VIRTUALIZE_FROM;
             return (
               <section
                 key={key}
@@ -214,29 +295,71 @@ export default function LivePage() {
                   </span>
                 </button>
                 {open && (
-                  <div className="overflow-x-auto">
+                  <div
+                    className={`overflow-x-auto ${useVirtualization ? "max-h-[560px] overflow-y-auto" : ""}`}
+                    onScroll={(e) => {
+                      if (!useVirtualization) return;
+                      setLeagueScrollTop((prev) => ({ ...prev, [key]: e.currentTarget.scrollTop }));
+                    }}
+                  >
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="text-slate-500 border-b border-slate-700/80 bg-slate-800/40">
                           <th className="text-left py-2.5 pr-3 font-medium w-16">Статус</th>
+                          <th className="text-left py-2.5 pr-3 font-medium">Дата и время</th>
                           <th className="text-left py-2.5 pr-3 font-medium">Участник 1</th>
                           <th className="text-right py-2.5 pr-2 font-medium">Кф. 1</th>
                           <th className="text-center py-2.5 px-2 font-medium">Счёт</th>
                           <th className="text-left py-2.5 pl-2 pr-3 font-medium">Кф. 2</th>
                           <th className="text-right py-2.5 pr-3 font-medium">Участник 2</th>
                           <th className="text-left py-2.5 pr-3 font-medium">Вероятность</th>
-                          <th className="text-left py-2.5 pl-2 font-medium">Рекомендация</th>
+                          <th className="text-left py-2.5 pl-2 font-medium">Прогноз</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {sortMatchesByStart(leagueMatches).map((m) => (
-                          <LiveMatchRow
-                            key={m.id}
-                            match={m}
-                            recommendation={modelRecs[m.id] ?? null}
-                            showAnalyticsBlur={!hasFullAccess}
-                          />
-                        ))}
+                        {(() => {
+                          if (!useVirtualization) {
+                            return sortedMatches.map((m) => (
+                              <LiveMatchRow
+                                key={m.id}
+                                match={m}
+                                recommendation={modelRecs[m.id] ?? null}
+                                showAnalyticsBlur={!hasFullAccess}
+                              />
+                            ));
+                          }
+                          const scrollTop = leagueScrollTop[key] ?? 0;
+                          const start = Math.max(0, Math.floor(scrollTop / LIVE_ROW_HEIGHT) - LIVE_OVERSCAN);
+                          const end = Math.min(
+                            sortedMatches.length,
+                            Math.ceil((scrollTop + LIVE_VIEWPORT_HEIGHT) / LIVE_ROW_HEIGHT) + LIVE_OVERSCAN,
+                          );
+                          const topPad = start * LIVE_ROW_HEIGHT;
+                          const bottomPad = Math.max(0, (sortedMatches.length - end) * LIVE_ROW_HEIGHT);
+                          const visible = sortedMatches.slice(start, end);
+                          return (
+                            <>
+                              {topPad > 0 && (
+                                <tr>
+                                  <td colSpan={9} style={{ height: topPad, padding: 0, border: 0 }} />
+                                </tr>
+                              )}
+                              {visible.map((m) => (
+                                <LiveMatchRow
+                                  key={m.id}
+                                  match={m}
+                                  recommendation={modelRecs[m.id] ?? null}
+                                  showAnalyticsBlur={!hasFullAccess}
+                                />
+                              ))}
+                              {bottomPad > 0 && (
+                                <tr>
+                                  <td colSpan={9} style={{ height: bottomPad, padding: 0, border: 0 }} />
+                                </tr>
+                              )}
+                            </>
+                          );
+                        })()}
                       </tbody>
                     </table>
                   </div>

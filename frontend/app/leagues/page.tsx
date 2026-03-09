@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
@@ -15,9 +15,13 @@ import { ResultsMatchRow } from "@/components/ResultsMatchRow";
 import { LineMatchRow, formatSignalRecommendation } from "@/components/LineMatchRow";
 import { LiveMatchRow } from "@/components/LiveMatchRow";
 import { useSubscription } from "@/contexts/SubscriptionContext";
+import { useWebSocket } from "@/hooks/useWebSocket";
+import { getCached, setCached } from "@/lib/viewCache";
 
 const PAGE_SIZE = 50;
 const SIGNALS_LIMIT = 200;
+const LEAGUES_CACHE_KEY = "view:leagues";
+const LEAGUES_CACHE_MAX_AGE_MS = 90_000;
 
 type Tab = "line" | "live" | "results";
 
@@ -81,7 +85,7 @@ function buildRecommendationByMatch(
   return byMatch;
 }
 
-export default function LeaguesPage() {
+function LeaguesPageContent() {
   const searchParams = useSearchParams();
   const leagueIdFromUrl = searchParams.get("league");
   const tabFromUrl = (searchParams.get("tab") as Tab) || "line";
@@ -106,8 +110,39 @@ export default function LeaguesPage() {
   const [error, setError] = useState<string | null>(null);
   const [signals, setSignals] = useState<Awaited<ReturnType<typeof fetchSignals>>>([]);
   const [leagueOpen, setLeagueOpen] = useState<Record<string, boolean>>({});
+  const [refreshTick, setRefreshTick] = useState(0);
 
   const { hasFullAccess } = useSubscription();
+
+  useWebSocket((message) => {
+    if (message?.type === "matches_updated") {
+      setRefreshTick((v) => v + 1);
+    }
+  });
+
+  useEffect(() => {
+    const cached = getCached<{
+      selectedId: string | null;
+      tab: Tab;
+      lineMatches: Match[];
+      liveMatches: Match[];
+      resultsItems: Match[];
+      resultsTotal: number;
+      resultsPage: number;
+      resultsDateFrom: string;
+      resultsDateTo: string;
+    }>(LEAGUES_CACHE_KEY, LEAGUES_CACHE_MAX_AGE_MS);
+    if (!cached) return;
+    setSelectedId(cached.selectedId);
+    setTab(cached.tab);
+    setLineMatches(cached.lineMatches);
+    setLiveMatches(cached.liveMatches);
+    setResultsItems(cached.resultsItems);
+    setResultsTotal(cached.resultsTotal);
+    setResultsPage(cached.resultsPage);
+    setResultsDateFrom(cached.resultsDateFrom);
+    setResultsDateTo(cached.resultsDateTo);
+  }, []);
 
   const filteredLeagues = useMemo(() => {
     if (!leagueQuery.trim()) return leagues;
@@ -123,7 +158,7 @@ export default function LeaguesPage() {
     let cancelled = false;
     async function load() {
       try {
-        const data = await fetchLeagues({ limit: 500 });
+        const data = await fetchLeagues({ limit: 20 });
         if (!cancelled) setLeagues(data);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : "Ошибка загрузки лиг");
@@ -172,7 +207,7 @@ export default function LeaguesPage() {
     let cancelled = false;
     async function load() {
       try {
-        const data = await fetchSignals({ limit: SIGNALS_LIMIT });
+        const data = await fetchSignals({ limit: 100 });
         if (!cancelled) setSignals(data);
       } catch {
         // ignore
@@ -198,14 +233,15 @@ export default function LeaguesPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedId, tab]);
+  }, [selectedId, tab, refreshTick]);
 
   useEffect(() => {
     if (!selectedId || tab !== "live") return;
+    const leagueId: string = selectedId;
     let cancelled = false;
     setLoadingLive(true);
     function load() {
-      fetchMatchesByLeague(selectedId, "live")
+      fetchMatchesByLeague(leagueId, "live")
         .then((data) => {
           if (!cancelled) setLiveMatches(data);
         })
@@ -222,7 +258,7 @@ export default function LeaguesPage() {
       cancelled = true;
       clearInterval(t);
     };
-  }, [selectedId, tab]);
+  }, [selectedId, tab, refreshTick]);
 
   useEffect(() => {
     if (!selectedId || tab !== "results") return;
@@ -250,7 +286,31 @@ export default function LeaguesPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedId, tab, resultsDateFrom, resultsDateTo, resultsPage]);
+  }, [selectedId, tab, resultsDateFrom, resultsDateTo, resultsPage, refreshTick]);
+
+  useEffect(() => {
+    setCached(LEAGUES_CACHE_KEY, {
+      selectedId,
+      tab,
+      lineMatches,
+      liveMatches,
+      resultsItems,
+      resultsTotal,
+      resultsPage,
+      resultsDateFrom,
+      resultsDateTo,
+    });
+  }, [
+    selectedId,
+    tab,
+    lineMatches,
+    liveMatches,
+    resultsItems,
+    resultsTotal,
+    resultsPage,
+    resultsDateFrom,
+    resultsDateTo,
+  ]);
 
   const selectedLeague = leagues.find((l) => l.id === selectedId);
   const recommendationByMatch = useMemo(
@@ -394,7 +454,7 @@ export default function LeaguesPage() {
                               <th className="text-left py-2.5 pl-2 pr-3 font-medium">Кф. 2</th>
                               <th className="text-right py-2.5 pr-3 font-medium">Участник 2</th>
                               <th className="text-left py-2.5 pr-3 font-medium">Вероятность</th>
-                              <th className="text-left py-2.5 pl-2 font-medium">Рекомендация</th>
+                              <th className="text-left py-2.5 pl-2 font-medium">Прогноз</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -435,7 +495,7 @@ export default function LeaguesPage() {
                               <th className="text-left py-2.5 pl-2 pr-3 font-medium">Кф. 2</th>
                               <th className="text-right py-2.5 pr-3 font-medium">Участник 2</th>
                               <th className="text-left py-2.5 pr-3 font-medium">Вероятность</th>
-                              <th className="text-left py-2.5 pl-2 font-medium">Рекомендация</th>
+                              <th className="text-left py-2.5 pl-2 font-medium">Прогноз</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -591,5 +651,13 @@ export default function LeaguesPage() {
         </div>
       </div>
     </main>
+  );
+}
+
+export default function LeaguesPage() {
+  return (
+    <Suspense fallback={<main className="max-w-6xl mx-auto px-4 py-6 text-slate-500">Загрузка...</main>}>
+      <LeaguesPageContent />
+    </Suspense>
   );
 }

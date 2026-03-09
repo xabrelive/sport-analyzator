@@ -1,8 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { fetchSignals, fetchSignalsStats, type SignalItem, type SignalStatsResponse } from "@/lib/api";
+import { useWebSocket } from "@/hooks/useWebSocket";
+import { getCached, setCached } from "@/lib/viewCache";
+
+const SIGNALS_CACHE_KEY = "view:signals";
+const SIGNALS_CACHE_MAX_AGE_MS = 60_000;
 
 export default function SignalsPage() {
   const [signals, setSignals] = useState<SignalItem[]>([]);
@@ -11,14 +16,28 @@ export default function SignalsPage() {
   const [loadingStats, setLoadingStats] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [days, setDays] = useState(7);
+  const isFetchingSignalsRef = useRef(false);
+  const fetchSignalsAgainRef = useRef(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    fetchSignals({ limit: 50, offset: 0 })
-      .then((list) => { if (!cancelled) setSignals(list); })
-      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : "Ошибка"); })
-      .finally(() => { if (!cancelled) setLoadingSignals(false); });
-    return () => { cancelled = true; };
+  const loadSignals = useCallback(async () => {
+    if (isFetchingSignalsRef.current) {
+      fetchSignalsAgainRef.current = true;
+      return;
+    }
+    isFetchingSignalsRef.current = true;
+    try {
+      const list = await fetchSignals({ limit: 50, offset: 0 });
+      setSignals(list);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ошибка");
+    } finally {
+      isFetchingSignalsRef.current = false;
+      setLoadingSignals(false);
+      if (fetchSignalsAgainRef.current) {
+        fetchSignalsAgainRef.current = false;
+        void loadSignals();
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -30,6 +49,42 @@ export default function SignalsPage() {
       .finally(() => { if (!cancelled) setLoadingStats(false); });
     return () => { cancelled = true; };
   }, [days]);
+
+  useWebSocket((message) => {
+    if (message?.type === "matches_updated") {
+      void loadSignals();
+      if (!loadingStats) setLoadingStats(true);
+      fetchSignalsStats(days)
+        .then((d) => setStats(d))
+        .catch(() => setStats(null))
+        .finally(() => setLoadingStats(false));
+    }
+  });
+
+  useEffect(() => {
+    const cached = getCached<{
+      signals: SignalItem[];
+      stats: SignalStatsResponse | null;
+      days: number;
+    }>(SIGNALS_CACHE_KEY, SIGNALS_CACHE_MAX_AGE_MS);
+    if (!cached) return;
+    setSignals(cached.signals);
+    setStats(cached.stats);
+    setDays(cached.days);
+    setLoadingSignals(false);
+    setLoadingStats(false);
+  }, []);
+
+  useEffect(() => {
+    void loadSignals();
+    const t = setInterval(() => void loadSignals(), 30_000);
+    return () => clearInterval(t);
+  }, [loadSignals]);
+
+  useEffect(() => {
+    if (loadingSignals || loadingStats) return;
+    setCached(SIGNALS_CACHE_KEY, { signals, stats, days });
+  }, [signals, stats, days, loadingSignals, loadingStats]);
 
   return (
     <main className="max-w-4xl mx-auto px-4 py-6">

@@ -2,7 +2,7 @@
 import uuid
 from datetime import date, datetime, timezone
 
-from sqlalchemy import BigInteger, Date, DateTime, String
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,7 +29,14 @@ class User(Base):
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
     email_verified: Mapped[bool] = mapped_column(default=False, nullable=False)
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True, index=True)
+    telegram_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
     date_of_birth: Mapped[date | None] = mapped_column(Date, nullable=True)
+    signal_via_telegram: Mapped[bool] = mapped_column(default=True, nullable=False)
+    signal_via_email: Mapped[bool] = mapped_column(default=True, nullable=False)
+    is_admin: Mapped[bool] = mapped_column(default=False, nullable=False)
+    is_blocked: Mapped[bool] = mapped_column(Boolean(), default=False, nullable=False)
+    trial_until: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utc_now,
@@ -39,6 +46,22 @@ class User(Base):
         "UserSubscription",
         back_populates="user",
         lazy="selectin",
+    )
+    invoices: Mapped[list["Invoice"]] = relationship(
+        "Invoice",
+        back_populates="user",
+        lazy="select",
+    )
+    subscription_grant_logs: Mapped[list["SubscriptionGrantLog"]] = relationship(
+        "SubscriptionGrantLog",
+        foreign_keys="SubscriptionGrantLog.user_id",
+        back_populates="user",
+        lazy="select",
+    )
+    signal_deliveries: Mapped[list["UserSignalDelivery"]] = relationship(
+        "UserSignalDelivery",
+        back_populates="user",
+        lazy="select",
     )
 
     @property
