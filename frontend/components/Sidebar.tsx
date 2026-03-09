@@ -8,7 +8,6 @@ import { SPORTS } from "@/lib/sports";
 const SPORT_LINKS = [
   { href: "/line", label: "Линия" },
   { href: "/live", label: "Лайв" },
-  { href: "/signals", label: "Сигналы" },
   { href: "/stats", label: "Статистика" },
   { href: "/results", label: "Результаты" },
   { href: "/leagues", label: "Лиги" },

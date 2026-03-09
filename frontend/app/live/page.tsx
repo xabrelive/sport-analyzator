@@ -100,7 +100,6 @@ export default function LivePage() {
     isFetchingMatchesRef.current = true;
     try {
       const { live } = await fetchMatchesOverview({ limit_live: 200, limit_upcoming: 0 });
-      await loadRecommendationsFor(live);
       const prev = matchesRef.current;
       const byId = new Map(prev.map((x) => [x.id, x]));
       const merged = live.map((m) => {
@@ -110,6 +109,8 @@ export default function LivePage() {
       setMatches(merged);
       setCachedMatches(merged);
       setError(null);
+      // Рекомендации догружаем асинхронно, чтобы не задерживать отображение таблицы.
+      void loadRecommendationsFor(live);
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") return;
       setError(e instanceof Error ? e.message : "Ошибка загрузки лайва");

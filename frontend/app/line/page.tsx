@@ -114,7 +114,6 @@ export default function LinePage() {
     isFetchingMatchesRef.current = true;
     try {
       const { upcoming } = await fetchMatchesOverview({ limit_upcoming: UPCOMING_LIMIT, limit_live: 0 });
-      await loadRecommendationsFor(upcoming);
       const prev = matchesRef.current;
       const byId = new Map(prev.map((x) => [x.id, x]));
       const merged = upcoming.map((m) => {
@@ -123,6 +122,8 @@ export default function LinePage() {
       });
       setMatches(merged);
       setCachedMatches(merged);
+      // Рекомендации догружаем асинхронно, не блокируя отображение таблицы.
+      void loadRecommendationsFor(upcoming);
     } finally {
       isFetchingMatchesRef.current = false;
       if (fetchMatchesAgainRef.current) {

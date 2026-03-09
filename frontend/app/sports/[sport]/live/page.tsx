@@ -11,8 +11,6 @@ import { useSubscription, FREE_LIVE_MATCHES_LIMIT } from "@/contexts/Subscriptio
 import { getSportBySlug } from "@/lib/sports";
 import { getCached, setCached } from "@/lib/viewCache";
 import { setCachedMatches, invalidateMatchIds } from "@/lib/matchCache";
-
-const MAX_MATCHES = 5;
 /** Кэш только если свежее 15 сек */
 const SPORT_LIVE_CACHE_MAX_AGE_MS = 15_000;
 
@@ -35,10 +33,10 @@ export default function SportLivePage() {
   const isFetchingRef = useRef(false);
   const fetchAgainRef = useRef(false);
 
-  const displayMatches = isAuthenticated && !hasFullAccess
-    ? matches.slice(0, FREE_LIVE_MATCHES_LIMIT)
-    : matches.slice(0, MAX_MATCHES);
-  const hasMoreThanFree = matches.length > FREE_LIVE_MATCHES_LIMIT && isAuthenticated && !hasFullAccess;
+  const displayMatches =
+    isAuthenticated && !hasFullAccess ? matches.slice(0, FREE_LIVE_MATCHES_LIMIT) : matches;
+  const hasMoreThanFree =
+    matches.length > FREE_LIVE_MATCHES_LIMIT && isAuthenticated && !hasFullAccess;
 
   const cacheKey = `view:sport:${sportSlug}:live`;
 
@@ -53,11 +51,10 @@ export default function SportLivePage() {
     }
     isFetchingRef.current = true;
     try {
-      const { live } = await fetchMatchesOverview({ limit_live: 50, limit_upcoming: 0 });
-      const limited = live.slice(0, MAX_MATCHES);
-      setMatches(limited);
-      setCachedMatches(limited);
-      setCached<Match[]>(cacheKey, limited);
+      const { live } = await fetchMatchesOverview({ limit_live: 200, limit_upcoming: 0 });
+      setMatches(live);
+      setCachedMatches(live);
+      setCached<Match[]>(cacheKey, live);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка загрузки");
     } finally {

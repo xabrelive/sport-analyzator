@@ -296,6 +296,7 @@ class MySignalItem(BaseModel):
     outcome: str = ""
     sent_at: str = ""
     sent_via: str = ""
+    odds_at_recommendation: float | None = None
 
 
 class MySignalsResponse(BaseModel):
@@ -312,15 +313,34 @@ class MySignalsResponse(BaseModel):
 async def get_my_signals(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
-    days: int = Query(30, ge=1, le=365),
+    days: int = Query(30, ge=1, le=365, description="Период от текущего момента, в днях"),
+    date_from: date | None = Query(None, description="Дата начала периода (YYYY-MM-DD)"),
+    date_to: date | None = Query(None, description="Дата конца периода (YYYY-MM-DD)"),
 ):
     """Сигналы, отправленные пользователю в личку (TG/email): что зашло, что нет."""
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    now = datetime.now(timezone.utc)
+    since: datetime
+    until: datetime
+    if date_from is not None or date_to is not None:
+        if date_from is None:
+            date_from = date_to
+        if date_to is None:
+            date_to = date_from
+        assert date_from is not None and date_to is not None
+        if date_from > date_to:
+            date_from, date_to = date_to, date_from
+        since = datetime.combine(date_from, time.min, tzinfo=timezone.utc)
+        until = datetime.combine(date_to, time.max, tzinfo=timezone.utc)
+    else:
+        since = now - timedelta(days=days)
+        until = now
+
     q = (
         select(UserSignalDelivery)
         .where(
             UserSignalDelivery.user_id == user.id,
             UserSignalDelivery.sent_at >= since,
+            UserSignalDelivery.sent_at <= until,
         )
         .order_by(UserSignalDelivery.sent_at.desc())
     )
@@ -385,6 +405,7 @@ async def get_my_signals(
                 outcome=outcome,
                 sent_at=info.get("sent_at", ""),
                 sent_via=info.get("sent_via", ""),
+                odds_at_recommendation=odds,
             )
         )
     items.sort(key=lambda x: x.start_time or "", reverse=True)

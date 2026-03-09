@@ -74,10 +74,10 @@ class Settings(BaseSettings):
     max_odds: float = 50.0
 
     # Интервалы опроса внешних API (BetsAPI, The Odds API, Sportradar)
-    # Лайв каждые 5 с при многих inplay может дать >3600/час; 8 с оставляет запас (линия + disappeared + архив).
-    live_poll_interval_seconds: int = 8
+    # Лайв каждые 4 с — более частое обновление счёта, при этом остаётся запас по лимиту 3600/час (учитывая линию, disappeared и архив).
+    live_poll_interval_seconds: int = 4
     live_odds_poll_interval_seconds: int = 30  # The Odds API (если задан ключ)
-    prematch_poll_interval_seconds: int = 900  # Линия: upcoming + view + odds (до перехода в лайв). Увеличено для снижения нагрузки.
+    prematch_poll_interval_seconds: int = 420  # Линия: upcoming + view + odds (до перехода в лайв). 7 минут.
 
     # Лимит запросов BetsAPI: 3600/час — распределяем между линией, лайвом, архивом, disappeared
     betsapi_rate_limit_per_hour: int = 3600

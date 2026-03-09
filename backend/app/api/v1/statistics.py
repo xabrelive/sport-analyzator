@@ -23,6 +23,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 ResultFilter = Literal["all", "correct", "wrong", "pending"]
+ChannelFilter = Literal["all", "free", "vip"]
 
 
 def _recommended_winner_side(text: str) -> str | None:
@@ -129,6 +130,10 @@ async def get_recommendations_stats(
     date_from: date | None = Query(None, description="Дата начала периода (YYYY-MM-DD)"),
     date_to: date | None = Query(None, description="Дата конца периода (YYYY-MM-DD)"),
     sport_key: str | None = Query(None, description="Фильтр по виду спорта (например table_tennis)"),
+    channel: ChannelFilter = Query(
+        "all",
+        description="Источник прогнозов: all — все, free — только отправленные в бесплатный канал, vip — только отправленные в VIP‑канал",
+    ),
     page: int = Query(1, ge=1, description="Страница"),
     per_page: int = Query(20, ge=1, le=100, description="Записей на странице"),
 ):
@@ -156,11 +161,25 @@ async def get_recommendations_stats(
         since = now - timedelta(days=days)
         until = now
 
+    # Базовый источник данных: все сохранённые прогнозы или только отправленные в конкретный канал.
     q = select(MatchRecommendation).order_by(MatchRecommendation.created_at.desc())
-    if since is not None:
-        q = q.where(MatchRecommendation.created_at >= since)
-    if until is not None:
-        q = q.where(MatchRecommendation.created_at <= until)
+    if channel == "free":
+        q = q.where(MatchRecommendation.free_channel_sent_at.is_not(None))
+        if since is not None:
+            q = q.where(MatchRecommendation.free_channel_sent_at >= since)
+        if until is not None:
+            q = q.where(MatchRecommendation.free_channel_sent_at <= until)
+    elif channel == "vip":
+        q = q.where(MatchRecommendation.paid_channel_sent_at.is_not(None))
+        if since is not None:
+            q = q.where(MatchRecommendation.paid_channel_sent_at >= since)
+        if until is not None:
+            q = q.where(MatchRecommendation.paid_channel_sent_at <= until)
+    else:
+        if since is not None:
+            q = q.where(MatchRecommendation.created_at >= since)
+        if until is not None:
+            q = q.where(MatchRecommendation.created_at <= until)
     if sport_key is not None and sport_key.strip():
         q = q.join(Match, MatchRecommendation.match_id == Match.id).where(Match.sport_key == sport_key.strip())
 
@@ -222,12 +241,13 @@ async def get_recommendations_stats(
         status_key = (match.status or "none").strip().lower()
         by_status[status_key] = by_status.get(status_key, 0) + 1
         if status_key == "cancelled":
+            # Отменённый матч считаем отдельно (cancelled_or_no_data), не как «Ожидает».
             final_score = "Отменён"
             cancelled_count += 1
-            pending += 1
         elif status_key == "postponed":
+            # Перенесён тоже не попадает в «Ожидают / не оцениваются» — считаем как «нет данных».
             final_score = "Перенесён"
-            pending += 1
+            no_data_count += 1
         elif status_key == "live":
             # До выхода матча из лайва (обычно в finished) не ставим Да/Нет.
             final_score = "В игре"
@@ -248,7 +268,8 @@ async def get_recommendations_stats(
                     else:
                         wrong += 1
                 else:
-                    pending += 1
+                    # Нет однозначного победителя по сетам — ждём, но считаем как «нет данных», а не pending.
+                    no_data_count += 1
             elif recommended is not None:
                 # Рекомендация на итоговую победу П1/П2.
                 if match.result and match.result.winner_id is not None:
@@ -306,9 +327,10 @@ async def get_recommendations_stats(
             final_score = "Ждёт начала"
             pending += 1
         else:
+            # Любой другой статус (ошибочный/неизвестный) считаем как «не удалось получить данные»,
+            # не увеличивая счётчик pending.
             final_score = "Не удалось получить данные"
             no_data_count += 1
-            pending += 1
 
         odds_at = float(rec.odds_at_recommendation) if rec.odds_at_recommendation is not None else None
         minutes_before: int | None = None

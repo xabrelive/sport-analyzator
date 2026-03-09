@@ -73,7 +73,7 @@ if settings.enable_scheduled_collectors:
             # Работает в той же очереди betsapi_collect с низкой конкуррентностью воркеров, чтобы не создавать дедлоки.
             "backfill-line-odds": {
                 "task": "app.worker.tasks.collect_betsapi.backfill_line_odds",
-                "schedule": 120,  # раз в 2 минуты
+                "schedule": 180,  # раз в 3 минуты
                 "options": {"queue": "betsapi_collect", "expires": 300},
             },
             # Догрузка результатов матчей (MatchResult) — нужна для корректной статистики исходов.

@@ -839,20 +839,21 @@ async def _reset_stuck_result_attempts(session_maker, limit: int = STUCK_RESET_B
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STUCK_RESET_DAYS)
     async with session_maker() as session:
-        sub = (
+        q = (
             select(Match.id)
+            .select_from(Match)
+            .outerjoin(MatchResult, Match.id == MatchResult.match_id)
             .where(
                 Match.provider == "betsapi",
                 Match.result_fetch_attempts >= MAX_RESULT_FETCH_ATTEMPTS,
                 Match.start_time < cutoff,
+                or_(
+                    MatchResult.id.is_(None),
+                    MatchResult.winner_id.is_(None),
+                    MatchResult.final_score.is_(None),
+                    MatchResult.final_score.in_(["0:0", "0-0"]),
+                ),
             )
-        )
-        q = (
-            select(Match.id)
-            .select_from(Match)
-            .where(Match.id.in_(sub))
-            .outerjoin(MatchResult, Match.id == MatchResult.match_id)
-            .where(MatchResult.id.is_(None))
             .limit(limit)
         )
         rows = (await session.execute(q)).scalars().all()
@@ -872,7 +873,7 @@ async def _reset_stuck_result_attempts(session_maker, limit: int = STUCK_RESET_B
 async def _run_result_backfill_async(
     batch_size: int = 10,
 ) -> dict[str, Any]:
-    """Находит матчи BetsAPI без результата и догружает их.
+    """Находит матчи BetsAPI без результата (или с «пустым» результатом) и догружает их.
 
     Первая попытка — для всех матчей, у которых start_time уже в прошлом (матч «прошёл» по времени начала),
     вторая/третья — через 7 и 24 часа от начала. Не более 3 попыток на матч."""
@@ -912,7 +913,14 @@ async def _run_result_backfill_async(
                 due_condition,
             )
             .outerjoin(MatchResult, Match.id == MatchResult.match_id)
-            .where(MatchResult.id.is_(None))
+            .where(
+                or_(
+                    MatchResult.id.is_(None),
+                    MatchResult.winner_id.is_(None),
+                    MatchResult.final_score.is_(None),
+                    MatchResult.final_score.in_(["0:0", "0-0"]),
+                )
+            )
             .order_by(Match.start_time.asc())
             .limit(batch_size)
         )

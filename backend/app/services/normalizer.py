@@ -285,16 +285,22 @@ class Normalizer:
                     existing_result = (
                         await self.session.execute(select(MatchResult).where(MatchResult.match_id == match.id))
                     ).scalars().first()
-                    if not existing_result:
-                        score_str = event.get("score") or ss or "0-0"
-                        home_sets = sum(1 for h, a in sets_scores if h > a)
-                        away_sets = sum(1 for h, a in sets_scores if a > h)
-                        winner_id = None
-                        if home_sets > away_sets:
-                            winner_id = match.home_player_id
-                        elif away_sets > home_sets:
-                            winner_id = match.away_player_id
-                        finished_at = datetime.now(timezone.utc)
+                    # Используем счёт по сетам, если он есть — он надёжнее, чем старое "0:0" или пустой результат.
+                    score_str = event.get("score") or ss or None
+                    if sets_scores:
+                        sets_str = " ".join(f"{h}:{a}" for h, a in sets_scores)
+                        score_str = score_str or sets_str
+                    if not score_str:
+                        score_str = "0-0"
+                    home_sets = sum(1 for h, a in sets_scores if h > a)
+                    away_sets = sum(1 for h, a in sets_scores if a > h)
+                    winner_id = None
+                    if home_sets > away_sets:
+                        winner_id = match.home_player_id
+                    elif away_sets > home_sets:
+                        winner_id = match.away_player_id
+                    finished_at = datetime.now(timezone.utc)
+                    if existing_result is None:
                         self.session.add(
                             MatchResult(
                                 match_id=match.id,
@@ -303,6 +309,18 @@ class Normalizer:
                                 finished_at=finished_at,
                             )
                         )
+                    else:
+                        # Перезаписываем только «пустые» результаты (0:0 / без winner_id).
+                        if (existing_result.final_score or "").strip() in ("0:0", "0-0") or existing_result.winner_id is None:
+                            await self.session.execute(
+                                update(MatchResult)
+                                .where(MatchResult.id == existing_result.id)
+                                .values(
+                                    final_score=score_str[:50],
+                                    winner_id=winner_id,
+                                    finished_at=finished_at,
+                                )
+                            )
             elif source == "ended":
                 ss = event.get("ss") or (event.get("scores") if isinstance(event.get("scores"), str) else None)
                 score_str = event.get("score") or ss or "0-0"
@@ -350,14 +368,14 @@ class Normalizer:
                 existing_result = (
                     await self.session.execute(select(MatchResult).where(MatchResult.match_id == match.id))
                 ).scalars().first()
-                if not existing_result:
-                    home_sets = sum(1 for h, a in sets_scores if h > a)
-                    away_sets = sum(1 for h, a in sets_scores if a > h)
-                    winner_id = None
-                    if home_sets > away_sets:
-                        winner_id = match.home_player_id
-                    elif away_sets > home_sets:
-                        winner_id = match.away_player_id
+                home_sets = sum(1 for h, a in sets_scores if h > a)
+                away_sets = sum(1 for h, a in sets_scores if a > h)
+                winner_id = None
+                if home_sets > away_sets:
+                    winner_id = match.home_player_id
+                elif away_sets > home_sets:
+                    winner_id = match.away_player_id
+                if existing_result is None:
                     self.session.add(
                         MatchResult(
                             match_id=match.id,
@@ -367,6 +385,18 @@ class Normalizer:
                         )
                     )
                     await self.session.flush()
+                else:
+                    # Перезаписываем только пустые/некорректные результаты.
+                    if (existing_result.final_score or "").strip() in ("0:0", "0-0") or existing_result.winner_id is None:
+                        await self.session.execute(
+                            update(MatchResult)
+                            .where(MatchResult.id == existing_result.id)
+                            .values(
+                                final_score=score_str[:50],
+                                winner_id=winner_id,
+                                finished_at=finished_at_approx,
+                            )
+                        )
             elif source == "upcoming":
                 # Для линии показываем только матчи, у которых уже есть коэффициенты.
                 # Если коэффициентов нет — держим отдельный статус до момента, когда odds появятся.

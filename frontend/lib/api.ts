@@ -515,6 +515,7 @@ export interface RecommendationStatsResponse {
 }
 
 export type RecommendationResultFilter = "all" | "correct" | "wrong" | "pending";
+export type RecommendationChannelFilter = "all" | "free" | "vip";
 
 export interface FetchRecommendationsStatsParams {
   page?: number;
@@ -526,6 +527,7 @@ export interface FetchRecommendationsStatsParams {
   date_from?: string;
   date_to?: string;
   sport_key?: string;
+  channel?: RecommendationChannelFilter;
 }
 
 export async function fetchRecommendationsStats(params?: FetchRecommendationsStatsParams): Promise<RecommendationStatsResponse> {
@@ -539,6 +541,7 @@ export async function fetchRecommendationsStats(params?: FetchRecommendationsSta
   if (params?.date_from) url.searchParams.set("date_from", params.date_from);
   if (params?.date_to) url.searchParams.set("date_to", params.date_to);
   if (params?.sport_key) url.searchParams.set("sport_key", params.sport_key);
+  if (params?.channel && params.channel !== "all") url.searchParams.set("channel", params.channel);
   return fetchJson<RecommendationStatsResponse>(url.toString(), { cache: "no-store" });
 }
 
@@ -747,6 +750,7 @@ export interface MySignalItem {
   outcome: "won" | "lost" | "pending";
   sent_at: string;
   sent_via: string;
+  odds_at_recommendation: number | null;
 }
 
 export interface MySignalsResponse {
@@ -759,12 +763,26 @@ export interface MySignalsResponse {
   avg_odds?: number | null;
 }
 
-export async function fetchMySignals(days = 30): Promise<MySignalsResponse> {
-  const url =
+export interface MySignalsParams {
+  days?: number;
+  date_from?: string;
+  date_to?: string;
+}
+
+export async function fetchMySignals(params?: number | MySignalsParams): Promise<MySignalsResponse> {
+  const base =
     typeof window !== "undefined"
-      ? `${apiUrl("me/signals")}?days=${days}`
-      : new URL(apiUrl("me/signals"), "http://localhost:11000").toString() + `?days=${days}`;
-  const res = await fetch(url, { headers: { ...authHeaders() }, cache: "no-store" });
+      ? apiUrl("me/signals")
+      : new URL(apiUrl("me/signals"), "http://localhost:11000").toString();
+  const url = new URL(base, typeof window !== "undefined" ? window.location.origin : "http://localhost:11000");
+  if (typeof params === "number") {
+    url.searchParams.set("days", String(params));
+  } else if (params) {
+    if (params.days != null) url.searchParams.set("days", String(params.days));
+    if (params.date_from) url.searchParams.set("date_from", params.date_from);
+    if (params.date_to) url.searchParams.set("date_to", params.date_to);
+  }
+  const res = await fetch(url.toString(), { headers: { ...authHeaders() }, cache: "no-store" });
   if (!res.ok) throw new Error("Failed to fetch my signals");
   return res.json();
 }
