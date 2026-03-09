@@ -1,20 +1,34 @@
 "use client";
 
-import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+} from "react";
 import {
   login as apiLogin,
   register as apiRegister,
+  verifyEmail as apiVerifyEmail,
+  verifyTelegramCode as apiVerifyTelegramCode,
   loginWithTelegram as apiLoginWithTelegram,
+  AUTH_TOKEN_STORAGE_KEY,
   type TelegramAuthPayload,
 } from "@/lib/api";
-
-const TOKEN_KEY = "sport_analyzator_token";
 
 type AuthContextType = {
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string) => Promise<{ message: string; detail: string }>;
+  register: (
+    email: string,
+    password: string,
+    acceptTerms: boolean,
+    acceptPrivacy: boolean
+  ) => Promise<{ message: string; detail: string }>;
+  verifyEmail: (email: string, code: string) => Promise<void>;
+  verifyTelegramCode: (code: string, acceptTerms: boolean, acceptPrivacy: boolean) => Promise<void>;
   loginWithTelegram: (payload: TelegramAuthPayload) => Promise<void>;
   saveToken: (accessToken: string) => void;
   logout: () => void;
@@ -27,36 +41,68 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const t = typeof window !== "undefined" ? localStorage.getItem(TOKEN_KEY) : null;
+    const t =
+      typeof window !== "undefined"
+        ? localStorage.getItem(AUTH_TOKEN_STORAGE_KEY)
+        : null;
     setToken(t);
     setIsLoading(false);
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
     const { access_token } = await apiLogin(email, password);
-    localStorage.setItem(TOKEN_KEY, access_token);
+    localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, access_token);
     setToken(access_token);
   }, []);
 
-  const register = useCallback(async (email: string, password: string) => {
-    const result = await apiRegister(email, password);
-    // No token: user must verify email first
-    return result;
-  }, []);
+  const register = useCallback(
+    async (
+      email: string,
+      password: string,
+      acceptTerms: boolean,
+      acceptPrivacy: boolean
+    ) => {
+      const result = await apiRegister(email, password, acceptTerms, acceptPrivacy);
+      return result;
+    },
+    []
+  );
 
-  const loginWithTelegram = useCallback(async (payload: TelegramAuthPayload) => {
-    const { access_token } = await apiLoginWithTelegram(payload);
-    localStorage.setItem(TOKEN_KEY, access_token);
+  const verifyEmail = useCallback(async (email: string, code: string) => {
+    const { access_token } = await apiVerifyEmail(email, code);
+    localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, access_token);
     setToken(access_token);
   }, []);
+
+  const verifyTelegramCode = useCallback(
+    async (code: string, acceptTerms: boolean, acceptPrivacy: boolean) => {
+      const { access_token } = await apiVerifyTelegramCode(
+        code,
+        acceptTerms,
+        acceptPrivacy
+      );
+      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, access_token);
+      setToken(access_token);
+    },
+    []
+  );
+
+  const loginWithTelegram = useCallback(
+    async (payload: TelegramAuthPayload) => {
+      const { access_token } = await apiLoginWithTelegram(payload);
+      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, access_token);
+      setToken(access_token);
+    },
+    []
+  );
 
   const saveToken = useCallback((accessToken: string) => {
-    localStorage.setItem(TOKEN_KEY, accessToken);
+    localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, accessToken);
     setToken(accessToken);
   }, []);
 
   const logout = useCallback(() => {
-    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
     setToken(null);
   }, []);
 
@@ -67,6 +113,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         isLoading,
         login,
         register,
+        verifyEmail,
+        verifyTelegramCode,
         loginWithTelegram,
         saveToken,
         logout,

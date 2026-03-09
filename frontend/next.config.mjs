@@ -1,17 +1,11 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  images: {
-    remotePatterns: [
-      { protocol: "https", hostname: "assets.b365api.com", pathname: "/images/**" },
-    ],
-  },
   async rewrites() {
     const backend =
       process.env.BACKEND_URL ||
-      (process.env.BACKEND_PORT
-        ? `http://backend:${process.env.BACKEND_PORT}`
-        : "http://backend:11001");
+      process.env.NEXT_PUBLIC_API_URL ||
+      "http://localhost:11001";
     return [{ source: "/api/:path*", destination: `${backend}/api/:path*` }];
   },
 };

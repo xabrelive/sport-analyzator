@@ -1,23 +1,21 @@
-"""Alembic env — run migrations with sync engine (Alembic supports sync)."""
+"""Alembic env — sync engine for migrations."""
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
+from sqlalchemy import engine_from_config, pool
 
 from app.config import settings
 from app.db.base import Base
-from app.models import *  # noqa: F401, F403 — register all models
+from app.models import User, VerificationCode  # noqa: F401 — register models
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
-# Use sync URL (no asyncpg) for migrations
 sync_url = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
-if sync_url == settings.database_url and "+asyncpg" in settings.database_url:
-    sync_url = settings.database_url.replace("+asyncpg", "")
+if "+asyncpg" in sync_url:
+    sync_url = sync_url.replace("+asyncpg", "")
 config.set_main_option("sqlalchemy.url", sync_url)
 
 

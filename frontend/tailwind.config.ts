@@ -9,26 +9,22 @@ export default {
     extend: {
       fontFamily: {
         sans: ["var(--font-sans)", "system-ui", "sans-serif"],
+        display: ["var(--font-display)", "var(--font-sans)", "system-ui"],
       },
       colors: {
-        value: "#22c55e",
-        near: "#eab308",
-        neutral: "#6b7280",
-        brand: "#f59e0b",
-        "brand-light": "#fbbf24",
+        brand: "#06b6d4",
+        "brand-light": "#22d3ee",
+        surface: "#0f172a",
+        "surface-elevated": "#1e293b",
       },
       keyframes: {
         fadeInUp: {
-          "0%": { opacity: "0", transform: "translateY(20px)" },
+          "0%": { opacity: "0", transform: "translateY(16px)" },
           "100%": { opacity: "1", transform: "translateY(0)" },
         },
         fadeIn: {
           "0%": { opacity: "0" },
           "100%": { opacity: "1" },
-        },
-        pulseSoft: {
-          "0%, 100%": { opacity: "1" },
-          "50%": { opacity: "0.7" },
         },
         shimmer: {
           "0%": { backgroundPosition: "-200% 0" },
@@ -38,16 +34,34 @@ export default {
           "0%, 100%": { transform: "translateY(0)" },
           "50%": { transform: "translateY(-6px)" },
         },
+        glow: {
+          "0%, 100%": { opacity: "0.4" },
+          "50%": { opacity: "0.8" },
+        },
+        gradientShift: {
+          "0%": { backgroundPosition: "0% 50%" },
+          "50%": { backgroundPosition: "100% 50%" },
+          "100%": { backgroundPosition: "0% 50%" },
+        },
+        scaleIn: {
+          "0%": { opacity: "0", transform: "scale(0.95)" },
+          "100%": { opacity: "1", transform: "scale(1)" },
+        },
       },
       animation: {
-        "fade-in-up": "fadeInUp 0.7s ease-out forwards",
-        "fade-in": "fadeIn 0.5s ease-out forwards",
-        "pulse-soft": "pulseSoft 2s ease-in-out infinite",
+        "fade-in-up": "fadeInUp 0.5s ease-out forwards",
+        "fade-in": "fadeIn 0.4s ease-out forwards",
         float: "float 4s ease-in-out infinite",
+        glow: "glow 2.5s ease-in-out infinite",
+        "scale-in": "scaleIn 0.4s ease-out forwards",
+      },
+      transitionDuration: {
+        400: "400ms",
       },
       backgroundImage: {
         "gradient-radial": "radial-gradient(var(--tw-gradient-stops))",
-        "mesh-dark": "radial-gradient(at 40% 20%, rgba(20, 184, 166, 0.12) 0px, transparent 50%), radial-gradient(at 80% 0%, rgba(45, 212, 191, 0.08) 0px, transparent 50%)",
+        "mesh-dark":
+          "radial-gradient(at 40% 20%, rgba(6, 182, 212, 0.15) 0px, transparent 50%), radial-gradient(at 80% 0%, rgba(34, 211, 238, 0.08) 0px, transparent 50%)",
       },
     },
   },

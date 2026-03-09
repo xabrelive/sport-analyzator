@@ -2,386 +2,317 @@
 
 import Link from "next/link";
 import Image from "next/image";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchMatchesOverview, fetchSignalsLandingStats, type Match } from "@/lib/api";
-import { useWebSocket } from "@/hooks/useWebSocket";
-import { LandingMatchRow } from "@/components/LandingMatchRow";
-import { getCached, setCached } from "@/lib/viewCache";
-import { setCachedMatches, invalidateMatchIds, mergeMatchesWithCache } from "@/lib/matchCache";
+import { Header } from "@/components/Header";
+import { Footer } from "@/components/Footer";
 
-const DEMO_LIVE = 4;
-const DEMO_LINE = 4;
-const LANDING_CACHE_KEY = "view:landing";
-/** Кэш главной: показываем при повторном заходе только если свежее 20 сек */
-const LANDING_CACHE_MAX_AGE_MS = 20_000;
+const FEATURES = [
+  {
+    icon: "📊",
+    title: "Статистика по игрокам",
+    text: "Форма, история встреч, тренды — только факты, без советов.",
+  },
+  {
+    icon: "⚡",
+    title: "Лайв",
+    text: "Счёт по сетам и очкам в реальном времени и линия предстоящих матчей.",
+  },
+  {
+    icon: "📈",
+    title: "Вероятности по сетам",
+    text: "Оценки на основе данных. Информация носит справочный характер.",
+  },
+  {
+    icon: "🔔",
+    title: "Уведомления",
+    text: "Telegram и email по выбранным видам спорта и событиям.",
+  },
+  {
+    icon: "🎯",
+    title: "Всё в одном месте",
+    text: "Лайв, линия, результаты и статистика — один кабинет, без переключения между сервисами.",
+  },
+  {
+    icon: "🛡️",
+    title: "Прозрачность",
+    text: "Чёткие правила использования и политика конфиденциальности. Никаких скрытых условий.",
+  },
+];
 
-function byStartTime(a: Match, b: Match): number {
-  return new Date(a.start_time).getTime() - new Date(b.start_time).getTime();
-}
+const TRUST = [
+  { value: "Только аналитика", label: "Без призывов к ставкам" },
+  { value: "Почта и Telegram", label: "Один аккаунт" },
+  { value: "pingwin.pro", label: "Прозрачные правила" },
+];
 
-export default function LandingPage() {
-  const [live, setLive] = useState<Match[]>([]);
-  const [line, setLine] = useState<Match[]>([]);
-  const [liveLoaded, setLiveLoaded] = useState(false);
-  const [lineLoaded, setLineLoaded] = useState(false);
-  const [liveError, setLiveError] = useState<string | null>(null);
-  const [lineError, setLineError] = useState<string | null>(null);
-  const [signalsStats, setSignalsStats] = useState<{
-    free_channel: { day: { total: number; won: number; lost: number }; week: { total: number; won: number; lost: number }; month: { total: number; won: number; lost: number } };
-    paid_subscription: { day: { total: number; won: number; lost: number }; week: { total: number; won: number; lost: number }; month: { total: number; won: number; lost: number } };
-  } | null>(null);
-  const [signalsStatsLoaded, setSignalsStatsLoaded] = useState(false);
-  const isFetchingRef = useRef(false);
-  const fetchAgainRef = useRef(false);
+const HOW_IT_WORKS = [
+  { step: 1, title: "Регистрация", text: "Почта или Telegram — за минуту.", icon: "✉️" },
+  { step: 2, title: "Аналитика", text: "Лайв, линия, статистика по игрокам и матчам.", icon: "📐" },
+  { step: 3, title: "Уведомления", text: "Получайте обновления в Telegram или на почту.", icon: "🔔" },
+];
 
-  const loadMatches = useCallback(async () => {
-    if (isFetchingRef.current) {
-      fetchAgainRef.current = true;
-      return;
-    }
-    isFetchingRef.current = true;
-    try {
-      const { live: liveList, upcoming: lineList } = await fetchMatchesOverview({
-        limit_live: DEMO_LIVE * 2,
-        limit_upcoming: DEMO_LINE * 2,
-      });
-      const nextLive = mergeMatchesWithCache(liveList.slice().sort(byStartTime).slice(0, DEMO_LIVE));
-      const nextLine = mergeMatchesWithCache(lineList.slice().sort(byStartTime).slice(0, DEMO_LINE));
-      setLive(nextLive);
-      setLine(nextLine);
-      setLiveLoaded(true);
-      setLineLoaded(true);
-      setLiveError(null);
-      setLineError(null);
-      setCached(LANDING_CACHE_KEY, { live: nextLive, line: nextLine });
-      setCachedMatches([...nextLive, ...nextLine]);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : "Ошибка загрузки";
-      setLiveLoaded(true);
-      setLineLoaded(true);
-      setLiveError(message);
-      setLineError(message);
-    } finally {
-      isFetchingRef.current = false;
-      if (fetchAgainRef.current) {
-        fetchAgainRef.current = false;
-        void loadMatches();
-      }
-    }
-  }, []);
+const WHY_US = [
+  { title: "Только данные", text: "Никаких рекомендаций «ставить» — только цифры и факты для вашего анализа." },
+  { title: "Удобный доступ", text: "Один аккаунт с любого устройства. Уведомления туда, куда вам удобно." },
+  { title: "Оперативность", text: "Обновления по матчам и событиям по мере поступления данных от источников." },
+];
 
-  const connected = useWebSocket((message) => {
-    if (message?.type === "matches_updated") {
-      const ids = Array.isArray(message.match_ids) ? message.match_ids : [];
-      if (ids.length) invalidateMatchIds(ids);
-      void loadMatches();
-    }
-  });
-
-  useEffect(() => {
-    const cached = getCached<{ live: Match[]; line: Match[] }>(LANDING_CACHE_KEY, LANDING_CACHE_MAX_AGE_MS);
-    if (cached) {
-      setLive(cached.live);
-      setLine(cached.line);
-      setLiveLoaded(true);
-      setLineLoaded(true);
-    }
-    void loadMatches();
-    const t = setInterval(() => void loadMatches(), 6000);
-    return () => clearInterval(t);
-  }, [loadMatches]);
-
-  useEffect(() => {
-    fetchSignalsLandingStats()
-      .then((data) => {
-        setSignalsStats(data);
-        setSignalsStatsLoaded(true);
-      })
-      .catch(() => setSignalsStatsLoaded(true));
-  }, []);
-
+export default function HomePage() {
   return (
-    <main className="min-h-screen bg-slate-950">
-      {/* Hero с логотипом */}
-      <section className="relative overflow-hidden border-b border-slate-800">
-        <div className="absolute inset-0 bg-gradient-to-b from-teal-500/10 via-transparent to-transparent" />
-        <div className="absolute inset-0 bg-[radial-gradient(ellipse_60%_40%_at_50%_0%,rgba(20,184,166,0.15),transparent)]" />
-        <div className="relative max-w-5xl mx-auto px-4 py-14 md:py-20 text-center">
-          <div className="inline-flex items-center justify-center gap-3 mb-6 animate-fade-in-up opacity-0 [animation-fill-mode:forwards]">
-            <Image src="/pingwin-logo.png" alt="" width={64} height={64} className="rounded-2xl" style={{ height: "auto" }} />
-            <span className="text-3xl md:text-4xl font-bold text-white">PingWin</span>
+    <>
+      <Header />
+      <main className="min-h-screen overflow-hidden">
+        {/* Hero — компактный */}
+        <section className="relative flex flex-col items-center justify-center border-b border-slate-800/60 px-4 py-12 sm:py-14 md:py-16">
+          <div className="absolute inset-0 bg-mesh-dark" />
+          <div className="absolute inset-0 bg-[radial-gradient(ellipse_80%_50%_at_50%_-20%,rgba(6,182,212,0.12),transparent)]" />
+          <div className="relative z-10 flex flex-col items-center text-center stagger">
+            <div className="animate-float mb-4">
+              <Image
+                src="/pingwin-logo.png"
+                alt="PingWin"
+                width={64}
+                height={64}
+                className="rounded-xl drop-shadow-lg"
+              />
+            </div>
+            <h1 className="font-display text-3xl font-bold tracking-tight text-white sm:text-4xl md:text-5xl">
+              <span className="gradient-text">PingWin</span>
+            </h1>
+            <p className="mt-2 text-slate-400 text-base sm:text-lg max-w-2xl">
+              Спортивная аналитика: лайв, линия, статистика. Только данные — решения за вами.
+            </p>
+            <p className="mt-0.5 text-slate-500 text-sm">
+              pingwin.pro
+            </p>
+            <div className="mt-6 flex flex-wrap justify-center gap-3">
+              <Link
+                href="/register"
+                className="hover-lift card-glow inline-flex items-center rounded-xl bg-cyan-500 px-6 py-3 font-medium text-white shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-400 hover:shadow-cyan-400/30"
+              >
+                Начать бесплатно
+              </Link>
+              <Link
+                href="/login"
+                className="hover-lift inline-flex items-center rounded-xl border border-slate-600 px-6 py-3 font-medium text-slate-200 transition hover:border-cyan-500/50 hover:bg-cyan-500/10 hover:text-cyan-400"
+              >
+                Войти
+              </Link>
+            </div>
           </div>
-          <h1 className="text-3xl sm:text-4xl md:text-5xl font-bold text-white tracking-tight mb-4 animate-fade-in-up opacity-0 [animation-delay:0.05s] [animation-fill-mode:forwards]">
-            AI-аналитика спорта
-          </h1>
-          <p className="text-slate-400 text-lg md:text-xl mb-8 max-w-2xl mx-auto leading-relaxed animate-fade-in-up opacity-0 [animation-delay:0.1s] [animation-fill-mode:forwards]">
-            Доступ к аналитике по спортивным событиям: лайв, линия, статистика по игрокам.
-          </p>
-          <div className="flex flex-wrap justify-center gap-3 animate-fade-in-up opacity-0 [animation-delay:0.15s] [animation-fill-mode:forwards]">
+        </section>
+
+        {/* Trust strip */}
+        <section className="border-b border-slate-800/60 py-8 px-4">
+          <div className="mx-auto max-w-4xl">
+            <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
+              {TRUST.map((item, i) => (
+                <div
+                  key={i}
+                  className="text-center animate-fade-in-up opacity-0 [animation-fill-mode:forwards] [animation-delay:0.1s]"
+                  style={{ animationDelay: `${0.1 + i * 0.08}s` }}
+                >
+                  <p className="font-display text-lg font-semibold text-white">
+                    {item.value}
+                  </p>
+                  <p className="mt-0.5 text-sm text-slate-500">{item.label}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* Features */}
+        <section className="border-b border-slate-800/60 py-12 px-4 sm:py-14">
+          <div className="mx-auto max-w-5xl">
+            <h2 className="font-display text-2xl font-semibold text-white text-center sm:text-3xl">
+              Что внутри
+            </h2>
+            <p className="mt-2 text-center text-slate-400 max-w-xl mx-auto">
+              Инструменты для самостоятельного анализа — без рекомендаций и призывов к действиям.
+            </p>
+            <div className="mt-10 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {FEATURES.map((item, i) => (
+                <div
+                  key={i}
+                  className="card-glow hover-lift rounded-xl border border-slate-700/80 bg-slate-800/40 p-5 transition"
+                >
+                  <span className="text-2xl">{item.icon}</span>
+                  <h3 className="mt-3 font-semibold text-white">
+                    {item.title}
+                  </h3>
+                  <p className="mt-1.5 text-sm text-slate-400">{item.text}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* Как это работает */}
+        <section className="border-b border-slate-800/60 py-12 px-4 sm:py-14">
+          <div className="mx-auto max-w-4xl">
+            <h2 className="font-display text-2xl font-semibold text-white text-center sm:text-3xl">
+              Как это работает
+            </h2>
+            <p className="mt-2 text-center text-slate-400 text-sm max-w-lg mx-auto">
+              Три шага до полноценного доступа к аналитике
+            </p>
+            <div className="mt-10 grid gap-6 sm:grid-cols-3">
+              {HOW_IT_WORKS.map((item) => (
+                <div
+                  key={item.step}
+                  className="relative rounded-xl border border-slate-700/80 bg-slate-800/30 p-5 text-center transition hover:border-cyan-500/30"
+                >
+                  <span className="absolute -top-2 -right-2 flex h-7 w-7 items-center justify-center rounded-full bg-cyan-500/20 text-xs font-bold text-cyan-400">
+                    {item.step}
+                  </span>
+                  <span className="text-2xl">{item.icon}</span>
+                  <h3 className="mt-3 font-semibold text-white">{item.title}</h3>
+                  <p className="mt-1.5 text-sm text-slate-400">{item.text}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* Почему PingWin */}
+        <section className="border-b border-slate-800/60 py-12 px-4 sm:py-14">
+          <div className="mx-auto max-w-4xl">
+            <h2 className="font-display text-2xl font-semibold text-white text-center sm:text-3xl">
+              Почему PingWin
+            </h2>
+            <div className="mt-10 grid gap-4 sm:grid-cols-3">
+              {WHY_US.map((item, i) => (
+                <div
+                  key={i}
+                  className="rounded-xl border border-slate-700/80 bg-slate-800/30 p-5 transition hover:border-cyan-500/20"
+                >
+                  <h3 className="font-semibold text-white">{item.title}</h3>
+                  <p className="mt-2 text-sm text-slate-400">{item.text}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* Визуальный блок */}
+        <section className="border-b border-slate-800/60 py-10 px-4">
+          <div className="mx-auto max-w-4xl">
+            <div className="relative overflow-hidden rounded-2xl border border-slate-700/80 bg-gradient-to-br from-slate-800/80 to-slate-900/80 p-8 sm:p-10">
+              <div className="absolute inset-0 bg-[radial-gradient(circle_at_70%_50%,rgba(6,182,212,0.08),transparent_50%)]" />
+              <div className="relative flex flex-col items-center gap-6 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-4">
+                  <Image
+                    src="/pingwin-logo.png"
+                    alt="PingWin"
+                    width={72}
+                    height={72}
+                    className="rounded-xl shadow-lg"
+                  />
+                  <div>
+                    <p className="font-display text-xl font-semibold text-white">
+                      Всё для анализа в одном месте
+                    </p>
+                    <p className="mt-0.5 text-sm text-slate-400">
+                      Лайв, линия, статистика, уведомления — без лишнего шума
+                    </p>
+                  </div>
+                </div>
+                <Link
+                  href="/register"
+                  className="shrink-0 rounded-xl bg-cyan-500 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-cyan-400"
+                >
+                  Попробовать
+                </Link>
+              </div>
+            </div>
+          </div>
+        </section>
+        {/* Вход и регистрация */}
+        <section className="border-b border-slate-800/60 py-10 px-4">
+          <div className="mx-auto max-w-2xl text-center">
+            <h2 className="font-display text-xl font-semibold text-white">
+              Вход и регистрация
+            </h2>
+            <p className="mt-2 text-slate-400 text-sm">
+              Один аккаунт: почта или Telegram — полный доступ к аналитике.
+            </p>
+            <div className="mt-6 flex flex-wrap justify-center gap-4">
+              <div className="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-800/50 px-5 py-3.5 transition hover:border-cyan-500/30">
+                <span className="text-xl">📧</span>
+                <div className="text-left">
+                  <span className="font-medium text-white">Email</span>
+                  <p className="text-slate-500 text-xs">Регистрация и вход</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-800/50 px-5 py-3.5 transition hover:border-cyan-500/30">
+                <span className="text-xl">✈️</span>
+                <div className="text-left">
+                  <span className="font-medium text-white">Telegram</span>
+                  <p className="text-slate-500 text-xs">Быстрый вход через бота</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Важно */}
+        <section className="border-b border-slate-800/60 py-8 px-4">
+          <div className="mx-auto max-w-3xl">
+            <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-6 py-5 text-center">
+              <p className="text-sm text-amber-200/90">
+                <strong>Важно:</strong> PingWin даёт только аналитику. Любые ставки — на ваш страх и риск. Обновление данных может идти с задержкой. Используя сервис, вы принимаете решения на свою ответственность; мы не несём ответственности за убытки. Подробнее — в{" "}
+                <Link href="/terms" className="text-cyan-400 underline hover:no-underline">
+                  правилах использования
+                </Link>
+                .
+              </p>
+            </div>
+          </div>
+        </section>
+
+        {/* CTA */}
+        <section className="py-12 px-4">
+          <div className="mx-auto max-w-2xl rounded-2xl border border-slate-700/80 bg-gradient-to-b from-slate-800/60 to-slate-800/30 p-8 text-center card-glow">
+            <h2 className="font-display text-2xl font-semibold text-white">
+              Готовы смотреть аналитику?
+            </h2>
+            <p className="mt-2 text-slate-400 text-sm">
+              Регистрация бесплатная. Лайв, линия, статистика по матчам — в одном месте.
+            </p>
             <Link
               href="/register"
-              className="inline-flex items-center rounded-xl bg-teal-500 px-8 py-3.5 font-semibold text-white hover:bg-teal-400 transition-all duration-300 shadow-xl shadow-teal-500/20 hover:shadow-teal-400/30 hover:-translate-y-0.5"
+              className="hover-lift mt-6 inline-flex rounded-xl bg-cyan-500 px-8 py-3.5 font-medium text-white transition hover:bg-cyan-400"
             >
-              Получить доступ
-            </Link>
-            <Link
-              href="/login"
-              className="inline-flex items-center rounded-xl border border-slate-600 px-8 py-3.5 font-medium text-slate-200 hover:border-teal-500/50 hover:text-teal-400 hover:bg-teal-500/5 transition-all duration-300"
-            >
-              Войти
+              Зарегистрироваться
             </Link>
           </div>
-          {connected && (
-            <p className="mt-5 text-sm text-teal-400 animate-fade-in opacity-0 [animation-delay:0.25s] [animation-fill-mode:forwards] flex items-center justify-center gap-2">
-              <span className="h-2 w-2 rounded-full bg-teal-400 animate-pulse" />
-              Данные в реальном времени
-            </p>
-          )}
-        </div>
-      </section>
+        </section>
 
-      {/* Лайв и Линия — две отдельные секции, сетка 2 колонки чтобы всё влезало */}
-      <section className="py-8 px-4 border-b border-slate-800/80">
-        <div className="max-w-5xl mx-auto space-y-10">
-          {/* Лайв */}
-          <div>
-            <div className="flex items-center gap-2 mb-3">
-              <span className="flex h-2 w-2 rounded-full bg-red-500 animate-pulse" aria-hidden />
-              <h2 className="text-lg font-bold text-white">Сейчас в лайве</h2>
-            </div>
-            {liveError && (
-              <p className="text-rose-400 text-sm mb-3">{liveError}</p>
-            )}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {!liveLoaded && !liveError ? (
-                <div className="col-span-full py-10 text-center text-slate-500 text-sm">Загрузка...</div>
-              ) : live.length === 0 ? (
-                <div className="col-span-full py-10 text-center text-slate-500 text-sm">Нет матчей в лайве.</div>
-              ) : (
-                live.filter((m) => m?.id).map((m) => <LandingMatchRow key={String(m.id)} match={m} isLive blurValues />)
-              )}
-            </div>
-            <p className="mt-3 text-sm text-slate-500">
-              <Link href="/register" className="text-teal-400 hover:text-teal-300 font-medium">Зарегистрироваться</Link>
-              {" — счёт по сетам и аналитика"}
-            </p>
-          </div>
-
-          {/* Линия */}
-          <div>
-            <h2 className="text-lg font-bold text-white mb-3">Линия</h2>
-            <p className="text-slate-500 text-sm -mt-2 mb-3">Матчи, которые начнутся в ближайшее время</p>
-            {lineError && (
-              <p className="text-rose-400 text-sm mb-3">{lineError}</p>
-            )}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {!lineLoaded && !lineError ? (
-                <div className="col-span-full py-10 text-center text-slate-500 text-sm">Загрузка...</div>
-              ) : line.length === 0 ? (
-                <div className="col-span-full py-10 text-center text-slate-500 text-sm">Нет матчей в линии.</div>
-              ) : (
-                line.filter((m) => m?.id).map((m) => <LandingMatchRow key={String(m.id)} match={m} isLive={false} blurValues />)
-              )}
-            </div>
-            <p className="mt-3 text-sm text-slate-500">
-              <Link href="/register" className="text-teal-400 hover:text-teal-300 font-medium">Получить доступ</Link>
-              {" — коэффициенты и аналитика"}
-            </p>
-          </div>
-        </div>
-      </section>
-
-      {/* Как это работает */}
-      <section className="py-10 px-4 border-b border-slate-800/80">
-        <div className="max-w-5xl mx-auto">
-          <h2 className="text-xl font-bold text-white mb-6 text-center">Как это работает</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="rounded-xl border border-slate-700 bg-slate-800/40 p-5 text-center">
-              <span className="text-2xl font-bold text-teal-400">1</span>
-              <h3 className="font-semibold text-white mt-2">Регистрация</h3>
-              <p className="text-slate-400 text-sm mt-1">Создайте аккаунт и получите доступ к лайву и линии</p>
-            </div>
-            <div className="rounded-xl border border-slate-700 bg-slate-800/40 p-5 text-center">
-              <span className="text-2xl font-bold text-teal-400">2</span>
-              <h3 className="font-semibold text-white mt-2">Аналитика</h3>
-              <p className="text-slate-400 text-sm mt-1">Смотрите счёт по сетам, вероятности и статистику по игрокам</p>
-            </div>
-            <div className="rounded-xl border border-slate-700 bg-slate-800/40 p-5 text-center">
-              <span className="text-2xl font-bold text-teal-400">3</span>
-              <h3 className="font-semibold text-white mt-2">Доступ к данным</h3>
-              <p className="text-slate-400 text-sm mt-1">Вся аналитика по матчам в одном месте</p>
+        {/* Contact */}
+        <section className="border-t border-slate-800/60 py-8 px-4">
+          <div className="mx-auto max-w-xl text-center">
+            <p className="text-slate-500 text-sm mb-3">Связь с нами</p>
+            <div className="flex flex-wrap justify-center gap-6">
+              <a
+                href="https://t.me/PingwinBets"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-cyan-400 hover:text-cyan-300 font-medium transition"
+              >
+                @PingwinBets
+              </a>
+              <a
+                href="mailto:info@pingwin.pro"
+                className="text-cyan-400 hover:text-cyan-300 font-medium transition"
+              >
+                info@pingwin.pro
+              </a>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      {/* Способы уведомлений */}
-      <section className="py-8 px-4 border-b border-slate-800/80">
-        <div className="max-w-5xl mx-auto">
-          <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-widest mb-4 text-center">
-            Уведомления
-          </h2>
-          <p className="text-slate-400 text-sm text-center mb-4 max-w-xl mx-auto">
-            Выберите вид спорта и получайте уведомления о новой аналитике или отправку избранной аналитики по выбранным каналам.
-          </p>
-          <div className="flex flex-wrap justify-center gap-4">
-            <div className="rounded-xl border border-slate-700 bg-slate-800/50 px-5 py-3.5 flex items-center gap-3 hover:border-teal-500/30 transition-all">
-              <span className="text-xl">✈️</span>
-              <span className="text-white font-medium">Telegram</span>
-              <span className="text-slate-500 text-xs">уведомления о новой аналитике по выбранному виду спорта</span>
-            </div>
-            <div className="rounded-xl border border-slate-700 bg-slate-800/50 px-5 py-3.5 flex items-center gap-3 hover:border-teal-500/30 transition-all">
-              <span className="text-xl">📧</span>
-              <span className="text-white font-medium">Email</span>
-              <span className="text-slate-500 text-xs">рассылка избранной аналитики на почту</span>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* Бонус подписчикам ТГ */}
-      <section className="py-8 px-4 border-b border-slate-800/80">
-        <div className="max-w-5xl mx-auto">
-          <div className="rounded-2xl border border-teal-500/40 bg-teal-500/10 px-6 py-5 text-center">
-            <p className="text-white font-semibold">Подписчикам ТГ‑канала PingWin — 1 день аналитики в подарок</p>
-            <p className="text-slate-400 text-sm mt-1">Подпишитесь на канал и получите бесплатный день доступа к аналитике</p>
-          </div>
-        </div>
-      </section>
-
-      {/* Статистика: бесплатный ТГ-канал и платная подписка */}
-      <section className="py-8 px-4 border-b border-slate-800/80">
-        <div className="max-w-5xl mx-auto space-y-10">
-          {/* Бесплатный ТГ-канал */}
-          <div>
-            <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-widest mb-1">
-              Бесплатный ТГ-канал
-            </h2>
-            <p className="text-slate-400 text-sm mb-4">Сколько прогнозов отправлено в бесплатный канал</p>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              {!signalsStatsLoaded ? (
-                <div className="col-span-full text-slate-500 text-sm py-4">Загрузка...</div>
-              ) : signalsStats ? (
-                <>
-                  <div className="rounded-xl border border-slate-700 bg-slate-800/50 p-5">
-                    <p className="text-slate-500 text-xs font-medium uppercase tracking-wider">За день</p>
-                    <p className="text-xl font-bold text-white mt-2">Всего: {signalsStats.free_channel.day.total}</p>
-                    <p className="text-teal-400 text-sm mt-1">Угадано: {signalsStats.free_channel.day.won}</p>
-                    <p className="text-rose-400/90 text-sm">Не угадано: {signalsStats.free_channel.day.lost}</p>
-                  </div>
-                  <div className="rounded-xl border border-slate-700 bg-slate-800/50 p-5">
-                    <p className="text-slate-500 text-xs font-medium uppercase tracking-wider">За неделю</p>
-                    <p className="text-xl font-bold text-white mt-2">Всего: {signalsStats.free_channel.week.total}</p>
-                    <p className="text-teal-400 text-sm mt-1">Угадано: {signalsStats.free_channel.week.won}</p>
-                    <p className="text-rose-400/90 text-sm">Не угадано: {signalsStats.free_channel.week.lost}</p>
-                  </div>
-                  <div className="rounded-xl border border-slate-700 bg-slate-800/50 p-5">
-                    <p className="text-slate-500 text-xs font-medium uppercase tracking-wider">За месяц</p>
-                    <p className="text-xl font-bold text-white mt-2">Всего: {signalsStats.free_channel.month.total}</p>
-                    <p className="text-teal-400 text-sm mt-1">Угадано: {signalsStats.free_channel.month.won}</p>
-                    <p className="text-rose-400/90 text-sm">Не угадано: {signalsStats.free_channel.month.lost}</p>
-                  </div>
-                </>
-              ) : (
-                <div className="col-span-full text-slate-500 text-sm py-4">—</div>
-              )}
-            </div>
-          </div>
-
-          {/* Платная подписка */}
-          <div>
-            <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-widest mb-1">
-              Платная подписка
-            </h2>
-            <p className="text-slate-400 text-sm mb-4">Сколько прогнозов отправлено подписчикам</p>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              {!signalsStatsLoaded ? (
-                <div className="col-span-full text-slate-500 text-sm py-4">Загрузка...</div>
-              ) : signalsStats ? (
-                <>
-                  <div className="rounded-xl border border-slate-700 bg-slate-800/50 p-5">
-                    <p className="text-slate-500 text-xs font-medium uppercase tracking-wider">За день</p>
-                    <p className="text-xl font-bold text-white mt-2">Всего: {signalsStats.paid_subscription.day.total}</p>
-                    <p className="text-teal-400 text-sm mt-1">Угадано: {signalsStats.paid_subscription.day.won}</p>
-                    <p className="text-rose-400/90 text-sm">Не угадано: {signalsStats.paid_subscription.day.lost}</p>
-                  </div>
-                  <div className="rounded-xl border border-slate-700 bg-slate-800/50 p-5">
-                    <p className="text-slate-500 text-xs font-medium uppercase tracking-wider">За неделю</p>
-                    <p className="text-xl font-bold text-white mt-2">Всего: {signalsStats.paid_subscription.week.total}</p>
-                    <p className="text-teal-400 text-sm mt-1">Угадано: {signalsStats.paid_subscription.week.won}</p>
-                    <p className="text-rose-400/90 text-sm">Не угадано: {signalsStats.paid_subscription.week.lost}</p>
-                  </div>
-                  <div className="rounded-xl border border-slate-700 bg-slate-800/50 p-5">
-                    <p className="text-slate-500 text-xs font-medium uppercase tracking-wider">За месяц</p>
-                    <p className="text-xl font-bold text-white mt-2">Всего: {signalsStats.paid_subscription.month.total}</p>
-                    <p className="text-teal-400 text-sm mt-1">Угадано: {signalsStats.paid_subscription.month.won}</p>
-                    <p className="text-rose-400/90 text-sm">Не угадано: {signalsStats.paid_subscription.month.lost}</p>
-                  </div>
-                </>
-              ) : (
-                <div className="col-span-full text-slate-500 text-sm py-4">—</div>
-              )}
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* Преимущества + цифры */}
-      <section className="py-10 px-4 border-b border-slate-800/80">
-        <div className="max-w-5xl mx-auto">
-          <h2 className="text-xl font-bold text-white mb-6 text-center">Почему PingWin</h2>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div className="rounded-xl border border-slate-700 bg-slate-800/40 p-4 text-center hover:border-teal-500/30 transition-all">
-              <span className="text-2xl">📊</span>
-              <p className="text-white font-semibold mt-2">Статистика по игрокам</p>
-              <p className="text-slate-500 text-xs mt-0.5">Тренды, форма, история встреч</p>
-            </div>
-            <div className="rounded-xl border border-slate-700 bg-slate-800/40 p-4 text-center hover:border-teal-500/30 transition-all">
-              <span className="text-2xl">⚡</span>
-              <p className="text-white font-semibold mt-2">Лайв в реальном времени</p>
-              <p className="text-slate-500 text-xs mt-0.5">Счёт по сетам и очкам</p>
-            </div>
-            <div className="rounded-xl border border-slate-700 bg-slate-800/40 p-4 text-center hover:border-teal-500/30 transition-all">
-              <span className="text-2xl">📈</span>
-              <p className="text-white font-semibold mt-2">Вероятности по сетам</p>
-              <p className="text-slate-500 text-xs mt-0.5">Оценки на основе данных</p>
-            </div>
-            <div className="rounded-xl border border-slate-700 bg-slate-800/40 p-4 text-center hover:border-teal-500/30 transition-all">
-              <span className="text-2xl">🎯</span>
-              <p className="text-white font-semibold mt-2">Доступ к аналитике</p>
-              <p className="text-slate-500 text-xs mt-0.5">Данные по матчам в реальном времени</p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* CTA */}
-      <section className="py-12 px-4">
-        <div className="max-w-2xl mx-auto text-center rounded-2xl border border-slate-700 bg-slate-800/50 p-8">
-          <h2 className="text-xl font-bold text-white mb-2">Готовы смотреть аналитику?</h2>
-          <p className="text-slate-400 text-sm mb-6">Регистрация бесплатная. Лайв, линия и статистика по матчам.</p>
-          <Link
-            href="/register"
-            className="inline-flex rounded-xl bg-teal-500 px-8 py-3.5 font-semibold text-white hover:bg-teal-400 transition-all hover:shadow-lg hover:shadow-teal-500/20"
-          >
-            Зарегистрироваться
-          </Link>
-        </div>
-      </section>
-
-      <p className="text-center text-slate-500 text-xs px-4 py-4 max-w-xl mx-auto">
-        Доступ к аналитике по спортивным событиям.
-      </p>
-
-      <footer className="border-t border-slate-800 py-6 px-4">
-        <div className="max-w-5xl mx-auto flex flex-wrap justify-center gap-6 text-sm text-slate-500">
-          <Link href="/sports" className="hover:text-teal-400 transition-colors">Виды спорта</Link>
-          <Link href="/terms" className="hover:text-teal-400 transition-colors">Условия</Link>
-          <Link href="/rules" className="hover:text-teal-400 transition-colors">Правила</Link>
-          <Link href="/about" className="hover:text-teal-400 transition-colors">Как работает</Link>
-          <Link href="/disclaimer" className="hover:text-teal-400 transition-colors">Оговорка</Link>
-        </div>
-      </footer>
-    </main>
+        <Footer />
+      </main>
+    </>
   );
 }

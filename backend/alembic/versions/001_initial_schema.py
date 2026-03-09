@@ -1,8 +1,8 @@
-"""Initial schema: leagues, players, matches, match_scores, odds_snapshots, match_results.
+"""Initial schema: users, verification_codes.
 
 Revision ID: 001
 Revises:
-Create Date: 2025-02-28
+Create Date: 2025-03-09
 
 """
 from typing import Sequence, Union
@@ -19,99 +19,46 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     op.create_table(
-        "leagues",
+        "users",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("name", sa.String(255), nullable=False),
-        sa.Column("country", sa.String(100), nullable=True),
-        sa.Column("provider_league_id", sa.String(100), nullable=True),
-        sa.Column("provider", sa.String(50), nullable=True),
+        sa.Column("email", sa.String(255), nullable=False),
+        sa.Column("hashed_password", sa.String(255), nullable=True),
+        sa.Column("email_verified", sa.Boolean(), nullable=False, server_default="false"),
+        sa.Column("telegram_id", sa.BigInteger(), nullable=True),
+        sa.Column("telegram_username", sa.String(128), nullable=True),
+        sa.Column("is_blocked", sa.Boolean(), nullable=False, server_default="false"),
+        sa.Column("last_login_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index("ix_leagues_name", "leagues", ["name"], unique=False)
-    op.create_index("ix_leagues_provider_league_id", "leagues", ["provider_league_id"], unique=False)
+    op.create_index("ix_users_email", "users", ["email"], unique=True)
+    op.create_index("ix_users_telegram_id", "users", ["telegram_id"], unique=True)
 
     op.create_table(
-        "players",
+        "verification_codes",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("name", sa.String(255), nullable=False),
-        sa.Column("provider_player_id", sa.String(100), nullable=True),
-        sa.Column("provider", sa.String(50), nullable=True),
+        sa.Column("type", sa.String(32), nullable=False),
+        sa.Column("contact", sa.String(255), nullable=False),
+        sa.Column("code_hash", sa.String(64), nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("user_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index("ix_players_name", "players", ["name"], unique=False)
-    op.create_index("ix_players_provider_player_id", "players", ["provider_player_id"], unique=False)
-
-    op.create_table(
-        "matches",
-        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("provider_match_id", sa.String(100), nullable=False),
-        sa.Column("provider", sa.String(50), nullable=False),
-        sa.Column("league_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("home_player_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("away_player_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("start_time", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("status", sa.String(20), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(["league_id"], ["leagues.id"], ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(["home_player_id"], ["players.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(["away_player_id"], ["players.id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("provider_match_id", name="uq_matches_provider_match_id"),
-    )
-    op.create_index("ix_matches_provider_match_id", "matches", ["provider_match_id"], unique=True)
-    op.create_index("ix_matches_league_id", "matches", ["league_id"], unique=False)
-    op.create_index("ix_matches_status", "matches", ["status"], unique=False)
-    op.create_index("ix_matches_start_time", "matches", ["start_time"], unique=False)
-
-    op.create_table(
-        "match_scores",
-        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("match_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("set_number", sa.Integer(), nullable=False),
-        sa.Column("home_score", sa.Integer(), nullable=False),
-        sa.Column("away_score", sa.Integer(), nullable=False),
-        sa.Column("timestamp", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(["match_id"], ["matches.id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index("ix_match_scores_match_id", "match_scores", ["match_id"], unique=False)
-
-    op.create_table(
-        "odds_snapshots",
-        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("match_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("bookmaker", sa.String(100), nullable=False),
-        sa.Column("market", sa.String(50), nullable=False),
-        sa.Column("selection", sa.String(255), nullable=False),
-        sa.Column("odds", sa.Numeric(10, 2), nullable=False),
-        sa.Column("implied_probability", sa.Numeric(8, 6), nullable=True),
-        sa.Column("timestamp", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(["match_id"], ["matches.id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index("ix_odds_snapshots_match_id", "odds_snapshots", ["match_id"], unique=False)
-    op.create_index("ix_odds_snapshots_bookmaker", "odds_snapshots", ["bookmaker"], unique=False)
-
-    op.create_table(
-        "match_results",
-        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("match_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("final_score", sa.String(50), nullable=False),
-        sa.Column("winner_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(["match_id"], ["matches.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(["winner_id"], ["players.id"], ondelete="SET NULL"),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("match_id", name="uq_match_results_match_id"),
-    )
-    op.create_index("ix_match_results_match_id", "match_results", ["match_id"], unique=True)
+    op.create_index("ix_verification_codes_type", "verification_codes", ["type"])
+    op.create_index("ix_verification_codes_contact", "verification_codes", ["contact"])
+    op.create_index("ix_verification_codes_code_hash", "verification_codes", ["code_hash"])
+    op.create_index("ix_verification_codes_expires_at", "verification_codes", ["expires_at"])
+    op.create_index("ix_verification_codes_user_id", "verification_codes", ["user_id"])
 
 
 def downgrade() -> None:
-    op.drop_table("match_results")
-    op.drop_table("odds_snapshots")
-    op.drop_table("match_scores")
-    op.drop_table("matches")
-    op.drop_table("players")
-    op.drop_table("leagues")
+    op.drop_index("ix_verification_codes_user_id", table_name="verification_codes")
+    op.drop_index("ix_verification_codes_expires_at", table_name="verification_codes")
+    op.drop_index("ix_verification_codes_code_hash", table_name="verification_codes")
+    op.drop_index("ix_verification_codes_contact", table_name="verification_codes")
+    op.drop_index("ix_verification_codes_type", table_name="verification_codes")
+    op.drop_table("verification_codes")
+    op.drop_index("ix_users_telegram_id", table_name="users")
+    op.drop_index("ix_users_email", table_name="users")
+    op.drop_table("users")

@@ -1,21 +1,51 @@
+import { Header } from "@/components/Header";
+import { Footer } from "@/components/Footer";
 import Link from "next/link";
+
+export const metadata = {
+  title: "О проекте — PingWin",
+  description: "Что такое PingWin: спортивная аналитика, только данные, без призывов к ставкам.",
+};
 
 export default function AboutPage() {
   return (
-    <main className="max-w-3xl mx-auto px-4 py-12">
-      <Link href="/" className="text-slate-400 hover:text-white text-sm mb-6 inline-block">← На главную</Link>
-      <h1 className="text-3xl font-bold text-white mb-6">Как это работает</h1>
-      <div className="prose prose-invert prose-slate max-w-none space-y-4 text-slate-300">
-        <p>Sport Analyzator агрегирует данные о матчах и коэффициентах из открытых источников и партнёрских API.</p>
-        <h2 className="text-xl font-semibold text-white mt-6">Что вы видите</h2>
-        <ul className="list-disc pl-6 space-y-2">
-          <li><strong>Линия</strong> — предстоящие матчи и коэффициенты на разные исходы.</li>
-          <li><strong>Лайв</strong> — матчи в реальном времени, счёт по сетам.</li>
-          <li><strong>Результаты</strong> — завершённые матчи и победители.</li>
-          <li><strong>Статистика по игрокам</strong> — победы/поражения, проценты по сетам, типичные порядки сетов.</li>
-        </ul>
-        <p>Данные обновляются автоматически. Аналитика носит информационный характер и не является рекомендацией к действию.</p>
-      </div>
-    </main>
+    <>
+      <Header />
+      <main className="min-h-screen">
+        <article className="mx-auto max-w-3xl px-4 py-12 sm:py-16">
+          <h1 className="font-display text-3xl font-bold text-white sm:text-4xl">
+            О проекте PingWin
+          </h1>
+          <p className="mt-2 text-slate-400">
+            pingwin.pro — сервис спортивной аналитики
+          </p>
+          <div className="prose prose-invert mt-10 max-w-none prose-p:text-slate-300 prose-li:text-slate-300 prose-a:text-cyan-400 prose-a:no-underline hover:prose-a:underline">
+            <p>
+              <strong>PingWin</strong> предоставляет исключительно аналитическую информацию по спортивным событиям: статистику по игрокам и командам, данные по матчам в режиме лайв и линия, оценки вероятностей на основе имеющихся данных.
+            </p>
+            <p>
+              Мы не даём рекомендаций по ставкам и не призываем к заключению пари. Любые решения о использовании информации в личных целях пользователь принимает самостоятельно и на свой страх и риск.
+            </p>
+            <p>
+              Регистрация и вход возможны по электронной почте или через Telegram. После входа доступны разделы с лайв-матчами, линией, статистикой по игрокам и уведомлениями по выбранным видам спорта.
+            </p>
+            <p>
+              По вопросам сотрудничества и обратной связи: канал в Telegram{" "}
+              <a href="https://t.me/PingwinBets" target="_blank" rel="noopener noreferrer">
+                @PingwinBets
+              </a>
+              , почта{" "}
+              <a href="mailto:info@pingwin.pro">info@pingwin.pro</a>.
+            </p>
+          </div>
+          <p className="mt-10">
+            <Link href="/" className="text-cyan-400 hover:underline">
+              ← На главную
+            </Link>
+          </p>
+        </article>
+        <Footer />
+      </main>
+    </>
   );
 }

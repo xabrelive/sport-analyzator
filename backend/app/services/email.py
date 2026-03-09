@@ -1,17 +1,15 @@
-"""Сервис отправки почты: верификация и рассылка сигналов. Отдельный модуль от Telegram."""
+"""Send verification code by email."""
 import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from urllib.parse import urlencode
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
 
-def _send_via_smtp(to_email: str, subject: str, body_text: str) -> bool:
-    """Отправить письмо через SMTP. Возвращает True при успехе."""
+def _send_smtp(to_email: str, subject: str, body: str) -> bool:
     if not settings.smtp_host or not settings.smtp_from_email:
         return False
     try:
@@ -19,7 +17,7 @@ def _send_via_smtp(to_email: str, subject: str, body_text: str) -> bool:
         msg["Subject"] = subject
         msg["From"] = settings.smtp_from_email
         msg["To"] = to_email
-        msg.attach(MIMEText(body_text, "plain", "utf-8"))
+        msg.attach(MIMEText(body, "plain", "utf-8"))
         with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
             if settings.smtp_use_tls:
                 server.starttls()
@@ -32,29 +30,12 @@ def _send_via_smtp(to_email: str, subject: str, body_text: str) -> bool:
         return False
 
 
-def send_verification_email(email: str, verify_link: str) -> None:
-    """Send email with verification link. When no SMTP configured, only log."""
-    if _send_via_smtp(
-        email,
-        "Подтверждение email — PingWin",
-        f"Перейдите по ссылке для подтверждения: {verify_link}",
-    ):
-        logger.info("Verification email sent to %s", email)
-    else:
-        logger.info("Verification email (no SMTP): %s -> %s", email, verify_link)
-
-
-def send_signal_email(to_email: str, subject: str, body_text: str) -> bool:
-    """
-    Отправить письмо с сигналом/уведомлением.
-    Если SMTP не настроен — только логируем и возвращаем False.
-    Не отправляем на placeholder-адреса (tg_...@telegram.pingwin.local).
-    """
-    if to_email.startswith("tg_") and "@telegram.pingwin.local" in to_email:
-        logger.debug("Skip signal email for placeholder address")
-        return False
-    if _send_via_smtp(to_email, subject, body_text):
-        logger.info("Signal email sent to %s: %s", to_email, subject[:50])
+def send_verification_code_email(email: str, code: str) -> bool:
+    """Send code to email. Returns True if sent, False otherwise (e.g. no SMTP). Logs if not sent."""
+    subject = "Код подтверждения — PingWin"
+    body = f"Ваш код подтверждения: {code}\n\nКод действителен {settings.verification_code_expire_minutes} минут.\n\nЕсли вы не запрашивали код, проигнорируйте это письмо."
+    if _send_smtp(email, subject, body):
+        logger.info("Verification code email sent to %s", email)
         return True
-    logger.info("Signal email (no SMTP): to=%s subject=%s", to_email, subject)
+    logger.info("Verification code (no SMTP): %s -> code %s", email, code)
     return False

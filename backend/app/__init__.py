@@ -1,2 +1,1 @@
-"""Sport Analyzator — backend."""
-__version__ = "0.1.0"
+"""PingWin backend application."""

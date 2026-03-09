@@ -2,261 +2,45 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-sport}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sport}
-      POSTGRES_DB: ${POSTGRES_DB:-sport_analyzator}
+      POSTGRES_USER: ${POSTGRES_USER:-pingwin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pingwin}
+      POSTGRES_DB: ${POSTGRES_DB:-pingwin}
     ports:
       - "11002:11002"
     command: ["postgres", "-c", "port=11002"]
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pingwin_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -p 11002 -U ${POSTGRES_USER:-sport} -d ${POSTGRES_DB:-sport_analyzator}"]
+      test: ["CMD-SHELL", "pg_isready -p 11002 -U ${POSTGRES_USER:-pingwin} -d ${POSTGRES_DB:-pingwin}"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "11003:11003"
-    command: ["redis-server", "--port", "11003"]
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli -p 11003 ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  # Backend: для доступа по LAN задайте в .env CORS_EXTRA_ORIGINS=http://ВАШ_IP:11000,http://ВАШ_IP:3000
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      CORS_EXTRA_ORIGINS: ${CORS_EXTRA_ORIGINS:-}
-      BETSAPI_TOKEN: ${BETSAPI_TOKEN:-}
-      ENABLE_SCHEDULED_COLLECTORS: ${ENABLE_SCHEDULED_COLLECTORS:-true}
-      # Ссылки в TG и письмах: домен вместо IP (если в .env не задано — по умолчанию pingwin.pro)
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/${POSTGRES_DB:-pingwin}
     ports:
       - "11001:11001"
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-    command: ["sh", "-c", "uv run alembic upgrade head && exec uv run uvicorn app.main:app --host 0.0.0.0 --port 11001"]
-    volumes:
-      - ./backend:/app
-
-  celery_worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "worker", "-l", "info", "-Q", "collect,probability,signals", "-c", "4"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
-
-  celery_worker_2:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "worker", "-l", "info", "-Q", "collect,probability,signals", "-c", "4"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
-
-  celery_betsapi_worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "worker", "-l", "info", "-Q", "betsapi_collect", "-c", "1"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-      BETSAPI_TOKEN: ${BETSAPI_TOKEN:-}
-      ENABLE_SCHEDULED_COLLECTORS: ${ENABLE_SCHEDULED_COLLECTORS:-true}
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
-
-  celery_betsapi_worker_2:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "worker", "-l", "info", "-Q", "betsapi_collect", "-c", "1"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-      BETSAPI_TOKEN: ${BETSAPI_TOKEN:-}
-      ENABLE_SCHEDULED_COLLECTORS: ${ENABLE_SCHEDULED_COLLECTORS:-true}
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
-
-  celery_history:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "worker", "-l", "info", "-Q", "history", "-c", "4"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
-
-  celery_history_2:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "worker", "-l", "info", "-Q", "history", "-c", "4"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
-
-  celery_normalize:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "worker", "-l", "info", "-Q", "normalize", "-c", "8"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
-
-  celery_normalize_2:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "worker", "-l", "info", "-Q", "normalize", "-c", "8"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
-
-  celery_normalize_3:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "worker", "-l", "info", "-Q", "normalize", "-c", "8"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
-
-  celery_beat:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file: .env
-    command: ["uv", "run", "celery", "-A", "app.worker.celery_app", "beat", "-l", "info"]
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-sport}:${POSTGRES_PASSWORD:-sport}@postgres:11002/${POSTGRES_DB:-sport_analyzator}
-      REDIS_URL: redis://redis:11003/0
-      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
-      ENABLE_SCHEDULED_COLLECTORS: ${ENABLE_SCHEDULED_COLLECTORS:-true}
-    depends_on:
-      - celery_worker
-    volumes:
-      - ./backend:/app
-
-  telegram_bot:
-    build:
-      context: ./telegram_bot
-      dockerfile: Dockerfile
-    env_file: .env
-    environment:
-      BACKEND_URL: http://backend:11001
-    depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./telegram_bot:/app
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 11001"]
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    env_file: .env
-    environment:
-      NEXT_PUBLIC_API_URL: http://localhost:11001
-      NEXT_PUBLIC_WS_URL: ws://localhost:11001/ws
-      BACKEND_URL: http://backend:11001
-      PORT: 11000
-      NODE_ENV: production
     ports:
       - "11000:11000"
-    depends_on:
-      - backend
+    environment:
+      PORT: 11000
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: http://localhost:11001
+      BACKEND_URL: http://backend:11001
 
 volumes:
-  postgres_data:
-  redis_data:
+  pingwin_postgres_data:
