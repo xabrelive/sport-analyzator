@@ -1,6 +1,8 @@
 """FastAPI application."""
 import logging
+import sys
 import traceback
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +12,36 @@ from app.config import settings
 from app.api.v1.router import api_router
 from app.db.session import init_db
 
+# Путь к корню backend (для alembic.ini)
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+
+# Чтобы логи приложения (SMTP, отправка писем) были видны в docker logs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s [%(name)s] %(message)s",
+    stream=sys.stdout,
+)
 logger = logging.getLogger(__name__)
+
+
+def _run_migrations() -> None:
+    """Запуск Alembic миграций до старта приложения."""
+    try:
+        from alembic import command
+        from alembic.config import Config
+
+        alembic_ini = BACKEND_ROOT / "alembic.ini"
+        if not alembic_ini.is_file():
+            logger.warning("alembic.ini не найден, миграции пропущены")
+            return
+        config = Config(str(alembic_ini))
+        config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+        # URL берётся из app.config в env.py
+        command.upgrade(config, "head")
+        logger.info("Alembic: миграции применены (upgrade head)")
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Alembic: ошибка при применении миграций: %s", e)
+        raise
 
 
 def _cors_origins() -> list[str]:
@@ -35,7 +66,33 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup():
+    _run_migrations()
     await init_db()
+    if settings.smtp_host and settings.smtp_from_email:
+        logger.info(
+            "SMTP настроен: host=%s port=%s from=%s (SSL=%s)",
+            settings.smtp_host,
+            settings.smtp_port,
+            settings.smtp_from_email,
+            settings.smtp_use_ssl or settings.smtp_port == 465,
+        )
+    else:
+        logger.warning(
+            "SMTP не настроен (smtp_host=%s, smtp_from_email=%s). Письма с кодами не будут отправляться.",
+            settings.smtp_host or "(пусто)",
+            settings.smtp_from_email or "(пусто)",
+        )
+
+    # Запускаем фоновый опрос линии настольного тенниса (BetsAPI) с очередью и воркерами.
+    try:
+        from app.worker.table_tennis_line import start_pipeline
+
+        if (settings.betsapi_token or "").strip():
+            await start_pipeline()
+        else:
+            logger.info("BetsAPI: betsapi_token пуст — опрос линии не запускаем.")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось запустить фоновый опрос BetsAPI: %s", e)
 
 
 @app.exception_handler(Exception)

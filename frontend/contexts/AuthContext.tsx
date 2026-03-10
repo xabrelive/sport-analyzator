@@ -9,24 +9,28 @@ import {
 } from "react";
 import {
   login as apiLogin,
+  loginByTelegramCode as apiLoginByTelegramCode,
   register as apiRegister,
   verifyEmail as apiVerifyEmail,
   verifyTelegramCode as apiVerifyTelegramCode,
   loginWithTelegram as apiLoginWithTelegram,
   AUTH_TOKEN_STORAGE_KEY,
+  type RegisterResult,
   type TelegramAuthPayload,
 } from "@/lib/api";
+import { clearDashboardBannerDismissed } from "@/components/DashboardBanner";
 
 type AuthContextType = {
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (email: string, password: string) => Promise<void>;
+  loginByTelegramCode: (code: string) => Promise<void>;
   register: (
     email: string,
     password: string,
     acceptTerms: boolean,
     acceptPrivacy: boolean
-  ) => Promise<{ message: string; detail: string }>;
+  ) => Promise<RegisterResult>;
   verifyEmail: (email: string, code: string) => Promise<void>;
   verifyTelegramCode: (code: string, acceptTerms: boolean, acceptPrivacy: boolean) => Promise<void>;
   loginWithTelegram: (payload: TelegramAuthPayload) => Promise<void>;
@@ -51,6 +55,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const login = useCallback(async (email: string, password: string) => {
     const { access_token } = await apiLogin(email, password);
+    localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, access_token);
+    setToken(access_token);
+  }, []);
+
+  const loginByTelegramCode = useCallback(async (code: string) => {
+    const { access_token } = await apiLoginByTelegramCode(code);
     localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, access_token);
     setToken(access_token);
   }, []);
@@ -103,6 +113,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(() => {
     localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    clearDashboardBannerDismissed();
     setToken(null);
   }, []);
 
@@ -112,6 +123,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         isAuthenticated: !!token,
         isLoading,
         login,
+        loginByTelegramCode,
         register,
         verifyEmail,
         verifyTelegramCode,

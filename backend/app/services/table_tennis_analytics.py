@@ -1,0 +1,536 @@
+"""Pre‑match analytics for table tennis: recommendation to fill 'Прогноз' column.
+
+Логика максимально приближена к старому analytics_service:
+- считаем win_rate и статистику по 1/2 сету,
+- на их основе получаем вероятности победы в матче и сетах,
+- строим рекомендации и выбираем самую уверенную.
+
+Используются только данные из table_tennis_line_events (завершённые матчи).
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from dataclasses import dataclass
+from typing import Tuple
+
+from sqlalchemy import select, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.table_tennis_line_event import (
+    TableTennisLineEvent,
+    LINE_EVENT_STATUS_FINISHED,
+    LINE_EVENT_STATUS_CANCELLED,
+    LINE_EVENT_STATUS_SCHEDULED,
+    LINE_EVENT_STATUS_LIVE,
+    LINE_EVENT_STATUS_POSTPONED,
+)
+from app.models.table_tennis_forecast import TableTennisForecast
+
+
+# Пороги и требования — как в старом проекте, но чуть мягче по матчам.
+CONFIDENCE_THRESHOLD = 0.78           # для сетов (П1/П2 выиграет сет)
+CONFIDENCE_THRESHOLD_MATCH = 0.80     # для победы в матче (чуть мягче 0.82)
+MIN_MATCHES_FOR_RECOMMENDATION = 3    # минимум матчей у каждого для любых выводов
+MIN_MATCHES_FOR_MATCH_RECOMMENDATION = 5  # для матча — требуем побольше истории, но меньше 7
+MIN_CONFIDENCE_MARGIN = 0.07          # минимальный отрыв лучшего исхода
+
+
+@dataclass
+class PlayerStats:
+    total_matches: int
+    wins: int
+    losses: int
+    win_rate: float | None
+    matches_with_first_set: int
+    wins_first_set: int
+    win_first_set_pct: float | None
+    matches_with_second_set: int
+    wins_second_set: int
+    win_second_set_pct: float | None
+
+
+def _parse_sets_score(value: str | None) -> Tuple[int | None, int | None]:
+    if not value or "-" not in value:
+        return None, None
+    left, right = value.split("-", 1)
+    try:
+        return int(left), int(right)
+    except (TypeError, ValueError):
+        return None, None
+
+
+async def load_player_stats(
+    session: AsyncSession,
+    player_id: str,
+) -> PlayerStats | None:
+    """Строит PlayerStats по завершённым матчам игрока из table_tennis_line_events."""
+    stmt = select(TableTennisLineEvent).where(
+        and_(
+            TableTennisLineEvent.status == LINE_EVENT_STATUS_FINISHED,
+            (TableTennisLineEvent.home_id == player_id)
+            | (TableTennisLineEvent.away_id == player_id),
+        )
+    )
+    result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    if not rows:
+        return None
+
+    total = 0
+    wins = 0
+    losses = 0
+    matches_with_first = 0
+    wins_first = 0
+    matches_with_second = 0
+    wins_second = 0
+
+    for r in rows:
+        total += 1
+        # Победа в матче по сетовому счёту
+        hs, as_ = _parse_sets_score(r.live_sets_score)
+        if hs is not None and as_ is not None and (hs != as_):
+            is_home = r.home_id == player_id
+            home_win = hs > as_
+            if (is_home and home_win) or ((not is_home) and (not home_win)):
+                wins += 1
+            else:
+                losses += 1
+
+        # Статистика по 1 и 2 сету из live_score
+        if isinstance(r.live_score, dict):
+            # 1-й сет
+            s1 = r.live_score.get("1")
+            if isinstance(s1, dict):
+                try:
+                    h1 = int(str(s1.get("home") or "0"))
+                    a1 = int(str(s1.get("away") or "0"))
+                except ValueError:
+                    h1 = a1 = 0
+                if h1 or a1:
+                    matches_with_first += 1
+                    is_home = r.home_id == player_id
+                    home_win = h1 > a1
+                    if (is_home and home_win) or ((not is_home) and (not home_win)):
+                        wins_first += 1
+
+            # 2-й сет
+            s2 = r.live_score.get("2")
+            if isinstance(s2, dict):
+                try:
+                    h2 = int(str(s2.get("home") or "0"))
+                    a2 = int(str(s2.get("away") or "0"))
+                except ValueError:
+                    h2 = a2 = 0
+                if h2 or a2:
+                    matches_with_second += 1
+                    is_home = r.home_id == player_id
+                    home_win = h2 > a2
+                    if (is_home and home_win) or ((not is_home) and (not home_win)):
+                        wins_second += 1
+
+    if total == 0:
+        return None
+
+    win_rate = wins / total if total > 0 else None
+    win_first_set_pct = (
+        wins_first / matches_with_first if matches_with_first > 0 else None
+    )
+    win_second_set_pct = (
+        wins_second / matches_with_second if matches_with_second > 0 else None
+    )
+
+    return PlayerStats(
+        total_matches=total,
+        wins=wins,
+        losses=losses,
+        win_rate=win_rate,
+        matches_with_first_set=matches_with_first,
+        wins_first_set=wins_first,
+        win_first_set_pct=win_first_set_pct,
+        matches_with_second_set=matches_with_second,
+        wins_second_set=wins_second,
+        win_second_set_pct=win_second_set_pct,
+    )
+
+
+def _pre_match_probs(
+    stats_home: PlayerStats | None,
+    stats_away: PlayerStats | None,
+) -> tuple[float, float, float, float, float, float]:
+    """
+    Pre-match probabilities from historical stats.
+    Returns: p_home_win, p_away_win, p_home_set1, p_away_set1, p_home_set2, p_away_set2.
+    """
+    wh = stats_home.win_rate if stats_home and stats_home.win_rate is not None else 0.5
+    wa = stats_away.win_rate if stats_away and stats_away.win_rate is not None else 0.5
+    lah = stats_home.total_matches if stats_home else 0
+    laa = stats_away.total_matches if stats_away else 0
+    if lah + laa == 0:
+        p_home_win = p_away_win = 0.5
+    else:
+        rh = wh * (stats_home.total_matches or 1) if stats_home else 0.5
+        ra = wa * (stats_away.total_matches or 1) if stats_away else 0.5
+        total = rh + ra
+        p_home_win = rh / total if total > 0 else 0.5
+        p_away_win = 1.0 - p_home_win
+
+    s1h = stats_home.win_first_set_pct if stats_home and stats_home.win_first_set_pct is not None else 0.5
+    s1a = stats_away.win_first_set_pct if stats_away and stats_away.win_first_set_pct is not None else 0.5
+    n1h = stats_home.matches_with_first_set if stats_home else 0
+    n1a = stats_away.matches_with_first_set if stats_away else 0
+    if n1h + n1a == 0:
+        p_home_set1 = p_away_set1 = 0.5
+    else:
+        total_s1 = s1h * n1h + (1 - s1a) * n1a
+        denom = n1h + n1a
+        p_home_set1 = total_s1 / denom if denom > 0 else 0.5
+        p_away_set1 = 1.0 - p_home_set1
+
+    s2h = stats_home.win_second_set_pct if stats_home and stats_home.win_second_set_pct is not None else 0.5
+    s2a = stats_away.win_second_set_pct if stats_away and stats_away.win_second_set_pct is not None else 0.5
+    n2h = stats_home.matches_with_second_set if stats_home else 0
+    n2a = stats_away.matches_with_second_set if stats_away else 0
+    if n2h + n2a == 0:
+        p_home_set2 = p_away_set2 = 0.5
+    else:
+        total_s2 = s2h * n2h + (1 - s2a) * n2a
+        denom = n2h + n2a
+        p_home_set2 = total_s2 / denom if denom > 0 else 0.5
+        p_away_set2 = 1.0 - p_home_set2
+
+    return p_home_win, p_away_win, p_home_set1, p_away_set1, p_home_set2, p_away_set2
+
+
+@dataclass
+class MatchRecommendation:
+    text: str
+    confidence_pct: float  # 0–100
+
+
+def _build_match_recommendations(
+    p_home_win: float,
+    p_away_win: float,
+    p_home_set1: float,
+    p_away_set1: float,
+    p_home_set2: float,
+    p_away_set2: float,
+    threshold: float = CONFIDENCE_THRESHOLD,
+    threshold_match: float = CONFIDENCE_THRESHOLD_MATCH,
+) -> list[MatchRecommendation]:
+    """Рекомендации только при уверенности >= threshold."""
+    recs: list[MatchRecommendation] = []
+
+    # Победа в матче
+    if p_home_win >= threshold_match and (p_home_win - p_away_win) >= MIN_CONFIDENCE_MARGIN:
+        recs.append(
+            MatchRecommendation(
+                f"П1 победа в матче ({p_home_win * 100:.0f}%)",
+                p_home_win * 100,
+            )
+        )
+    if p_away_win >= threshold_match and (p_away_win - p_home_win) >= MIN_CONFIDENCE_MARGIN:
+        recs.append(
+            MatchRecommendation(
+                f"П2 победа в матче ({p_away_win * 100:.0f}%)",
+                p_away_win * 100,
+            )
+        )
+
+    # 1-й сет
+    if p_home_set1 >= threshold and (p_home_set1 - p_away_set1) >= MIN_CONFIDENCE_MARGIN:
+        recs.append(
+            MatchRecommendation(
+                f"П1 выиграет 1-й сет ({p_home_set1 * 100:.0f}%)",
+                p_home_set1 * 100,
+            )
+        )
+    if p_away_set1 >= threshold and (p_away_set1 - p_home_set1) >= MIN_CONFIDENCE_MARGIN:
+        recs.append(
+            MatchRecommendation(
+                f"П2 выиграет 1-й сет ({p_away_set1 * 100:.0f}%)",
+                p_away_set1 * 100,
+            )
+        )
+
+    # 2-й сет
+    if p_home_set2 >= threshold and (p_home_set2 - p_away_set2) >= MIN_CONFIDENCE_MARGIN:
+        recs.append(
+            MatchRecommendation(
+                f"П1 выиграет 2-й сет ({p_home_set2 * 100:.0f}%)",
+                p_home_set2 * 100,
+            )
+        )
+    if p_away_set2 >= threshold and (p_away_set2 - p_home_set2) >= MIN_CONFIDENCE_MARGIN:
+        recs.append(
+            MatchRecommendation(
+                f"П2 выиграет 2-й сет ({p_away_set2 * 100:.0f}%)",
+                p_away_set2 * 100,
+            )
+        )
+
+    return recs
+
+
+def _is_match_win_rec(text: str) -> bool:
+    return "победа в матче" in text
+
+
+def _first_recommendation_text_and_confidence(
+    stats_home: PlayerStats | None,
+    stats_away: PlayerStats | None,
+    min_matches: int = MIN_MATCHES_FOR_RECOMMENDATION,
+    threshold: float | None = None,
+    threshold_match: float | None = None,
+    min_matches_for_match: int | None = None,
+) -> tuple[str | None, float]:
+    """
+    Выбирает приоритетную рекомендацию по матчу только при высокой уверенности.
+    Возвращает (текст, confidence_pct) или (None, 0.0).
+    """
+    n_home = (stats_home.total_matches if stats_home else 0)
+    n_away = (stats_away.total_matches if stats_away else 0)
+    if n_home < min_matches or n_away < min_matches:
+        return None, 0.0
+
+    p_home_win, p_away_win, p_home_set1, p_away_set1, p_home_set2, p_away_set2 = _pre_match_probs(
+        stats_home, stats_away
+    )
+    thr = threshold if threshold is not None else CONFIDENCE_THRESHOLD
+    thr_m = threshold_match if threshold_match is not None else CONFIDENCE_THRESHOLD_MATCH
+    recs = _build_match_recommendations(
+        p_home_win,
+        p_away_win,
+        p_home_set1,
+        p_away_set1,
+        p_home_set2,
+        p_away_set2,
+        threshold=thr,
+        threshold_match=thr_m,
+    )
+    if not recs:
+        return None, 0.0
+
+    # Рекомендацию на победу в матче учитываем только при достаточной истории.
+    min_match_rec = (
+        min_matches_for_match
+        if min_matches_for_match is not None
+        else MIN_MATCHES_FOR_MATCH_RECOMMENDATION
+    )
+    if n_home < min_match_rec or n_away < min_match_rec:
+        recs = [r for r in recs if not _is_match_win_rec(r.text)]
+    if not recs:
+        return None, 0.0
+
+    # Выбираем между рекомендацией на матч и на сет:
+    # - если уверенность по матчу существенно выше (>=5 п.п.) — берём матч,
+    # - иначе даём рекомендацию по сету (чтобы чаще видеть прогнозы на конкретный сет).
+    match_recs = [r for r in recs if _is_match_win_rec(r.text)]
+    set_recs = [r for r in recs if not _is_match_win_rec(r.text)]
+
+    if not match_recs and not set_recs:
+        return None, 0.0
+    if not match_recs:
+        best_set = max(set_recs, key=lambda r: r.confidence_pct)
+        return best_set.text, best_set.confidence_pct
+    if not set_recs:
+        best_match = max(match_recs, key=lambda r: r.confidence_pct)
+        return best_match.text, best_match.confidence_pct
+
+    best_match = max(match_recs, key=lambda r: r.confidence_pct)
+    best_set = max(set_recs, key=lambda r: r.confidence_pct)
+
+    if best_match.confidence_pct - best_set.confidence_pct >= 5.0:
+        return best_match.text, best_match.confidence_pct
+    return best_set.text, best_set.confidence_pct
+
+
+async def compute_forecast_for_event(
+    session: AsyncSession,
+    event: TableTennisLineEvent,
+) -> Tuple[str | None, float]:
+    """Возвращает (текст прогноза, confidence_pct) или (None, 0.0), если данных недостаточно."""
+    home_id = event.home_id
+    away_id = event.away_id
+    if not home_id or not away_id:
+        return None, 0.0
+
+    stats_home = await load_player_stats(session, home_id)
+    stats_away = await load_player_stats(session, away_id)
+    if not stats_home or not stats_away:
+        return None, 0.0
+
+    text, conf = _first_recommendation_text_and_confidence(
+        stats_home,
+        stats_away,
+        min_matches=MIN_MATCHES_FOR_RECOMMENDATION,
+        threshold=CONFIDENCE_THRESHOLD,
+        threshold_match=CONFIDENCE_THRESHOLD_MATCH,
+        min_matches_for_match=MIN_MATCHES_FOR_MATCH_RECOMMENDATION,
+    )
+    if not text:
+        return None, 0.0
+    return text, conf
+
+
+def build_strengths_weaknesses(
+    stats: PlayerStats | None,
+) -> tuple[list[str], list[str]]:
+    """Формирует человекочитаемые сильные и слабые стороны игрока по статистике."""
+    strengths: list[str] = []
+    weaknesses: list[str] = []
+    if not stats:
+        return strengths, weaknesses
+
+    if stats.win_rate is not None:
+        if stats.win_rate >= 0.65 and stats.total_matches >= 10:
+            strengths.append(f"Высокий % побед в матчах ({stats.win_rate * 100:.0f}%)")
+        elif stats.win_rate <= 0.35 and stats.total_matches >= 10:
+            weaknesses.append(f"Низкий % побед в матчах ({stats.win_rate * 100:.0f}%)")
+
+    if stats.win_first_set_pct is not None and stats.matches_with_first_set >= 8:
+        if stats.win_first_set_pct >= 0.6:
+            strengths.append(
+                f"Часто выигрывает 1-й сет ({stats.win_first_set_pct * 100:.0f}%)"
+            )
+        elif stats.win_first_set_pct <= 0.4:
+            weaknesses.append(
+                f"Редко выигрывает 1-й сет ({stats.win_first_set_pct * 100:.0f}%)"
+            )
+
+    if stats.win_second_set_pct is not None and stats.matches_with_second_set >= 8:
+        if stats.win_second_set_pct >= 0.6:
+            strengths.append(
+                f"Сильный во 2-м сете ({stats.win_second_set_pct * 100:.0f}%)"
+            )
+        elif stats.win_second_set_pct <= 0.4:
+            weaknesses.append(
+                f"Слабый во 2-м сете ({stats.win_second_set_pct * 100:.0f}%)"
+            )
+
+    return strengths, weaknesses
+
+
+def _evaluate_forecast_outcome(
+    event: TableTennisLineEvent,
+    forecast_text: str,
+) -> str:
+    """Определяет исход прогноза (hit/miss/no_result) по финальным данным матча."""
+    # Нужен финальный счёт и, для сетовых прогнозов, детализация по сетам.
+    sets_score = event.live_sets_score or ""
+    scores = event.live_score or {}
+
+    # Помощники для победителя матча и сетов
+    def _winner_by_sets() -> str | None:
+        h, a = _parse_sets_score(sets_score)
+        if h is None or a is None or h == a:
+            return None
+        return "home" if h > a else "away"
+
+    def _winner_in_set(set_no: str) -> str | None:
+        s = scores.get(set_no)
+        if not isinstance(s, dict):
+            return None
+        try:
+            h = int(str(s.get("home") or "0"))
+            a = int(str(s.get("away") or "0"))
+        except ValueError:
+            return None
+        if h == a:
+            return None
+        return "home" if h > a else "away"
+
+    text = forecast_text.lower()
+
+    # Прогноз на победу в матче
+    if "победа в матче" in text:
+        winner = _winner_by_sets()
+        if winner is None:
+            return "no_result"
+        expected = "home" if "п1" in text else "away"
+        return "hit" if winner == expected else "miss"
+
+    # Прогноз на 1-й сет
+    if "1-й сет" in text:
+        winner = _winner_in_set("1")
+        if winner is None:
+            return "no_result"
+        expected = "home" if "п1" in text else "away"
+        return "hit" if winner == expected else "miss"
+
+    # Прогноз на 2-й сет
+    if "2-й сет" in text:
+        winner = _winner_in_set("2")
+        if winner is None:
+            return "no_result"
+        expected = "home" if "п1" in text else "away"
+        return "hit" if winner == expected else "miss"
+
+    return "no_result"
+
+
+async def update_forecast_outcome_for_event(
+    session: AsyncSession,
+    event: TableTennisLineEvent,
+) -> None:
+    """Обновляет статус прогноза в таблице table_tennis_forecasts для данного события."""
+    if not event.id:
+        return
+    result = await session.execute(
+        select(TableTennisForecast).where(
+            TableTennisForecast.event_id == event.id,
+            TableTennisForecast.status.in_(["pending", "cancelled", "no_result"]),
+        )
+    )
+    rows = list(result.scalars().all())
+    if not rows:
+        return
+
+    now = datetime.now(timezone.utc)
+
+    # Если матч "ожил" (scheduled/live/postponed) после ошибочного cancelled/no_result,
+    # возвращаем прогноз в pending.
+    if event.status in {
+        LINE_EVENT_STATUS_SCHEDULED,
+        LINE_EVENT_STATUS_LIVE,
+        LINE_EVENT_STATUS_POSTPONED,
+    }:
+        for row in rows:
+            if row.status in {"cancelled", "no_result"}:
+                row.status = "pending"
+                row.resolved_at = None
+                row.final_status = None
+                row.final_sets_score = None
+
+    if event.status == LINE_EVENT_STATUS_CANCELLED:
+        for row in rows:
+            row.status = "cancelled"
+            row.resolved_at = now
+            row.final_status = event.status
+            row.final_sets_score = event.live_sets_score
+        return
+
+    # В реальных данных BetsAPI статус иногда запаздывает, но по live_sets_score уже есть победитель.
+    # Тогда считаем матч завершённым для расчёта исхода прогноза.
+    effective_status = event.status
+    if event.status != LINE_EVENT_STATUS_FINISHED:
+        h, a = _parse_sets_score(event.live_sets_score)
+        if h is None or a is None or h == a:
+            return
+        effective_status = LINE_EVENT_STATUS_FINISHED
+
+    if not event.forecast:
+        for row in rows:
+            row.status = "no_result"
+            row.resolved_at = now
+            row.final_status = effective_status
+            row.final_sets_score = event.live_sets_score
+        return
+
+    outcome = _evaluate_forecast_outcome(event, event.forecast)
+    for row in rows:
+        row.status = outcome
+        row.resolved_at = now
+        row.final_status = effective_status
+        row.final_sets_score = event.live_sets_score
+
+

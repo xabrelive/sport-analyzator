@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/contexts/AuthContext";
 import { DashboardSidebar } from "@/components/DashboardSidebar";
+import { DashboardBanner } from "@/components/DashboardBanner";
 import { useEffect } from "react";
 
 export default function DashboardLayout({
@@ -45,7 +46,8 @@ export default function DashboardLayout({
   return (
     <div className="min-h-screen bg-[var(--bg)] flex">
       <DashboardSidebar />
-      <main className="flex-1 pl-56 min-h-screen">
+      <main className="flex-1 pl-56 min-h-screen flex flex-col">
+        <DashboardBanner />
         {children}
       </main>
     </div>

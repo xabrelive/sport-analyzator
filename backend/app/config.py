@@ -18,9 +18,10 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24 * 7  # 7 days
 
-    # Verification codes (email + Telegram)
-    verification_code_expire_minutes: int = 15
+    # Verification codes
     verification_code_length: int = 6
+    verification_code_expire_minutes_telegram: int = 10  # код из бота (регистрация, привязка)
+    verification_code_expire_minutes_email: int = 120  # 2 часа — код из письма
 
     # Frontend
     frontend_url: str = "http://localhost:11000"
@@ -33,13 +34,37 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
     debug: bool = False
 
-    # SMTP (sending codes to email)
+    # BetsAPI (спорт: настольный теннис)
+    betsapi_token: str = ""
+    betsapi_table_tennis_sport_id: int = 92  # стандартный sport_id для настольного тенниса в BetsAPI
+    betsapi_table_tennis_line_interval_sec: int = 300  # опрос линии (список матчей), секунды
+    betsapi_table_tennis_odds_interval_sec: int = 300   # опрос коэффициентов по матчам без кф, секунды
+    betsapi_table_tennis_live_interval_sec: int = 8     # базовый опрос лайв-событий (inplay), секунды
+    betsapi_table_tennis_live_interval_forecast_sec: int = 4  # матчи с прогнозом: обновление счёта чаще
+    betsapi_table_tennis_live_interval_other_sec: int = 12  # матчи без прогноза: обновление счёта реже
+    betsapi_table_tennis_result_check_interval_sec: int = 1800  # период фоновой проверки результатов (1ч/3ч), секунды
+    betsapi_table_tennis_archive_sync_interval_sec: int = 300  # синхронизация результатов из архива (today/yesterday)
+    betsapi_table_tennis_cancel_forecast_recheck_interval_sec: int = 120  # перепроверка cancelled матчей с прогнозом
+    betsapi_table_tennis_max_pages: int = 20
+    betsapi_table_tennis_cancel_missing_horizon_minutes: int = 90  # помечаем cancelled только для ближних матчей
+    # Задержка перед расчётом прематч‑прогноза (минуты) после появления матча в линии
+    betsapi_table_tennis_forecast_delay_minutes: int = 5
+    # Минимальный коэффициент на исход прогноза (для выбранной стороны), ниже — прогноз не даём
+    betsapi_table_tennis_min_odds_for_forecast: float = 1.4
+
+    # Очередь и воркеры линии (масштабирование при росте объёма данных)
+    line_queue_maxsize: int = 32  # макс. батчей в очереди (при переполнении продюсер ждёт)
+    line_worker_count: int = 3    # число воркеров, обрабатывающих очередь (увеличить при росте нагрузки)
+    line_sse_interval_sec: int = 5  # интервал отправки данных линии по SSE (обновление на лету)
+
+    # SMTP (отправка кодов на почту)
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from_email: str = ""
     smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False  # True для порта 465 (Mail.ru и др.)
 
     # Telegram Bot
     telegram_bot_token: str = ""

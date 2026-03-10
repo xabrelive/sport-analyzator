@@ -93,6 +93,14 @@ export default function RegisterPage() {
     setLoading(true);
     try {
       const result = await register(email, password, agreeTerms, agreePrivacy);
+      if (!result.ok) {
+        if (result.email_verified) {
+          router.push(`/forgot-password?email=${encodeURIComponent(email)}`);
+          return;
+        }
+        router.push(`/verify-email?email=${encodeURIComponent(email)}`);
+        return;
+      }
       setSuccessMessage(
         result.detail || "На почту отправлен код. Введите его на следующей странице."
       );

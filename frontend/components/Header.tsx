@@ -25,6 +25,12 @@ export function Header() {
         </Link>
         <nav className="hidden items-center gap-6 sm:flex">
           <Link
+            href="/"
+            className="text-sm text-slate-400 transition hover:text-white"
+          >
+            Главная
+          </Link>
+          <Link
             href="/about"
             className="text-sm text-slate-400 transition hover:text-white"
           >

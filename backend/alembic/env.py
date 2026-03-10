@@ -6,7 +6,7 @@ from sqlalchemy import engine_from_config, pool
 
 from app.config import settings
 from app.db.base import Base
-from app.models import User, VerificationCode  # noqa: F401 — register models
+from app.models import User, VerificationCode, TableTennisLineEvent, TableTennisPlayer, TableTennisLeague, TableTennisLeagueRule  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

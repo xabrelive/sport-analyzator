@@ -11,14 +11,19 @@ import type { TelegramAuthPayload } from "@/lib/api";
 const TELEGRAM_BOT_USERNAME =
   process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME || "";
 
+const TELEGRAM_BOT_LINK =
+  process.env.NEXT_PUBLIC_TELEGRAM_BOT_LINK || "https://t.me/";
+
 function LoginContent() {
-  const { login, loginWithTelegram, saveToken } = useAuth();
+  const { login, loginWithTelegram, loginByTelegramCode, saveToken } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [telegramCode, setTelegramCode] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [telegramCodeLoading, setTelegramCodeLoading] = useState(false);
   const telegramRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -77,10 +82,29 @@ function LoginContent() {
     try {
       await login(email, password);
       router.push("/dashboard");
-    } catch (err) {
+    } catch (err: unknown) {
+      const e = err as Error & { code?: string; email?: string };
+      if (e?.code === "email_not_verified" && e?.email) {
+        router.push(`/verify-email?email=${encodeURIComponent(e.email)}`);
+        return;
+      }
       setError(err instanceof Error ? err.message : "Ошибка входа");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleTelegramCodeSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError("");
+    setTelegramCodeLoading(true);
+    try {
+      await loginByTelegramCode(telegramCode.trim());
+      router.push("/dashboard");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Ошибка входа по коду");
+    } finally {
+      setTelegramCodeLoading(false);
     }
   }
 
@@ -105,7 +129,15 @@ function LoginContent() {
               />
             </div>
             <div>
-              <label className="block text-slate-400 text-sm mb-1">Пароль</label>
+              <div className="flex justify-between items-center mb-1">
+                <label className="block text-slate-400 text-sm">Пароль</label>
+                <Link
+                  href="/forgot-password"
+                  className="text-cyan-400 text-sm hover:underline"
+                >
+                  Забыли пароль?
+                </Link>
+              </div>
               <input
                 type="password"
                 value={password}
@@ -114,6 +146,9 @@ function LoginContent() {
                 className="w-full rounded-lg border border-slate-600 bg-slate-800/80 px-4 py-2.5 text-white placeholder-slate-500 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
               />
             </div>
+            {searchParams.get("message") === "password_reset" && (
+              <p className="text-emerald-400 text-sm">Пароль изменён. Войдите с новым паролем.</p>
+            )}
             {error && <p className="text-rose-400 text-sm">{error}</p>}
             <button
               type="submit"
@@ -124,15 +159,53 @@ function LoginContent() {
             </button>
           </form>
 
+          <div className="my-6 flex items-center gap-3">
+            <span className="flex-1 h-px bg-slate-600" />
+            <span className="text-slate-500 text-xs">или</span>
+            <span className="flex-1 h-px bg-slate-600" />
+          </div>
+
+          <p className="text-slate-400 text-sm mb-2">Войти по коду из Telegram-бота</p>
+          <p className="text-slate-500 text-xs mb-3">
+            Получите код в боте и введите его ниже (код действует 10 мин).
+          </p>
+          <form onSubmit={handleTelegramCodeSubmit} className="space-y-2 mb-4">
+            <div className="flex gap-2">
+              <input
+                type="text"
+                inputMode="numeric"
+                value={telegramCode}
+                onChange={(e) => setTelegramCode(e.target.value.replace(/\D/g, "").slice(0, 10))}
+                placeholder="Код из бота"
+                className="flex-1 rounded-lg border border-slate-600 bg-slate-800/80 px-4 py-2.5 text-white placeholder-slate-500 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+              />
+              <button
+                type="submit"
+                disabled={telegramCodeLoading || !telegramCode.trim()}
+                className="rounded-lg bg-cyan-600 px-4 py-2.5 font-medium text-white hover:bg-cyan-500 disabled:opacity-50"
+              >
+                {telegramCodeLoading ? "Вход…" : "Войти"}
+              </button>
+            </div>
+            <a
+              href={TELEGRAM_BOT_LINK}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 text-cyan-400 text-sm hover:underline"
+            >
+              Открыть бота в Telegram
+            </a>
+          </form>
+
           {TELEGRAM_BOT_USERNAME && (
             <>
-              <div className="my-6 flex items-center gap-3">
+              <div className="my-4 flex items-center gap-3">
                 <span className="flex-1 h-px bg-slate-600" />
-                <span className="text-slate-500 text-xs">или</span>
+                <span className="text-slate-500 text-xs">или виджет</span>
                 <span className="flex-1 h-px bg-slate-600" />
               </div>
               <div className="flex flex-col items-center gap-2">
-                <p className="text-slate-400 text-sm">Войти через Telegram</p>
+                <p className="text-slate-400 text-sm">Войти через Telegram (виджет)</p>
                 <div ref={telegramRef} />
               </div>
             </>

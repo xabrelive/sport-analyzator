@@ -1,0 +1,6 @@
+# Запуск: из папки telegram_bot
+#   pip install -r requirements.txt
+#   python main.py
+python-telegram-bot>=21.0
+httpx>=0.27.0
+python-dotenv>=1.0.0

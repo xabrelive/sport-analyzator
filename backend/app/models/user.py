@@ -1,8 +1,8 @@
 """User model."""
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, String
+from sqlalchemy import BigInteger, Boolean, DateTime, String, Time
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,6 +30,11 @@ class User(Base):
     email_verified: Mapped[bool] = mapped_column(default=False, nullable=False)
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True, index=True)
     telegram_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Для получения уведомлений (привязка почты к аккаунту, зарегистрированному через Telegram)
+    notification_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Режим тишины: не слать уведомления в этот интервал (локальное время пользователя)
+    quiet_hours_start: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    quiet_hours_end: Mapped[time | None] = mapped_column(Time(), nullable=True)
     is_blocked: Mapped[bool] = mapped_column(Boolean(), default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean(), default=True, nullable=False)
     is_superadmin: Mapped[bool] = mapped_column(Boolean(), default=False, nullable=False)
@@ -44,3 +49,7 @@ class User(Base):
     @staticmethod
     def email_placeholder(telegram_id: int) -> str:
         return _email_placeholder(telegram_id)
+
+    def is_telegram_only(self) -> bool:
+        """Аккаунт зарегистрирован через Telegram (email — плейсхолдер)."""
+        return self.email.startswith("tg_") and "telegram.pingwin.local" in self.email

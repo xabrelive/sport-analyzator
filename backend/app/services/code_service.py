@@ -14,6 +14,21 @@ from app.models.verification_code import VerificationCode
 TYPE_EMAIL_VERIFY = "email_verify"
 TYPE_TELEGRAM_REGISTER = "telegram_register"
 TYPE_TELEGRAM_LINK = "telegram_link"
+TYPE_PASSWORD_RESET = "password_reset"
+TYPE_EMAIL_LINK = "email_link"
+
+
+def _expire_minutes(code_type: str) -> int:
+    """Срок действия кода в минутах: Telegram — 10 мин, почта — 2 часа."""
+    if code_type in (TYPE_TELEGRAM_REGISTER, TYPE_TELEGRAM_LINK):
+        return settings.verification_code_expire_minutes_telegram
+    if code_type in (TYPE_EMAIL_VERIFY, TYPE_PASSWORD_RESET, TYPE_EMAIL_LINK):
+        return settings.verification_code_expire_minutes_email
+    return settings.verification_code_expire_minutes_telegram  # fallback
+
+
+def _expires_at(code_type: str) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(minutes=_expire_minutes(code_type))
 
 
 def _generate_code() -> str:
@@ -23,10 +38,6 @@ def _generate_code() -> str:
 
 def _hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
-
-
-def _expires_at() -> datetime:
-    return datetime.now(timezone.utc) + timedelta(minutes=settings.verification_code_expire_minutes)
 
 
 async def create_code(
@@ -42,7 +53,7 @@ async def create_code(
         type=code_type,
         contact=contact,
         code_hash=code_hash,
-        expires_at=_expires_at(),
+        expires_at=_expires_at(code_type),
         user_id=user_id,
     )
     session.add(row)

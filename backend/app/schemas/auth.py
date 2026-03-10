@@ -24,6 +24,20 @@ class VerifyEmailBody(BaseModel):
     code: str = Field(..., min_length=4, max_length=10)
 
 
+class ResendVerificationCodeBody(BaseModel):
+    email: EmailStr
+
+
+class RequestPasswordResetBody(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordBody(BaseModel):
+    email: EmailStr
+    code: str = Field(..., min_length=4, max_length=10)
+    new_password: str = Field(..., min_length=6)
+
+
 # Telegram Login Widget (frontend sends this after user clicks "Login with Telegram")
 class TelegramAuthPayload(BaseModel):
     id: int
@@ -40,6 +54,11 @@ class VerifyTelegramCodeBody(BaseModel):
     code: str = Field(..., min_length=4, max_length=10)
     accept_terms: bool = False
     accept_privacy: bool = False
+
+
+# Login by code from Telegram bot (existing user)
+class LoginByTelegramCodeBody(BaseModel):
+    code: str = Field(..., min_length=4, max_length=10)
 
 
 # Bot calls API to create code; backend returns code to send to user
@@ -59,3 +78,12 @@ class LinkTelegramByCodeBody(BaseModel):
 
 # Request new code for linking (logged-in user); backend creates code and returns it for user to type in bot
 # No body needed — user from JWT
+
+
+class RequestLinkEmailBody(BaseModel):
+    email: EmailStr
+
+
+class VerifyLinkEmailBody(BaseModel):
+    email: EmailStr
+    code: str = Field(..., min_length=4, max_length=10)
