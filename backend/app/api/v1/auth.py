@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.session import get_async_session
+from app.models.app_setting import AppSetting
 from app.models.user import User
 from app.schemas.auth import (
     CreateTelegramCodeBody,
@@ -317,6 +318,21 @@ async def telegram_create_code(
         raise HTTPException(status_code=400, detail="Use telegram_register for new users")
     code = await create_code(session, TYPE_TELEGRAM_REGISTER, contact)
     return {"code": code, "expires_minutes": settings.verification_code_expire_minutes_telegram}
+
+
+BOT_INFO_KEY = "telegram_bot_info_message"
+
+
+@router.get("/telegram/bot-info")
+async def get_telegram_bot_info(
+    _: bool = Depends(_require_bot_token),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Bot fetches the message for «Получить информацию» button."""
+    row = (
+        await session.execute(select(AppSetting).where(AppSetting.key == BOT_INFO_KEY))
+    ).scalar_one_or_none()
+    return {"message": (row.value if row else "") or ""}
 
 
 @router.post("/telegram/verify-code", response_model=TokenResponse)

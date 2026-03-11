@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { getTableTennisResults, type TableTennisResultsResponse } from "@/lib/api";
 
@@ -20,6 +20,16 @@ function formatDateTime(ts: number | undefined): string {
   }
 }
 
+function cleanForecastText(value: string | null | undefined): string {
+  const text = (value || "").trim();
+  if (!text) return "Недостаточно данных для расчёта";
+  return text
+    .replace(/\s*\(\d+(?:[.,]\d+)?%\)/g, "")
+    .replace(/%/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 export default function TableTennisResultsPage() {
   const [data, setData] = useState<TableTennisResultsResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -36,6 +46,7 @@ export default function TableTennisResultsPage() {
   const [appliedDateFrom, setAppliedDateFrom] = useState("");
   const [appliedDateTo, setAppliedDateTo] = useState("");
   const [onlyWithForecast, setOnlyWithForecast] = useState(false);
+  const [sortByTime, setSortByTime] = useState<"asc" | "desc">("desc");
   const pageSize = 30;
 
   useEffect(() => {
@@ -67,13 +78,18 @@ export default function TableTennisResultsPage() {
   const total = data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
-  const displayItems = (data?.items ?? []).filter((ev) => {
-    const hasOdds = ev.odds_1 != null && ev.odds_2 != null;
-    if (onlyWithForecast) {
-      return hasOdds;
-    }
-    return true;
-  });
+  const displayItems = useMemo(() => {
+    const raw = (data?.items ?? []).filter((ev) => {
+      const hasOdds = ev.odds_1 != null && ev.odds_2 != null;
+      if (onlyWithForecast) return hasOdds;
+      return true;
+    });
+    return [...raw].sort((a, b) => {
+      const ta = a.time ?? 0;
+      const tb = b.time ?? 0;
+      return sortByTime === "desc" ? tb - ta : ta - tb;
+    });
+  }, [data?.items, onlyWithForecast, sortByTime]);
 
   return (
     <div className="p-6 md:p-8">
@@ -235,20 +251,33 @@ export default function TableTennisResultsPage() {
           >
             Сбросить фильтры
           </button>
-          <label className="flex items-center gap-2 text-slate-300 text-sm ml-auto">
-            <input
-              type="checkbox"
-              checked={onlyWithForecast}
-              onChange={(e) => {
-                setOnlyWithForecast(e.target.checked);
-                setPage(1);
-              }}
-              className="rounded border-slate-500 text-emerald-500 focus:ring-slate-500"
-            />
-            <span>Только с прогнозом</span>
-          </label>
+          {!data?.forecast_locked && (
+            <label className="flex items-center gap-2 text-slate-300 text-sm ml-auto">
+              <input
+                type="checkbox"
+                checked={onlyWithForecast}
+                onChange={(e) => {
+                  setOnlyWithForecast(e.target.checked);
+                  setPage(1);
+                }}
+                className="rounded border-slate-500 text-emerald-500 focus:ring-slate-500"
+              />
+              <span>Только с прогнозом</span>
+            </label>
+          )}
         </div>
       </div>
+
+      {data?.forecast_locked && data?.forecast_purchase_url && (
+        <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3">
+          <Link
+            href={data.forecast_purchase_url}
+            className="text-amber-200 hover:text-amber-100 font-medium"
+          >
+            {data.forecast_locked_message ?? "Для просмотра прогнозов приобретите подписку на аналитику"}
+          </Link>
+        </div>
+      )}
 
       {loading ? <p className="text-slate-400">Загрузка…</p> : null}
       {error ? <p className="text-rose-400 mb-3">{error}</p> : null}
@@ -263,14 +292,20 @@ export default function TableTennisResultsPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-slate-700 bg-slate-700/50 text-slate-300 text-left">
-                      <th className="px-4 py-3 font-medium">Дата и время</th>
+                      <th
+                        className="px-4 py-3 font-medium cursor-pointer hover:text-white select-none"
+                        onClick={() => setSortByTime((d) => (d === "desc" ? "asc" : "desc"))}
+                        title="Сортировка по дате и времени начала матча"
+                      >
+                        Дата и время {sortByTime === "desc" ? "↓" : "↑"}
+                      </th>
                       <th className="px-4 py-3 font-medium">Лига</th>
                       <th className="px-4 py-3 font-medium">Игрок 1</th>
                       <th className="px-4 py-3 font-medium text-center tabular-nums">Кф П1</th>
                       <th className="px-4 py-3 font-medium text-center">Счёт</th>
                       <th className="px-4 py-3 font-medium text-center tabular-nums">Кф П2</th>
                       <th className="px-4 py-3 font-medium">Игрок 2</th>
-                      <th className="px-4 py-3 font-medium">Прогноз</th>
+                      {!data?.forecast_locked && <th className="px-4 py-3 font-medium">Прогноз</th>}
                     </tr>
                   </thead>
                   <tbody>
@@ -326,20 +361,20 @@ export default function TableTennisResultsPage() {
                               {ev.away_name}
                             </Link>
                           </td>
-                          <td className="px-4 py-3 text-xs text-slate-400">
-                            {ev.odds_1 != null && ev.odds_2 != null ? (
-                              <Link
-                                href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
-                                className="text-emerald-300 hover:text-emerald-200"
-                              >
-                                {ev.forecast && String(ev.forecast).trim() !== ""
-                                  ? ev.forecast
-                                  : "Недостаточно данных для расчёта"}
-                              </Link>
-                            ) : (
-                              "—"
-                            )}
-                          </td>
+                          {!data?.forecast_locked && (
+                            <td className="px-4 py-3 text-xs text-slate-400">
+                              {ev.odds_1 != null && ev.odds_2 != null ? (
+                                <Link
+                                  href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
+                                  className="text-emerald-300 hover:text-emerald-200"
+                                >
+                                  {cleanForecastText(ev.forecast)}
+                                </Link>
+                              ) : (
+                                "—"
+                              )}
+                            </td>
+                          )}
                         </tr>
                       );
                     })}

@@ -63,7 +63,8 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       BACKEND_URL: http://backend:11001
-      FRONTEND_URL: ${FRONTEND_URL:-https://pingwin.pro}
+      FRONTEND_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
       TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-PingWin}
     depends_on:
       backend:

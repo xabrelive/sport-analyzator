@@ -4,7 +4,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import Image from "next/image";
 import { useAuth } from "@/contexts/AuthContext";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { getMe } from "@/lib/api";
 
 // Иконки одного цвета (currentColor) — лаконичные, без эмодзи
 const Icons = {
@@ -54,6 +55,11 @@ const Icons = {
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
     </svg>
   ),
+  shield: (
+    <svg className="h-5 w-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3l7 4v6c0 5-3.5 8-7 9-3.5-1-7-4-7-9V7l7-4z" />
+    </svg>
+  ),
   chevronDown: (
     <svg className="h-4 w-4 shrink-0 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -76,27 +82,50 @@ const Icons = {
   ),
 };
 
-export function DashboardSidebar() {
+export function DashboardSidebar({
+  className,
+  mobile = false,
+  onNavigate,
+}: {
+  className?: string;
+  mobile?: boolean;
+  onNavigate?: () => void;
+}) {
   const pathname = usePathname();
   const { logout } = useAuth();
+  const [isSuperadmin, setIsSuperadmin] = useState(false);
 
   const [openTableTennis, setOpenTableTennis] = useState(true);
   const [openTennis, setOpenTennis] = useState(false);
   const [openHockey, setOpenHockey] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    getMe()
+      .then((me) => {
+        if (!cancelled) setIsSuperadmin(Boolean(me.is_superadmin));
+      })
+      .catch(() => {
+        if (!cancelled) setIsSuperadmin(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const isActive = (href: string) => pathname === href;
 
   const navLinkClasses = (active: boolean) =>
     `flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition ${
       active
-        ? "bg-slate-700/60 text-white"
+        ? "bg-gradient-to-r from-sky-500/25 to-blue-500/25 border border-sky-500/35 text-sky-100 shadow-[0_0_20px_-12px_rgba(59,130,246,0.9)]"
         : "text-slate-400 hover:bg-slate-800/80 hover:text-white"
     }`;
 
   const subLinkClasses = (active: boolean) =>
     `ml-6 flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition ${
       active
-        ? "bg-slate-700/50 text-white"
+        ? "bg-gradient-to-r from-sky-500/20 to-blue-500/20 border border-sky-500/30 text-sky-100"
         : "text-slate-400 hover:bg-slate-800/60 hover:text-white"
     }`;
 
@@ -108,10 +137,16 @@ export function DashboardSidebar() {
      bg-slate-800/50 text-slate-300 hover:bg-slate-800 hover:text-white
      border border-slate-700/50 ${open ? "rounded-b-none border-b-0" : ""}`;
 
+  const asideClass = [
+    "fixed left-0 top-0 h-screen w-56 border-r border-slate-800 bg-slate-900/95 backdrop-blur-sm flex flex-col transition-transform duration-300",
+    mobile ? "z-50" : "z-40",
+    className || "",
+  ].join(" ");
+
   return (
-    <aside className="fixed left-0 top-0 z-40 h-screen w-56 border-r border-slate-800 bg-slate-900/95 backdrop-blur-sm flex flex-col">
+    <aside className={asideClass}>
       <div className="p-4 border-b border-slate-800">
-        <Link href="/dashboard" className="flex items-center gap-2">
+        <Link href="/dashboard" className="flex items-center gap-2" onClick={onNavigate}>
           <Image
             src="/pingwin-logo.png"
             alt="PingWin"
@@ -126,6 +161,7 @@ export function DashboardSidebar() {
         <Link
           href="/dashboard"
           className={navLinkClasses(isActive("/dashboard"))}
+          onClick={onNavigate}
         >
           {Icons.home}
           Дашборд
@@ -148,6 +184,7 @@ export function DashboardSidebar() {
             <Link
               href="/dashboard/table-tennis/line"
               className={subLinkClasses(isActive("/dashboard/table-tennis/line"))}
+              onClick={onNavigate}
             >
               {Icons.line}
               Линия
@@ -155,6 +192,7 @@ export function DashboardSidebar() {
             <Link
               href="/dashboard/table-tennis/live"
               className={subLinkClasses(isActive("/dashboard/table-tennis/live"))}
+              onClick={onNavigate}
             >
               {Icons.live}
               Лайв
@@ -162,6 +200,7 @@ export function DashboardSidebar() {
             <Link
               href="/dashboard/table-tennis/stats"
               className={subLinkClasses(isActive("/dashboard/table-tennis/stats"))}
+              onClick={onNavigate}
             >
               {Icons.stats}
               Статистика
@@ -169,6 +208,7 @@ export function DashboardSidebar() {
             <Link
               href="/dashboard/table-tennis/leagues"
               className={subLinkClasses(isActive("/dashboard/table-tennis/leagues"))}
+              onClick={onNavigate}
             >
               {Icons.trophy}
               Лиги
@@ -176,6 +216,7 @@ export function DashboardSidebar() {
             <Link
               href="/dashboard/table-tennis/players"
               className={subLinkClasses(isActive("/dashboard/table-tennis/players"))}
+              onClick={onNavigate}
             >
               {Icons.user}
               Игроки
@@ -183,6 +224,7 @@ export function DashboardSidebar() {
             <Link
               href="/dashboard/table-tennis/results"
               className={subLinkClasses(isActive("/dashboard/table-tennis/results"))}
+              onClick={onNavigate}
             >
               {Icons.check}
               Результаты
@@ -236,6 +278,7 @@ export function DashboardSidebar() {
         <Link
           href="/dashboard/calculator"
           className={navLinkClasses(isActive("/dashboard/calculator"))}
+          onClick={onNavigate}
         >
           {Icons.calculator}
           Калькулятор
@@ -243,22 +286,37 @@ export function DashboardSidebar() {
         <Link
           href="/dashboard/settings"
           className={navLinkClasses(isActive("/dashboard/settings"))}
+          onClick={onNavigate}
         >
           {Icons.settings}
           Настройки
         </Link>
+        {isSuperadmin ? (
+          <Link
+            href="/dashboard/admin"
+            className={navLinkClasses(pathname?.startsWith("/dashboard/admin") || false)}
+            onClick={onNavigate}
+          >
+            {Icons.shield}
+            Админка
+          </Link>
+        ) : null}
       </nav>
       <div className="p-3 border-t border-slate-800">
         <Link
           href="/"
           className="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-slate-400 hover:bg-slate-800/80 hover:text-white transition"
+          onClick={onNavigate}
         >
           {Icons.back}
           На сайт
         </Link>
         <button
           type="button"
-          onClick={() => logout()}
+          onClick={() => {
+            onNavigate?.();
+            logout();
+          }}
           className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-slate-400 hover:bg-slate-800/80 hover:text-rose-400 transition"
         >
           {Icons.logout}

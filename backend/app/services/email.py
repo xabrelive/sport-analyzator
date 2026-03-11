@@ -9,7 +9,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-def _send_smtp(to_email: str, subject: str, body: str) -> bool:
+def _send_smtp(to_email: str, subject: str, body: str, body_html: str | None = None) -> bool:
     if not settings.smtp_host or not settings.smtp_from_email:
         logger.warning(
             "SMTP не настроен: smtp_host=%s, smtp_from_email=%s (задайте в .env или переменных окружения)",
@@ -30,6 +30,8 @@ def _send_smtp(to_email: str, subject: str, body: str) -> bool:
         msg["From"] = settings.smtp_from_email
         msg["To"] = to_email
         msg.attach(MIMEText(body, "plain", "utf-8"))
+        if body_html:
+            msg.attach(MIMEText(body_html, "html", "utf-8"))
 
         use_ssl = settings.smtp_use_ssl or settings.smtp_port == 465
         if use_ssl:
@@ -113,4 +115,22 @@ def send_email_link_code_email(email: str, code: str) -> bool:
         logger.info("Email link code sent to %s", email)
         return True
     logger.warning("Email link code НЕ отправлен (SMTP): %s", email)
+    return False
+
+
+def send_text_email(email: str, subject: str, body: str) -> bool:
+    """Send plain text email notification."""
+    if _send_smtp(email, subject, body):
+        logger.info("Text email sent to %s, subject=%s", email, subject)
+        return True
+    logger.warning("Text email НЕ отправлен (SMTP): %s, subject=%s", email, subject)
+    return False
+
+
+def send_html_email(email: str, subject: str, body_text: str, body_html: str) -> bool:
+    """Send html+text email notification."""
+    if _send_smtp(email, subject, body_text, body_html=body_html):
+        logger.info("HTML email sent to %s, subject=%s", email, subject)
+        return True
+    logger.warning("HTML email НЕ отправлен (SMTP): %s, subject=%s", email, subject)
     return False

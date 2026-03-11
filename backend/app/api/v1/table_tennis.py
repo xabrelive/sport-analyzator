@@ -10,6 +10,7 @@ from sqlalchemy import select, or_, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.api.v1.auth import get_current_user
 from app.db.session import get_async_session, async_session_maker
 from app.models.table_tennis_line_event import (
     TableTennisLineEvent,
@@ -19,12 +20,29 @@ from app.models.table_tennis_line_event import (
 )
 from app.services.betsapi_table_tennis import (
     backfill_missing_sets_scores_once,
-    backfill_forecasts_from_existing_events_once,
     sync_results_from_archive_range_once,
     revalidate_cancelled_forecast_events_once,
 )
 from app.services.table_tennis_analytics import load_player_stats, build_strengths_weaknesses
-from app.models.table_tennis_forecast import TableTennisForecast
+from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
+from app.models.table_tennis_forecast_explanation import TableTennisForecastExplanation
+from app.models.user import User
+from app.models.user_forecast_notification import UserForecastNotification
+from app.services.forecast_v2_pipeline import (
+    get_kpi_runtime_state,
+    run_kpi_guard_once,
+    rebuild_features_once,
+    run_forecast_v2_once,
+    run_result_priority_once,
+    run_validation_checks_once,
+)
+from app.services.notification_dispatcher import dispatch_forecast_notifications_once
+from app.services.subscription_access import (
+    FORECAST_LOCKED_ANALYTICS,
+    DASHBOARD_PURCHASE_URL,
+    get_subscription_access,
+)
+from app.services.telegram_channel_dispatcher import dispatch_channel_notifications_once
 
 router = APIRouter()
 
@@ -65,6 +83,41 @@ def _parse_sets_score(value: str | None) -> tuple[int | None, int | None]:
         return int(left), int(right)
     except (TypeError, ValueError):
         return None, None
+
+
+def _has_in_progress_set_fragment(live_score: dict | None) -> bool:
+    if not isinstance(live_score, dict):
+        return False
+    for _, set_data in live_score.items():
+        if not isinstance(set_data, dict):
+            continue
+        h_raw = set_data.get("home")
+        a_raw = set_data.get("away")
+        if h_raw is None and a_raw is None:
+            continue
+        try:
+            h = int(str(h_raw or "0"))
+            a = int(str(a_raw or "0"))
+        except (TypeError, ValueError):
+            continue
+        if h == 0 and a == 0:
+            continue
+        if not (max(h, a) >= 11 and abs(h - a) >= 2):
+            return True
+    return False
+
+
+def _normalize_forecast_event_status(event: TableTennisLineEvent | None) -> str | None:
+    if not event:
+        return None
+    if event.status != LINE_EVENT_STATUS_FINISHED:
+        return event.status
+    hs, as_ = _parse_sets_score(event.live_sets_score)
+    required_wins = max(1, int(getattr(settings, "table_tennis_match_sets_to_win", 3)))
+    has_final_sets = hs is not None and as_ is not None and hs != as_ and max(hs, as_) >= required_wins
+    if (not has_final_sets) or _has_in_progress_set_fragment(event.live_score):
+        return LINE_EVENT_STATUS_LIVE
+    return event.status
 
 
 def _event_to_dict(r: TableTennisLineEvent) -> dict:
@@ -159,7 +212,49 @@ def _build_match_justification(
     return " ".join(parts)
 
 
-def _build_line_response(rows: list) -> dict:
+async def _load_v2_forecast_map(
+    session: AsyncSession,
+    event_ids: list[str],
+    channel: str = "paid",
+    resolved_only: bool = False,
+) -> dict[str, str]:
+    """Latest V2 forecast text per event for given channel."""
+    if not event_ids:
+        return {}
+    conditions = [
+        TableTennisForecastV2.event_id.in_(event_ids),
+        TableTennisForecastV2.channel == channel,
+    ]
+    if resolved_only:
+        conditions.append(TableTennisForecastV2.status.in_(["hit", "miss"]))
+    rows = (
+        await session.execute(
+            select(
+                TableTennisForecastV2.event_id,
+                TableTennisForecastV2.forecast_text,
+                TableTennisForecastV2.created_at,
+            )
+            .where(and_(*conditions))
+            .order_by(TableTennisForecastV2.event_id.asc(), TableTennisForecastV2.created_at.desc())
+        )
+    ).all()
+    out: dict[str, str] = {}
+    for event_id, forecast_text, _created_at in rows:
+        if event_id not in out and forecast_text:
+            out[str(event_id)] = str(forecast_text)
+    return out
+
+
+async def _load_v2_forecast_map_resolved_only(
+    session: AsyncSession,
+    event_ids: list[str],
+    channel: str,
+) -> dict[str, str]:
+    """Latest V2 forecast text per event, only for resolved (hit/miss) forecasts."""
+    return await _load_v2_forecast_map(session, event_ids, channel=channel, resolved_only=True)
+
+
+def _build_line_response(rows: list, forecast_map: dict[str, str] | None = None) -> dict:
     """Собирает ответ с событиями, лигами и игроками по лигам."""
     events = []
     leagues_map = {}
@@ -193,7 +288,7 @@ def _build_line_response(rows: list) -> dict:
             "status": r.status,
             "odds_1": float(r.odds_1) if r.odds_1 is not None else None,
             "odds_2": float(r.odds_2) if r.odds_2 is not None else None,
-            "forecast": r.forecast,
+            "forecast": (forecast_map or {}).get(str(r.id)) or r.forecast,
         })
 
     leagues = list(leagues_map.values())
@@ -211,7 +306,10 @@ def _build_line_response(rows: list) -> dict:
 
 
 @router.get("/live")
-async def get_table_tennis_live(session: AsyncSession = Depends(get_async_session)):
+async def get_table_tennis_live(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
+):
     """Лайв: матчи со статусом live, а также finished — но только в течение 5 минут после завершения."""
     now = datetime.now(timezone.utc)
     five_minutes_ago = now - timedelta(minutes=5)
@@ -244,10 +342,35 @@ async def get_table_tennis_live(session: AsyncSession = Depends(get_async_sessio
         ).order_by(TableTennisLineEvent.starts_at)
     )
     rows = list(result.scalars().all())
-    return _build_live_response(rows)
+    access = await get_subscription_access(user.id, session)
+    if not access["can_see_forecasts"]:
+        forecast_map = None
+        forecast_placeholder = FORECAST_LOCKED_ANALYTICS
+        forecast_locked = True
+        forecast_purchase_url = DASHBOARD_PURCHASE_URL
+    else:
+        ch = access["forecast_channel"] or "paid"
+        if access["only_resolved"]:
+            forecast_map = await _load_v2_forecast_map_resolved_only(session, [str(r.id) for r in rows], channel=ch)
+        else:
+            forecast_map = await _load_v2_forecast_map(session, [str(r.id) for r in rows], channel=ch)
+        forecast_placeholder = None
+        forecast_locked = False
+        forecast_purchase_url = None
+    resp = _build_live_response(rows, forecast_map=forecast_map)
+    if forecast_locked:
+        for ev in resp.get("events", []):
+            ev["forecast"] = forecast_placeholder
+        resp["forecast_locked"] = True
+        resp["forecast_locked_message"] = forecast_placeholder
+        resp["forecast_purchase_url"] = forecast_purchase_url
+    return resp
 
 
-def _build_live_response(rows: list[TableTennisLineEvent]) -> dict:
+def _build_live_response(
+    rows: list[TableTennisLineEvent],
+    forecast_map: dict[str, str] | None = None,
+) -> dict:
     events = []
     for r in rows:
         events.append(
@@ -263,7 +386,7 @@ def _build_live_response(rows: list[TableTennisLineEvent]) -> dict:
                 "status": r.status,
                 "odds_1": float(r.odds_1) if r.odds_1 is not None else None,
                 "odds_2": float(r.odds_2) if r.odds_2 is not None else None,
-                "forecast": r.forecast,
+                "forecast": (forecast_map or {}).get(str(r.id)) or r.forecast,
                 "sets_score": r.live_sets_score,
                 "sets": r.live_score or {},
                 "last_score_changed_at": int(r.last_score_changed_at.timestamp()) if r.last_score_changed_at else None,
@@ -311,13 +434,6 @@ async def run_backfill_sets(limit: int = 120):
     return {"ok": True, "limit": safe_limit, "updated": updated}
 
 
-@router.post("/debug/backfill-forecasts")
-async def run_backfill_forecasts() -> dict:
-    """Ручной запуск: добавить в table_tennis_forecasts все уже рассчитанные прогнозы из line‑таблицы."""
-    inserted = await backfill_forecasts_from_existing_events_once()
-    return {"ok": True, "inserted": inserted}
-
-
 @router.post("/debug/backfill-results-range")
 async def run_backfill_results_range(
     date_from: str,
@@ -358,7 +474,10 @@ async def run_revalidate_cancelled_forecasts(limit: int = 120) -> dict:
 
 
 @router.get("/line")
-async def get_table_tennis_line(session: AsyncSession = Depends(get_async_session)):
+async def get_table_tennis_line(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
+):
     """Линия: только матчи со статусом scheduled. Cancelled, live, finished и др. не отдаём."""
     now = datetime.now(timezone.utc)
     result = await session.execute(
@@ -368,7 +487,29 @@ async def get_table_tennis_line(session: AsyncSession = Depends(get_async_sessio
         .order_by(TableTennisLineEvent.starts_at)
     )
     rows = list(result.scalars().all())
-    return _build_line_response(rows)
+    access = await get_subscription_access(user.id, session)
+    if not access["can_see_forecasts"]:
+        forecast_map = None
+        forecast_placeholder = FORECAST_LOCKED_ANALYTICS
+        forecast_locked = True
+        forecast_purchase_url = DASHBOARD_PURCHASE_URL
+    else:
+        ch = access["forecast_channel"] or "paid"
+        if access["only_resolved"]:
+            forecast_map = await _load_v2_forecast_map_resolved_only(session, [str(r.id) for r in rows], channel=ch)
+        else:
+            forecast_map = await _load_v2_forecast_map(session, [str(r.id) for r in rows], channel=ch)
+        forecast_placeholder = None
+        forecast_locked = False
+        forecast_purchase_url = None
+    resp = _build_line_response(rows, forecast_map=forecast_map)
+    if forecast_locked:
+        for ev in resp.get("events", []):
+            ev["forecast"] = forecast_placeholder
+        resp["forecast_locked"] = True
+        resp["forecast_locked_message"] = forecast_placeholder
+        resp["forecast_purchase_url"] = forecast_purchase_url
+    return resp
 
 
 @router.get("/results")
@@ -379,6 +520,7 @@ async def get_table_tennis_results(
     player_query: str = "",
     date_from: str = "",
     date_to: str = "",
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
     """Завершённые матчи (results) с фильтрами и пагинацией."""
@@ -436,8 +578,31 @@ async def get_table_tennis_results(
         for r in leagues_result.mappings().all()
     ]
 
+    access = await get_subscription_access(user.id, session)
+    items = [_event_to_dict(r) for r in rows]
+    if not access["can_see_forecasts"]:
+        for it in items:
+            it["forecast"] = None
+            it.pop("forecast_confidence", None)
+        return {
+            "items": items,
+            "page": p,
+            "page_size": ps,
+            "total": total,
+            "leagues": leagues,
+            "filters": {
+                "league_id": league_id or None,
+                "player_query": player_query or None,
+                "date_from": date_from or None,
+                "date_to": date_to or None,
+            },
+            "forecast_locked": True,
+            "forecast_locked_message": FORECAST_LOCKED_ANALYTICS,
+            "forecast_purchase_url": DASHBOARD_PURCHASE_URL,
+        }
+
     return {
-        "items": [_event_to_dict(r) for r in rows],
+        "items": items,
         "page": p,
         "page_size": ps,
         "total": total,
@@ -451,165 +616,682 @@ async def get_table_tennis_results(
     }
 
 
-@router.get("/forecasts/stats")
-async def get_table_tennis_forecasts_stats(
+def _forecast_v2_item(
+    forecast: TableTennisForecastV2,
+    event: TableTennisLineEvent | None,
+    explanations: list[TableTennisForecastExplanation],
+) -> dict:
+    starts_at_ts = int(event.starts_at.timestamp()) if event and event.starts_at else None
+    created_at_ts = int(forecast.created_at.timestamp()) if forecast.created_at else None
+    lead_seconds = None
+    if event and event.starts_at and forecast.created_at:
+        lead_seconds = int((event.starts_at - forecast.created_at).total_seconds())
+    return {
+        "id": forecast.id,
+        "event_id": forecast.event_id,
+        "channel": forecast.channel,
+        "market": forecast.market,
+        "pick_side": forecast.pick_side,
+        "forecast_text": forecast.forecast_text,
+        "probability_pct": float(forecast.probability_pct) if forecast.probability_pct is not None else None,
+        "confidence_score": float(forecast.confidence_score) if forecast.confidence_score is not None else None,
+        "edge_pct": float(forecast.edge_pct) if forecast.edge_pct is not None else None,
+        "odds_used": float(forecast.odds_used) if forecast.odds_used is not None else None,
+        "status": forecast.status,
+        "final_status": forecast.final_status,
+        "final_sets_score": forecast.final_sets_score,
+        "created_at": created_at_ts,
+        "resolved_at": int(forecast.resolved_at.timestamp()) if forecast.resolved_at else None,
+        "starts_at": starts_at_ts,
+        "forecast_lead_seconds": lead_seconds,
+        "event_status": _normalize_forecast_event_status(event),
+        "league_id": event.league_id if event else None,
+        "league_name": event.league_name if event else None,
+        "home_id": event.home_id if event else None,
+        "home_name": event.home_name if event else None,
+        "away_id": event.away_id if event else None,
+        "away_name": event.away_name if event else None,
+        "sets_score": event.live_sets_score if event else None,
+        "live_score": event.live_score if event else None,
+        "explanation_summary": forecast.explanation_summary,
+        "factors": [
+            {
+                "factor_key": e.factor_key,
+                "factor_label": e.factor_label,
+                "factor_value": e.factor_value,
+                "contribution": float(e.contribution) if e.contribution is not None else None,
+                "direction": e.direction,
+                "rank": e.rank,
+            }
+            for e in sorted(explanations, key=lambda x: x.rank)
+        ],
+    }
+
+
+async def _build_player_match_context(
+    session: AsyncSession,
+    event: TableTennisLineEvent,
+) -> dict:
+    """Build per-player and H2H context for this exact match."""
+    if not event.home_id or not event.away_id:
+        return {}
+
+    cutoff = event.starts_at or datetime.now(timezone.utc)
+
+    async def _player_recent(pid: str, max_rows: int = 30) -> dict:
+        rows = (
+            await session.execute(
+                select(TableTennisLineEvent)
+                .where(
+                    TableTennisLineEvent.status == LINE_EVENT_STATUS_FINISHED,
+                    or_(
+                        TableTennisLineEvent.home_id == pid,
+                        TableTennisLineEvent.away_id == pid,
+                    ),
+                    TableTennisLineEvent.starts_at.is_not(None),
+                    TableTennisLineEvent.starts_at < cutoff,
+                )
+                .order_by(TableTennisLineEvent.starts_at.desc())
+                .limit(max_rows)
+            )
+        ).scalars().all()
+
+        wins = 0
+        losses = 0
+        form: list[dict] = []
+        for row in rows:
+            hs, as_ = _parse_sets_score(row.live_sets_score)
+            if hs is None or as_ is None or hs == as_:
+                continue
+            is_home = row.home_id == pid
+            won = (is_home and hs > as_) or ((not is_home) and as_ > hs)
+            opponent_name = row.away_name if is_home else row.home_name
+            if won:
+                wins += 1
+                form.append(
+                    {
+                        "event_id": str(row.id),
+                        "result": "W",
+                        "opponent_name": opponent_name,
+                        "starts_at": int(row.starts_at.timestamp()) if row.starts_at else None,
+                        "sets_score": row.live_sets_score,
+                    }
+                )
+            else:
+                losses += 1
+                form.append(
+                    {
+                        "event_id": str(row.id),
+                        "result": "L",
+                        "opponent_name": opponent_name,
+                        "starts_at": int(row.starts_at.timestamp()) if row.starts_at else None,
+                        "sets_score": row.live_sets_score,
+                    }
+                )
+        played = wins + losses
+        return {
+            "played": played,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round((wins / played) * 100.0, 1) if played else None,
+            "last5_form": form[:5],
+        }
+
+    h2h_rows = (
+        await session.execute(
+            select(TableTennisLineEvent)
+            .where(
+                TableTennisLineEvent.status == LINE_EVENT_STATUS_FINISHED,
+                TableTennisLineEvent.starts_at.is_not(None),
+                TableTennisLineEvent.starts_at < cutoff,
+                or_(
+                    and_(
+                        TableTennisLineEvent.home_id == event.home_id,
+                        TableTennisLineEvent.away_id == event.away_id,
+                    ),
+                    and_(
+                        TableTennisLineEvent.home_id == event.away_id,
+                        TableTennisLineEvent.away_id == event.home_id,
+                    ),
+                ),
+            )
+            .order_by(TableTennisLineEvent.starts_at.desc())
+            .limit(50)
+        )
+    ).scalars().all()
+
+    h2h_home_wins = 0
+    h2h_away_wins = 0
+    for row in h2h_rows:
+        hs, as_ = _parse_sets_score(row.live_sets_score)
+        if hs is None or as_ is None or hs == as_:
+            continue
+        if row.home_id == event.home_id:
+            if hs > as_:
+                h2h_home_wins += 1
+            else:
+                h2h_away_wins += 1
+        else:
+            if hs > as_:
+                h2h_away_wins += 1
+            else:
+                h2h_home_wins += 1
+
+    home_ctx = await _player_recent(str(event.home_id))
+    away_ctx = await _player_recent(str(event.away_id))
+    home_ctx["h2h_wins"] = h2h_home_wins
+    away_ctx["h2h_wins"] = h2h_away_wins
+
+    return {
+        "home": home_ctx,
+        "away": away_ctx,
+        "h2h": {
+            "total": h2h_home_wins + h2h_away_wins,
+            "home_wins": h2h_home_wins,
+            "away_wins": h2h_away_wins,
+        },
+    }
+
+
+ALL_CHANNELS = ["free", "paid", "vip", "bot_signals"]
+
+
+def _allowed_channels_and_resolved(access: dict, channel: str) -> tuple[list[str], bool]:
+    """
+    allowed_channels — всегда все вкладки видны.
+    only_resolved — для запрошенного channel: True если нет доступа (показываем только hit/miss, без прогнозов и pending).
+    """
+    has_analytics = access["has_analytics"]
+    has_vip = access["has_vip_channel"]
+
+    if channel == "free":
+        only_resolved = False  # бесплатный для всех
+    elif channel == "paid":
+        only_resolved = not has_analytics
+    elif channel == "vip":
+        only_resolved = not has_vip
+    elif channel == "bot_signals":
+        only_resolved = not has_analytics
+    else:
+        only_resolved = True
+
+    return ALL_CHANNELS, only_resolved
+
+
+@router.get("/v2/forecasts/stats")
+async def get_table_tennis_forecasts_v2_stats(
     date_from: str = "",
     date_to: str = "",
     league_id: str = "",
-    channel: str = "",
+    channel: str = "paid",
+    quality_tier: str = "",
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
-    """Сводная статистика по прематч‑прогнозам модели."""
+    access = await get_subscription_access(user.id, session)
+    allowed, only_resolved = _allowed_channels_and_resolved(access, channel)
+
     dt_from = _parse_date_start_utc(date_from)
     dt_to_excl = _parse_date_end_utc_exclusive(date_to)
+    if channel == "bot_signals":
+        base_sent = (
+            select(
+                UserForecastNotification.event_id.label("event_id"),
+                func.max(UserForecastNotification.forecast_v2_id).label("forecast_v2_id"),
+                func.max(UserForecastNotification.sent_at).label("sent_at"),
+            )
+            .where(
+                UserForecastNotification.user_id == user.id,
+                UserForecastNotification.channel == "telegram",
+            )
+            .group_by(UserForecastNotification.event_id)
+            .subquery()
+        )
+        conditions = []
+        if dt_from is not None:
+            conditions.append(base_sent.c.sent_at >= dt_from)
+        if dt_to_excl is not None:
+            conditions.append(base_sent.c.sent_at < dt_to_excl)
+        if quality_tier:
+            conditions.append(TableTennisForecastV2.explanation_summary.ilike(f"%Tier {quality_tier.upper()}%"))
+        if league_id:
+            conditions.append(TableTennisLineEvent.league_id == league_id)
+        if only_resolved:
+            conditions.append(TableTennisForecastV2.status.in_(["hit", "miss"]))
 
-    conditions = []
+        by_status_rows = (
+            await session.execute(
+                select(TableTennisForecastV2.status, func.count())
+                .join(base_sent, base_sent.c.forecast_v2_id == TableTennisForecastV2.id)
+                .join(TableTennisLineEvent, TableTennisLineEvent.id == base_sent.c.event_id)
+                .where(*conditions)
+                .group_by(TableTennisForecastV2.status)
+            )
+        ).all()
+        by_status: dict[str, int] = {str(status): int(cnt) for status, cnt in by_status_rows}
+        total = sum(by_status.values())
+        hits = by_status.get("hit", 0)
+        misses = by_status.get("miss", 0)
+        resolved = hits + misses
+        hit_rate = (hits / resolved * 100.0) if resolved else None
+        avg_odds = (
+            await session.execute(
+                select(func.avg(TableTennisForecastV2.odds_used))
+                .join(base_sent, base_sent.c.forecast_v2_id == TableTennisForecastV2.id)
+                .join(TableTennisLineEvent, TableTennisLineEvent.id == base_sent.c.event_id)
+                .where(*conditions)
+            )
+        ).scalar_one_or_none()
+        result = {
+            "total": total,
+            "by_status": by_status,
+            "hit_rate": hit_rate,
+            "avg_odds": float(avg_odds) if avg_odds is not None else None,
+            "kpi_runtime": get_kpi_runtime_state(),
+            "allowed_channels": allowed,
+            "only_resolved": only_resolved,
+        }
+        if only_resolved:
+            result["forecast_purchase_url"] = DASHBOARD_PURCHASE_URL
+        return result
+
+    conditions = [TableTennisForecastV2.channel == channel]
     if dt_from is not None:
-        conditions.append(TableTennisForecast.created_at >= dt_from)
+        conditions.append(TableTennisForecastV2.created_at >= dt_from)
     if dt_to_excl is not None:
-        conditions.append(TableTennisForecast.created_at < dt_to_excl)
+        conditions.append(TableTennisForecastV2.created_at < dt_to_excl)
+    if quality_tier:
+        conditions.append(TableTennisForecastV2.explanation_summary.ilike(f"%Tier {quality_tier.upper()}%"))
     if league_id:
-        conditions.append(TableTennisForecast.league_id == league_id)
-    if channel:
-        conditions.append(TableTennisForecast.channel == channel)
+        conditions.append(TableTennisLineEvent.league_id == league_id)
+    if only_resolved:
+        conditions.append(TableTennisForecastV2.status.in_(["hit", "miss"]))
 
-    # Всего
-    total_result = await session.execute(
-        select(func.count()).select_from(TableTennisForecast).where(*conditions)
-    )
-    total = int(total_result.scalar_one() or 0)
-
-    # По статусам
-    by_status_result = await session.execute(
-        select(TableTennisForecast.status, func.count())
+    base = (
+        select(TableTennisForecastV2.status, func.count())
+        .join(TableTennisLineEvent, TableTennisLineEvent.id == TableTennisForecastV2.event_id)
         .where(*conditions)
-        .group_by(TableTennisForecast.status)
+        .group_by(TableTennisForecastV2.status)
     )
-    by_status_rows = by_status_result.all()
+    by_status_rows = (await session.execute(base)).all()
     by_status: dict[str, int] = {str(status): int(cnt) for status, cnt in by_status_rows}
 
+    total = sum(by_status.values())
     hits = by_status.get("hit", 0)
     misses = by_status.get("miss", 0)
     resolved = hits + misses
     hit_rate = (hits / resolved * 100.0) if resolved else None
 
-    return {
+    avg_odds_result = await session.execute(
+        select(func.avg(TableTennisForecastV2.odds_used))
+        .join(TableTennisLineEvent, TableTennisLineEvent.id == TableTennisForecastV2.event_id)
+        .where(*conditions)
+    )
+    avg_odds = avg_odds_result.scalar_one_or_none()
+
+    result = {
         "total": total,
         "by_status": by_status,
         "hit_rate": hit_rate,
+        "avg_odds": float(avg_odds) if avg_odds is not None else None,
+        "kpi_runtime": get_kpi_runtime_state(),
+        "allowed_channels": allowed,
+        "only_resolved": only_resolved,
     }
+    if only_resolved:
+        result["forecast_purchase_url"] = DASHBOARD_PURCHASE_URL
+    return result
 
 
-@router.get("/forecasts")
-async def get_table_tennis_forecasts(
+@router.get("/v2/forecasts")
+async def get_table_tennis_forecasts_v2(
     page: int = 1,
     page_size: int = 50,
     status: str = "",
     league_id: str = "",
     date_from: str = "",
     date_to: str = "",
-    channel: str = "",
+    channel: str = "paid",
+    quality_tier: str = "",
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
-    """Пагинированный список прогнозов по матчам для аналитики.
+    access = await get_subscription_access(user.id, session)
+    allowed, only_resolved = _allowed_channels_and_resolved(access, channel)
 
-    Если page=0, возвращает все подходящие прогнозы без пагинации (для SSE/фона)."""
     p = _sanitize_page(page) if page > 0 else 1
-    ps = _sanitize_page_size(page_size, max_size=200)
+    ps = _sanitize_page_size(page_size, max_size=250)
     offset = (p - 1) * ps if page > 0 else 0
     dt_from = _parse_date_start_utc(date_from)
     dt_to_excl = _parse_date_end_utc_exclusive(date_to)
 
-    conditions = []
+    if channel == "bot_signals":
+        base_sent = (
+            select(
+                UserForecastNotification.event_id.label("event_id"),
+                func.max(UserForecastNotification.forecast_v2_id).label("forecast_v2_id"),
+                func.max(UserForecastNotification.sent_at).label("sent_at"),
+            )
+            .where(
+                UserForecastNotification.user_id == user.id,
+                UserForecastNotification.channel == "telegram",
+            )
+            .group_by(UserForecastNotification.event_id)
+            .subquery()
+        )
+        conditions = []
+        if status:
+            conditions.append(TableTennisForecastV2.status == status)
+        elif only_resolved:
+            conditions.append(TableTennisForecastV2.status.in_(["hit", "miss"]))
+        if league_id:
+            conditions.append(TableTennisLineEvent.league_id == league_id)
+        if dt_from is not None:
+            conditions.append(base_sent.c.sent_at >= dt_from)
+        if dt_to_excl is not None:
+            conditions.append(base_sent.c.sent_at < dt_to_excl)
+        if quality_tier:
+            conditions.append(TableTennisForecastV2.explanation_summary.ilike(f"%Tier {quality_tier.upper()}%"))
+
+        total = int(
+            (
+                await session.execute(
+                    select(func.count(base_sent.c.event_id))
+                    .join(TableTennisForecastV2, TableTennisForecastV2.id == base_sent.c.forecast_v2_id)
+                    .join(TableTennisLineEvent, TableTennisLineEvent.id == base_sent.c.event_id)
+                    .where(*conditions)
+                )
+            ).scalar_one()
+            or 0
+        )
+        stmt = (
+            select(TableTennisForecastV2, TableTennisLineEvent)
+            .join(base_sent, base_sent.c.forecast_v2_id == TableTennisForecastV2.id)
+            .join(TableTennisLineEvent, TableTennisLineEvent.id == base_sent.c.event_id)
+            .where(*conditions)
+            .order_by(base_sent.c.sent_at.desc())
+        )
+        if page > 0:
+            stmt = stmt.limit(ps).offset(offset)
+        rows = (await session.execute(stmt)).all()
+        forecast_ids = [f.id for f, _ev in rows]
+        explanation_rows = (
+            await session.execute(
+                select(TableTennisForecastExplanation).where(
+                    TableTennisForecastExplanation.forecast_v2_id.in_(forecast_ids or [-1])
+                )
+            )
+        ).scalars().all()
+        by_forecast: dict[int, list[TableTennisForecastExplanation]] = {}
+        for exp in explanation_rows:
+            by_forecast.setdefault(exp.forecast_v2_id, []).append(exp)
+        items = [
+            _forecast_v2_item(forecast, event, by_forecast.get(forecast.id, []))
+            for forecast, event in rows
+        ]
+        result = {
+            "items": items,
+            "page": p if page > 0 else 1,
+            "page_size": ps if page > 0 else total,
+            "total": total,
+            "allowed_channels": allowed,
+            "only_resolved": only_resolved,
+        }
+        if only_resolved:
+            result["forecast_purchase_url"] = DASHBOARD_PURCHASE_URL
+        return result
+
+    conditions = [TableTennisForecastV2.channel == channel]
     if status:
-        conditions.append(TableTennisForecast.status == status)
+        conditions.append(TableTennisForecastV2.status == status)
+    elif only_resolved:
+        conditions.append(TableTennisForecastV2.status.in_(["hit", "miss"]))
     if league_id:
-        conditions.append(TableTennisForecast.league_id == league_id)
+        conditions.append(TableTennisLineEvent.league_id == league_id)
     if dt_from is not None:
-        conditions.append(TableTennisForecast.created_at >= dt_from)
+        conditions.append(TableTennisForecastV2.created_at >= dt_from)
     if dt_to_excl is not None:
-        conditions.append(TableTennisForecast.created_at < dt_to_excl)
-    if channel:
-        conditions.append(TableTennisForecast.channel == channel)
+        conditions.append(TableTennisForecastV2.created_at < dt_to_excl)
+    if quality_tier:
+        conditions.append(TableTennisForecastV2.explanation_summary.ilike(f"%Tier {quality_tier.upper()}%"))
 
-
-    total_result = await session.execute(
-        select(func.count()).select_from(TableTennisForecast).where(*conditions)
+    total = int(
+        (
+            await session.execute(
+                select(func.count(TableTennisForecastV2.id))
+                .join(TableTennisLineEvent, TableTennisLineEvent.id == TableTennisForecastV2.event_id)
+                .where(*conditions)
+            )
+        ).scalar_one()
+        or 0
     )
-    total = int(total_result.scalar_one() or 0)
 
     stmt = (
-        select(TableTennisForecast, TableTennisLineEvent)
-        .join(
-            TableTennisLineEvent,
-            TableTennisLineEvent.id == TableTennisForecast.event_id,
-        )
+        select(TableTennisForecastV2, TableTennisLineEvent)
+        .join(TableTennisLineEvent, TableTennisLineEvent.id == TableTennisForecastV2.event_id)
         .where(*conditions)
-        .order_by(TableTennisForecast.created_at.desc())
+        .order_by(TableTennisForecastV2.created_at.desc())
     )
     if page > 0:
         stmt = stmt.limit(ps).offset(offset)
 
-    rows_result = await session.execute(stmt)
-    items: list[dict] = []
-    for f_row, ev in rows_result.all():
-        f: TableTennisForecast = f_row
-        # Кф прогноза: берём кф той стороны, на которую даётся рекомендация (П1 / П2).
-        txt = (f.forecast_text or "").lower()
-        forecast_odds: float | None = None
-        if "п1" in txt:
-            forecast_odds = float(ev.odds_1) if ev.odds_1 is not None else None
-        elif "п2" in txt:
-            forecast_odds = float(ev.odds_2) if ev.odds_2 is not None else None
-
-        # За сколько времени до начала матча был дан прогноз (секунды; может быть отрицательным, если после старта).
-        lead_seconds: int | None = None
-        if f.created_at and ev.starts_at:
-            lead_seconds = int((ev.starts_at - f.created_at).total_seconds())
-
-        # Эффективный статус события для аналитики:
-        # если по счёту по сетам явно есть победитель — считаем матч завершённым,
-        # даже если status в таблице ещё "live" (задержка фоновых задач).
-        event_status = ev.status
-        wins_home, wins_away = _parse_sets_score(ev.live_sets_score)
-        if wins_home is not None and wins_away is not None and wins_home != wins_away:
-            if event_status in {LINE_EVENT_STATUS_LIVE, LINE_EVENT_STATUS_SCHEDULED}:
-                event_status = LINE_EVENT_STATUS_FINISHED
-
-        items.append(
-            {
-                "event_id": f.event_id,
-                "league_id": f.league_id,
-                "league_name": f.league_name,
-                "home_id": f.home_id,
-                "home_name": f.home_name,
-                "away_id": f.away_id,
-                "away_name": f.away_name,
-                "forecast_text": f.forecast_text,
-                "confidence_pct": float(f.confidence_pct) if f.confidence_pct is not None else None,
-                "status": f.status,
-                "created_at": int(f.created_at.timestamp()) if f.created_at else None,
-                "resolved_at": int(f.resolved_at.timestamp()) if f.resolved_at else None,
-                "final_status": f.final_status,
-                "final_sets_score": f.final_sets_score,
-                "starts_at": int(ev.starts_at.timestamp()) if ev.starts_at else None,
-                "odds_1": float(ev.odds_1) if ev.odds_1 is not None else None,
-                "odds_2": float(ev.odds_2) if ev.odds_2 is not None else None,
-                "channel": f.channel,
-                "event_status": event_status,
-                "sets_score": ev.live_sets_score,
-                "live_score": ev.live_score,
-                "forecast_odds": float(f.forecast_odds) if f.forecast_odds is not None else forecast_odds,
-                "forecast_lead_seconds": lead_seconds,
-            }
+    rows = (await session.execute(stmt)).all()
+    forecast_ids = [f.id for f, _ev in rows]
+    explanation_rows = (
+        await session.execute(
+            select(TableTennisForecastExplanation).where(
+                TableTennisForecastExplanation.forecast_v2_id.in_(forecast_ids or [-1])
+            )
         )
+    ).scalars().all()
+    by_forecast: dict[int, list[TableTennisForecastExplanation]] = {}
+    for exp in explanation_rows:
+        by_forecast.setdefault(exp.forecast_v2_id, []).append(exp)
 
-    return {
+    items = [
+        _forecast_v2_item(forecast, event, by_forecast.get(forecast.id, []))
+        for forecast, event in rows
+    ]
+    result = {
         "items": items,
         "page": p if page > 0 else 1,
         "page_size": ps if page > 0 else total,
         "total": total,
+        "allowed_channels": allowed,
+        "only_resolved": only_resolved,
     }
+    if only_resolved:
+        result["forecast_purchase_url"] = DASHBOARD_PURCHASE_URL
+    return result
+
+
+@router.get("/v2/matches/{match_id}")
+async def get_table_tennis_match_card_v2(
+    match_id: str,
+    channel: str = "paid",
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
+):
+    access = await get_subscription_access(user.id, session)
+    if not access["can_see_forecasts"]:
+        event = (
+            await session.execute(select(TableTennisLineEvent).where(TableTennisLineEvent.id == str(match_id)))
+        ).scalar_one_or_none()
+        if event is None:
+            return {"match": None}
+        return {
+            "match": _event_to_dict(event),
+            "forecast_v2": None,
+            "player_context": await _build_player_match_context(session, event),
+            "forecast_locked": True,
+            "forecast_locked_message": FORECAST_LOCKED_ANALYTICS,
+            "forecast_purchase_url": DASHBOARD_PURCHASE_URL,
+        }
+    if access["forecast_channel"]:
+        channel = access["forecast_channel"]
+    if access["only_resolved"]:
+        # For VIP-only, only return forecast if it's resolved
+        pass  # handled in forecast fetch below
+
+    event = (
+        await session.execute(select(TableTennisLineEvent).where(TableTennisLineEvent.id == str(match_id)))
+    ).scalar_one_or_none()
+    if event is None:
+        return {"match": None}
+
+    forecast_conditions = [
+        TableTennisForecastV2.event_id == event.id,
+        TableTennisForecastV2.channel == channel,
+    ]
+    if access["only_resolved"]:
+        forecast_conditions.append(TableTennisForecastV2.status.in_(["hit", "miss"]))
+    forecast = (
+        await session.execute(
+            select(TableTennisForecastV2)
+            .where(and_(*forecast_conditions))
+            .order_by(TableTennisForecastV2.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    explanations: list[TableTennisForecastExplanation] = []
+    if forecast:
+        explanations = (
+            await session.execute(
+                select(TableTennisForecastExplanation).where(
+                    TableTennisForecastExplanation.forecast_v2_id == forecast.id
+                )
+            )
+        ).scalars().all()
+
+    player_context = await _build_player_match_context(session, event)
+
+    return {
+        "match": _event_to_dict(event),
+        "forecast_v2": _forecast_v2_item(forecast, event, explanations) if forecast else None,
+        "player_context": player_context,
+    }
+
+
+@router.get("/v2/players/{player_id}")
+async def get_table_tennis_player_card_v2(
+    player_id: str,
+    channel: str = "paid",
+    page_upcoming: int = 1,
+    page_finished: int = 1,
+    page_size: int = 15,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
+):
+    ps = _sanitize_page_size(page_size, max_size=50)
+    p_up = _sanitize_page(page_upcoming)
+    p_fin = _sanitize_page(page_finished)
+    now = datetime.now(timezone.utc)
+
+    # Reuse existing player endpoint and enrich with V2 forecasts.
+    access = await get_subscription_access(user.id, session)
+    player_data = await get_table_tennis_player_card(
+        player_id=player_id,
+        page_upcoming=p_up,
+        page_finished=p_fin,
+        page_size=ps,
+        user=user,
+        session=session,
+    )
+    if not player_data.get("player"):
+        return player_data
+
+    analytics_locked = not access["can_see_forecasts"]
+    if analytics_locked:
+        player_data["forecast_locked"] = True
+        player_data["forecast_locked_message"] = FORECAST_LOCKED_ANALYTICS
+        player_data["forecast_purchase_url"] = DASHBOARD_PURCHASE_URL
+        player_data["stats"] = None
+        for group_key in ("upcoming_matches", "finished_matches"):
+            for item in (player_data.get(group_key) or []):
+                if isinstance(item, dict):
+                    item.pop("forecast_v2", None)
+        player_data["v2_channel"] = channel
+        player_data["now"] = int(now.timestamp())
+        return player_data
+
+    upcoming_items = player_data.get("upcoming_matches") or []
+    finished_items = player_data.get("finished_matches") or []
+    event_ids = [
+        str(item.get("id"))
+        for item in (upcoming_items + finished_items)
+        if isinstance(item, dict) and item.get("id")
+    ]
+    forecast_rows = (
+        await session.execute(
+            select(TableTennisForecastV2)
+            .where(
+                and_(
+                    TableTennisForecastV2.event_id.in_(event_ids or ["-1"]),
+                    TableTennisForecastV2.channel == channel,
+                )
+            )
+            .order_by(TableTennisForecastV2.created_at.desc())
+        )
+    ).scalars().all()
+    forecasts_by_event: dict[str, dict] = {}
+    for fc in forecast_rows:
+        forecasts_by_event.setdefault(fc.event_id, {
+            "forecast_text": fc.forecast_text,
+            "status": fc.status,
+            "odds_used": float(fc.odds_used) if fc.odds_used is not None else None,
+            "probability_pct": float(fc.probability_pct) if fc.probability_pct is not None else None,
+        })
+
+    for group_key in ("upcoming_matches", "finished_matches"):
+        group_items = player_data.get(group_key) or []
+        for item in group_items:
+            if isinstance(item, dict):
+                item["forecast_v2"] = forecasts_by_event.get(str(item.get("id")))
+
+    player_data["v2_channel"] = channel
+    player_data["now"] = int(now.timestamp())
+    return player_data
+
+
+@router.get("/v2/debug/kpi")
+async def get_table_tennis_v2_kpi_debug(recompute: bool = False):
+    state = await run_kpi_guard_once() if recompute else get_kpi_runtime_state()
+    return {"kpi": state}
+
+
+@router.post("/v2/debug/run-once")
+async def run_table_tennis_v2_once(
+    run_features: bool = True,
+    run_forecast: bool = True,
+    run_results: bool = True,
+):
+    features = await rebuild_features_once() if run_features else 0
+    forecasts = await run_forecast_v2_once() if run_forecast else 0
+    resolved = await run_result_priority_once() if run_results else 0
+    kpi = await run_kpi_guard_once()
+    validation = await run_validation_checks_once()
+    return {
+        "features_rebuilt": features,
+        "forecasts_created_or_updated": forecasts,
+        "resolved_outcomes": resolved,
+        "kpi": kpi,
+        "validation": validation,
+    }
+
+
+@router.get("/v2/debug/validate")
+async def get_table_tennis_v2_validation():
+    return await run_validation_checks_once()
+
+
+@router.post("/v2/debug/notifications/run-once")
+async def run_table_tennis_notifications_once():
+    return await dispatch_forecast_notifications_once()
+
+
+@router.post("/v2/debug/channel-dispatch/run-once")
+async def run_table_tennis_channel_dispatch_once():
+    return await dispatch_channel_notifications_once()
 
 
 @router.get("/players")
@@ -617,6 +1299,7 @@ async def get_table_tennis_players(
     page: int = 1,
     page_size: int = 30,
     q: str = "",
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
     """Пагинированный список игроков с базовой статистикой."""
@@ -702,6 +1385,7 @@ async def get_table_tennis_leagues(
     page: int = 1,
     page_size: int = 30,
     q: str = "",
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
     """Пагинированный список лиг с базовой статистикой."""
@@ -755,7 +1439,12 @@ async def get_table_tennis_leagues(
 
 
 @router.get("/matches/{match_id}")
-async def get_table_tennis_match_card(match_id: str, session: AsyncSession = Depends(get_async_session)):
+async def get_table_tennis_match_card(
+    match_id: str,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Legacy match card. Prefer /v2/matches/{id} which has subscription gating."""
     result = await session.execute(
         select(TableTennisLineEvent).where(TableTennisLineEvent.id == str(match_id))
     )
@@ -848,6 +1537,20 @@ async def get_table_tennis_match_card(match_id: str, session: AsyncSession = Dep
     home_strengths, home_weaknesses = build_strengths_weaknesses(detailed_home)
     away_strengths, away_weaknesses = build_strengths_weaknesses(detailed_away)
 
+    access = await get_subscription_access(user.id, session)
+    if not access["can_see_forecasts"]:
+        return {
+            "match": _event_to_dict(match),
+            "home_stats": None,
+            "away_stats": None,
+            "forecast": FORECAST_LOCKED_ANALYTICS,
+            "forecast_confidence": None,
+            "analytics": None,
+            "forecast_locked": True,
+            "forecast_locked_message": FORECAST_LOCKED_ANALYTICS,
+            "forecast_purchase_url": DASHBOARD_PURCHASE_URL,
+        }
+
     return {
         "match": _event_to_dict(match),
         "home_stats": home_stats,
@@ -865,12 +1568,21 @@ async def get_table_tennis_match_card(match_id: str, session: AsyncSession = Dep
     }
 
 
+def _event_to_dict_safe(r: TableTennisLineEvent, hide_forecast: bool = False) -> dict:
+    d = _event_to_dict(r)
+    if hide_forecast:
+        d["forecast"] = None
+        d["forecast_confidence"] = None
+    return d
+
+
 @router.get("/players/{player_id}/card")
 async def get_table_tennis_player_card(
     player_id: str,
     page_upcoming: int = 1,
     page_finished: int = 1,
     page_size: int = 20,
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
     now = datetime.now(timezone.utc)
@@ -926,12 +1638,14 @@ async def get_table_tennis_player_card(
         .limit(ps)
         .offset(offset_fin)
     )
-    upcoming = [_event_to_dict(r) for r in list(upcoming_rows_result.scalars().all())]
-    finished = [_event_to_dict(r) for r in list(finished_rows_result.scalars().all())]
+    access = await get_subscription_access(user.id, session)
+    hide_forecast = not access["can_see_forecasts"]
+    upcoming = [_event_to_dict_safe(r, hide_forecast) for r in list(upcoming_rows_result.scalars().all())]
+    finished = [_event_to_dict_safe(r, hide_forecast) for r in list(finished_rows_result.scalars().all())]
 
-    return {
+    resp: dict = {
         "player": {"id": str(player_id), "name": player_name or "Игрок"},
-        "stats": _build_player_stats(str(player_id), rows, now),
+        "stats": _build_player_stats(str(player_id), rows, now) if access["can_see_forecasts"] else None,
         "upcoming_matches": upcoming,
         "finished_matches": finished,
         "pagination": {
@@ -939,6 +1653,11 @@ async def get_table_tennis_player_card(
             "finished": {"page": p_fin, "page_size": ps, "total": total_finished},
         },
     }
+    if hide_forecast:
+        resp["forecast_locked"] = True
+        resp["forecast_locked_message"] = FORECAST_LOCKED_ANALYTICS
+        resp["forecast_purchase_url"] = DASHBOARD_PURCHASE_URL
+    return resp
 
 
 @router.get("/leagues/{league_id}/card")
@@ -949,6 +1668,7 @@ async def get_table_tennis_league_card(
     page_size: int = 20,
     date_from: str = "",
     date_to: str = "",
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
     now = datetime.now(timezone.utc)
@@ -1012,10 +1732,12 @@ async def get_table_tennis_league_card(
         .limit(ps)
         .offset(offset_fin)
     )
-    upcoming = [_event_to_dict(r) for r in list(upcoming_rows_result.scalars().all())]
-    finished = [_event_to_dict(r) for r in list(finished_rows_result.scalars().all())]
+    access = await get_subscription_access(user.id, session)
+    hide_forecast = not access["can_see_forecasts"]
+    upcoming = [_event_to_dict_safe(r, hide_forecast) for r in list(upcoming_rows_result.scalars().all())]
+    finished = [_event_to_dict_safe(r, hide_forecast) for r in list(finished_rows_result.scalars().all())]
 
-    return {
+    resp: dict = {
         "league": {"id": str(league_id), "name": league_name},
         "stats": {
             "upcoming_matches": total_upcoming,
@@ -1033,9 +1755,14 @@ async def get_table_tennis_league_card(
             "date_to": date_to or None,
         },
     }
+    if hide_forecast:
+        resp["forecast_locked"] = True
+        resp["forecast_locked_message"] = FORECAST_LOCKED_ANALYTICS
+        resp["forecast_purchase_url"] = DASHBOARD_PURCHASE_URL
+    return resp
 
 
-async def _line_sse_generator():
+async def _line_sse_generator(user: User):
     """Генератор SSE: периодически отправляет актуальную линию (статусы, коэфы, новые матчи)."""
     interval = max(5, getattr(settings, "line_sse_interval_sec", 5))
     try:
@@ -1049,41 +1776,69 @@ async def _line_sse_generator():
                     .order_by(TableTennisLineEvent.starts_at)
                 )
                 rows = list(result.scalars().all())
-            payload = _build_line_response(rows)
+                access = await get_subscription_access(user.id, session)
+                if not access["can_see_forecasts"]:
+                    forecast_map = None
+                    forecast_placeholder = FORECAST_LOCKED_ANALYTICS
+                    forecast_locked = True
+                    forecast_purchase_url = DASHBOARD_PURCHASE_URL
+                else:
+                    ch = access["forecast_channel"] or "paid"
+                    if access["only_resolved"]:
+                        forecast_map = await _load_v2_forecast_map_resolved_only(session, [str(r.id) for r in rows], channel=ch)
+                    else:
+                        forecast_map = await _load_v2_forecast_map(session, [str(r.id) for r in rows], channel=ch)
+                    forecast_placeholder = None
+                    forecast_locked = False
+                    forecast_purchase_url = None
+            payload = _build_line_response(rows, forecast_map=forecast_map)
+            if forecast_locked:
+                for ev in payload.get("events", []):
+                    ev["forecast"] = forecast_placeholder
+                payload["forecast_locked"] = True
+                payload["forecast_locked_message"] = forecast_placeholder
+                payload["forecast_purchase_url"] = forecast_purchase_url
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         pass
 
 
-async def _forecasts_sse_generator(channel: str = "paid"):
-    """SSE: периодически отдаёт агрегированную статистику и список прогнозов для указанного канала."""
-    interval = max(10, getattr(settings, "line_sse_interval_sec", 5))
+async def _forecasts_v2_sse_generator(
+    user: User,
+    channel: str = "paid",
+    quality_tier: str = "",
+):
+    """SSE for V2 forecasts and stats."""
+    interval = max(5, int(getattr(settings, "line_sse_interval_sec", 5)))
     try:
         while True:
             async with async_session_maker() as session:
-                # Статистика
-                stats = await get_table_tennis_forecasts_stats(
+                stats = await get_table_tennis_forecasts_v2_stats(
                     date_from="",
                     date_to="",
                     league_id="",
                     channel=channel,
+                    quality_tier=quality_tier,
+                    user=user,
                     session=session,
                 )
-                # Полный список прогнозов для канала (page=0 → без пагинации)
-                forecasts = await get_table_tennis_forecasts(
+                forecasts = await get_table_tennis_forecasts_v2(
                     page=0,
-                    page_size=200,
+                    page_size=500,
                     status="",
                     league_id="",
                     date_from="",
                     date_to="",
                     channel=channel,
+                    quality_tier=quality_tier,
+                    user=user,
                     session=session,
                 )
             payload = {
                 "stats": stats,
                 "forecasts": forecasts,
+                "updated_at": int(datetime.now(timezone.utc).timestamp()),
             }
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(interval)
@@ -1092,10 +1847,10 @@ async def _forecasts_sse_generator(channel: str = "paid"):
 
 
 @router.get("/line/stream")
-async def stream_table_tennis_line():
+async def stream_table_tennis_line(user: User = Depends(get_current_user)):
     """SSE-поток линии: обновление статусов, коэфов и списка матчей без перезагрузки страницы."""
     return StreamingResponse(
-        _line_sse_generator(),
+        _line_sse_generator(user),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -1105,11 +1860,14 @@ async def stream_table_tennis_line():
     )
 
 
-@router.get("/forecasts/stream")
-async def stream_table_tennis_forecasts(channel: str = "paid"):
-    """SSE-поток статистики прогнозов (для страницы аналитики)."""
+@router.get("/v2/forecasts/stream")
+async def stream_table_tennis_forecasts_v2(
+    channel: str = "paid",
+    quality_tier: str = "",
+    user: User = Depends(get_current_user),
+):
     return StreamingResponse(
-        _forecasts_sse_generator(channel=channel),
+        _forecasts_v2_sse_generator(user=user, channel=channel, quality_tier=quality_tier),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -1118,7 +1876,7 @@ async def stream_table_tennis_forecasts(channel: str = "paid"):
         },
     )
 
-async def _live_sse_generator():
+async def _live_sse_generator(user: User):
     """SSE: периодически отдаёт актуальный список лайв-матчей (live + свежие finished)."""
     interval = max(5, getattr(settings, "line_sse_interval_sec", 5))
     try:
@@ -1156,7 +1914,28 @@ async def _live_sse_generator():
                     .order_by(TableTennisLineEvent.starts_at)
                 )
                 rows = list(result.scalars().all())
-            payload = _build_live_response(rows)
+                access = await get_subscription_access(user.id, session)
+                if not access["can_see_forecasts"]:
+                    forecast_map = None
+                    forecast_placeholder = FORECAST_LOCKED_ANALYTICS
+                    forecast_locked = True
+                    forecast_purchase_url = DASHBOARD_PURCHASE_URL
+                else:
+                    ch = access["forecast_channel"] or "paid"
+                    if access["only_resolved"]:
+                        forecast_map = await _load_v2_forecast_map_resolved_only(session, [str(r.id) for r in rows], channel=ch)
+                    else:
+                        forecast_map = await _load_v2_forecast_map(session, [str(r.id) for r in rows], channel=ch)
+                    forecast_placeholder = None
+                    forecast_locked = False
+                    forecast_purchase_url = None
+            payload = _build_live_response(rows, forecast_map=forecast_map)
+            if forecast_locked:
+                for ev in payload.get("events", []):
+                    ev["forecast"] = forecast_placeholder
+                payload["forecast_locked"] = True
+                payload["forecast_locked_message"] = forecast_placeholder
+                payload["forecast_purchase_url"] = forecast_purchase_url
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
@@ -1164,10 +1943,10 @@ async def _live_sse_generator():
 
 
 @router.get("/live/stream")
-async def stream_table_tennis_live():
+async def stream_table_tennis_live(user: User = Depends(get_current_user)):
     """SSE-поток лайва: обновление статусов, коэфов и счёта без перезагрузки страницы."""
     return StreamingResponse(
-        _live_sse_generator(),
+        _live_sse_generator(user),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",

@@ -24,7 +24,8 @@ from app.models.table_tennis_line_event import (
     LINE_EVENT_STATUS_LIVE,
     LINE_EVENT_STATUS_POSTPONED,
 )
-from app.models.table_tennis_forecast import TableTennisForecast
+from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
+from app.config import settings
 
 
 # Пороги и требования — как в старом проекте, но чуть мягче по матчам.
@@ -435,6 +436,9 @@ def _evaluate_forecast_outcome(
             a = int(str(s.get("away") or "0"))
         except ValueError:
             return None
+        # Сет считаем завершённым только по правилам настольного тенниса.
+        if not (max(h, a) >= 11 and abs(h - a) >= 2):
+            return None
         if h == a:
             return None
         return "home" if h > a else "away"
@@ -468,17 +472,46 @@ def _evaluate_forecast_outcome(
     return "no_result"
 
 
+def _is_match_forecast_text(value: str | None) -> bool:
+    return "победа в матче" in (value or "").lower()
+
+
+def _has_in_progress_set_fragment(scores: dict | None) -> bool:
+    if not isinstance(scores, dict):
+        return False
+    for _, s in scores.items():
+        if not isinstance(s, dict):
+            continue
+        try:
+            h = int(str(s.get("home") or "0"))
+            a = int(str(s.get("away") or "0"))
+        except ValueError:
+            continue
+        if h == 0 and a == 0:
+            continue
+        if not (max(h, a) >= 11 and abs(h - a) >= 2):
+            return True
+    return False
+
+
+def _cancelled_grace_elapsed(event: TableTennisLineEvent, now: datetime) -> bool:
+    if event.starts_at is None:
+        return True
+    from datetime import timedelta
+    return now >= (event.starts_at + timedelta(hours=2))
+
+
 async def update_forecast_outcome_for_event(
     session: AsyncSession,
     event: TableTennisLineEvent,
 ) -> None:
-    """Обновляет статус прогноза в таблице table_tennis_forecasts для данного события."""
+    """Обновляет статус V2-прогнозов для данного события."""
     if not event.id:
         return
     result = await session.execute(
-        select(TableTennisForecast).where(
-            TableTennisForecast.event_id == event.id,
-            TableTennisForecast.status.in_(["pending", "cancelled", "no_result"]),
+        select(TableTennisForecastV2).where(
+            TableTennisForecastV2.event_id == event.id,
+            TableTennisForecastV2.status.in_(["pending", "cancelled", "no_result", "hit", "miss"]),
         )
     )
     rows = list(result.scalars().all())
@@ -486,6 +519,14 @@ async def update_forecast_outcome_for_event(
         return
 
     now = datetime.now(timezone.utc)
+    hs, as_ = _parse_sets_score(event.live_sets_score)
+    has_decisive_sets_winner = hs is not None and as_ is not None and hs != as_
+    required_wins = max(1, int(getattr(settings, "table_tennis_match_sets_to_win", 3)))
+    score_final = (
+        has_decisive_sets_winner
+        and max(hs or 0, as_ or 0) >= required_wins
+        and not _has_in_progress_set_fragment(event.live_score)
+    )
 
     # Если матч "ожил" (scheduled/live/postponed) после ошибочного cancelled/no_result,
     # возвращаем прогноз в pending.
@@ -495,40 +536,71 @@ async def update_forecast_outcome_for_event(
         LINE_EVENT_STATUS_POSTPONED,
     }:
         for row in rows:
-            if row.status in {"cancelled", "no_result"}:
+            if row.status in {"cancelled", "no_result"} or (
+                _is_match_forecast_text(row.forecast_text) and row.status in {"hit", "miss"}
+            ):
                 row.status = "pending"
                 row.resolved_at = None
                 row.final_status = None
                 row.final_sets_score = None
+            elif row.status in {"hit", "miss"} and row.forecast_text:
+                outcome_preview = _evaluate_forecast_outcome(event, row.forecast_text)
+                if outcome_preview == "no_result":
+                    row.status = "pending"
+                    row.resolved_at = None
+                    row.final_status = None
+                    row.final_sets_score = None
 
-    if event.status == LINE_EVENT_STATUS_CANCELLED:
+    # Если матч помечен cancelled, но по сетам уже есть явный победитель,
+    # считаем его завершённым для целей прогноза (BetsAPI иногда запаздывает по status).
+    if event.status == LINE_EVENT_STATUS_CANCELLED and not score_final:
+        if not _cancelled_grace_elapsed(event, now):
+            for row in rows:
+                # Keep all forecasts pending during grace window.
+                if row.status in {"cancelled", "no_result", "hit", "miss"}:
+                    row.status = "pending"
+                    row.resolved_at = None
+                    row.final_status = None
+                    row.final_sets_score = None
+            return
         for row in rows:
-            row.status = "cancelled"
-            row.resolved_at = now
-            row.final_status = event.status
-            row.final_sets_score = event.live_sets_score
+            if _is_match_forecast_text(row.forecast_text):
+                row.status = "pending"
+                row.resolved_at = None
+                row.final_status = None
+                row.final_sets_score = None
+            else:
+                row.status = "cancelled"
+                row.resolved_at = now
+                row.final_status = event.status
+                row.final_sets_score = event.live_sets_score
         return
 
     # В реальных данных BetsAPI статус иногда запаздывает, но по live_sets_score уже есть победитель.
     # Тогда считаем матч завершённым для расчёта исхода прогноза.
     effective_status = event.status
     if event.status != LINE_EVENT_STATUS_FINISHED:
-        h, a = _parse_sets_score(event.live_sets_score)
-        if h is None or a is None or h == a:
+        if not has_decisive_sets_winner:
             return
         effective_status = LINE_EVENT_STATUS_FINISHED
 
-    if not event.forecast:
-        for row in rows:
-            row.status = "no_result"
-            row.resolved_at = now
-            row.final_status = effective_status
-            row.final_sets_score = event.live_sets_score
-        return
-
-    outcome = _evaluate_forecast_outcome(event, event.forecast)
     for row in rows:
-        row.status = outcome
+        if _is_match_forecast_text(row.forecast_text):
+            can_resolve_match = (
+                event.status in {LINE_EVENT_STATUS_FINISHED, LINE_EVENT_STATUS_CANCELLED}
+                and score_final
+            )
+            if not can_resolve_match:
+                if row.status in {"hit", "miss", "cancelled", "no_result"}:
+                    row.status = "pending"
+                    row.resolved_at = None
+                    row.final_status = None
+                    row.final_sets_score = None
+                continue
+        if not row.forecast_text:
+            row.status = "no_result"
+        else:
+            row.status = _evaluate_forecast_outcome(event, row.forecast_text)
         row.resolved_at = now
         row.final_status = effective_status
         row.final_sets_score = event.live_sets_score

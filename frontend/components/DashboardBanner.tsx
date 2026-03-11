@@ -47,9 +47,9 @@ export function DashboardBanner() {
   if (!showTelegramBanner && !showEmailBanner) return null;
 
   return (
-    <div className="space-y-2 px-6 pt-4">
+    <div className="space-y-2 px-4 md:px-6 pt-4">
       {showTelegramBanner && (
-        <div className="flex items-center gap-3 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-4 py-3 text-cyan-200">
+        <div className="flex items-center gap-3 rounded-lg border border-sky-500/35 bg-gradient-to-r from-sky-500/15 to-blue-500/10 px-4 py-3 text-sky-200">
           <p className="flex-1 text-sm">
             Привяжите Telegram для получения уведомлений в личные сообщения.{" "}
             <Link href="/dashboard/settings" className="font-medium underline hover:no-underline">
@@ -59,7 +59,7 @@ export function DashboardBanner() {
           <button
             type="button"
             onClick={dismissTelegram}
-            className="shrink-0 rounded p-1 text-cyan-400 hover:bg-cyan-500/20 hover:text-white"
+            className="shrink-0 rounded p-1 text-sky-400 hover:bg-sky-500/20 hover:text-white"
             aria-label="Закрыть"
           >
             ✕
@@ -67,7 +67,7 @@ export function DashboardBanner() {
         </div>
       )}
       {showEmailBanner && (
-        <div className="flex items-center gap-3 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-4 py-3 text-cyan-200">
+        <div className="flex items-center gap-3 rounded-lg border border-sky-500/35 bg-gradient-to-r from-sky-500/15 to-blue-500/10 px-4 py-3 text-sky-200">
           <p className="flex-1 text-sm">
             Привяжите почту для получения уведомлений на email.{" "}
             <Link href="/dashboard/settings" className="font-medium underline hover:no-underline">
@@ -77,7 +77,7 @@ export function DashboardBanner() {
           <button
             type="button"
             onClick={dismissEmail}
-            className="shrink-0 rounded p-1 text-cyan-400 hover:bg-cyan-500/20 hover:text-white"
+            className="shrink-0 rounded p-1 text-sky-400 hover:bg-sky-500/20 hover:text-white"
             aria-label="Закрыть"
           >
             ✕

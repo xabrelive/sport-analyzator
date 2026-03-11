@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { getTableTennisPlayerCardPaged, type TableTennisPlayerCard } from "@/lib/api";
+import { getTableTennisPlayerCardV2, type TableTennisPlayerCard } from "@/lib/api";
 
 function formatDateTime(ts: number | undefined): string {
   if (ts == null) return "—";
@@ -21,6 +21,34 @@ function formatDateTime(ts: number | undefined): string {
   }
 }
 
+function cleanForecastText(value: string | null | undefined): string {
+  const text = (value || "").trim();
+  if (!text) return "Недостаточно данных для расчёта";
+  return text
+    .replace(/\s*\(\d+(?:[.,]\d+)?%\)/g, "")
+    .replace(/%/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function formatForecastStatus(status: string | undefined): string {
+  if (!status) return "—";
+  if (status === "hit") return "Угадан";
+  if (status === "miss") return "Не угадан";
+  if (status === "pending") return "Ожидает";
+  if (status === "cancelled") return "Отменён";
+  if (status === "no_result") return "Нет данных";
+  return status;
+}
+
+function forecastStatusClass(status: string | undefined): string {
+  if (status === "hit") return "text-emerald-400";
+  if (status === "miss") return "text-rose-400";
+  if (status === "pending") return "text-sky-300";
+  if (status === "cancelled" || status === "no_result") return "text-amber-300";
+  return "text-slate-300";
+}
+
 export default function TableTennisPlayerPage() {
   const params = useParams();
   const id = typeof params.id === "string" ? params.id : "";
@@ -36,7 +64,7 @@ export default function TableTennisPlayerPage() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    getTableTennisPlayerCardPaged(id, upcomingPage, finishedPage, pageSize)
+    getTableTennisPlayerCardV2(id, "paid", upcomingPage, finishedPage, pageSize)
       .then((res) => {
         if (!cancelled) setCard(res);
       })
@@ -54,6 +82,9 @@ export default function TableTennisPlayerPage() {
   if (loading) return <div className="p-6 md:p-8"><p className="text-slate-400">Загрузка…</p></div>;
   if (error) return <div className="p-6 md:p-8"><p className="text-rose-400">{error}</p></div>;
 
+  const analyticsLocked = (card as { forecast_locked?: boolean })?.forecast_locked ?? false;
+  const forecastPurchaseUrl = (card as { forecast_purchase_url?: string })?.forecast_purchase_url;
+
   return (
     <div className="p-6 md:p-8 space-y-8">
       <div>
@@ -63,6 +94,15 @@ export default function TableTennisPlayerPage() {
         <h1 className="font-display text-2xl font-bold text-white">{card?.player?.name || "Игрок"}</h1>
       </div>
 
+      {analyticsLocked && forecastPurchaseUrl && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3">
+          <Link href={forecastPurchaseUrl} className="text-amber-200 hover:text-amber-100 font-medium">
+            Для просмотра аналитики и статистики приобретите подписку на аналитику
+          </Link>
+        </div>
+      )}
+
+      {!analyticsLocked && (
       <section>
         <h2 className="text-lg font-semibold text-white mb-3 border-b border-slate-700 pb-2">Статистика игрока</h2>
         <div className="flex flex-wrap gap-4">
@@ -73,6 +113,7 @@ export default function TableTennisPlayerPage() {
           <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3"><span className="text-slate-400 text-sm">Предстоящие</span><p className="text-xl font-semibold text-white">{card?.stats?.upcoming_matches ?? 0}</p></div>
         </div>
       </section>
+      )}
 
       <section>
         <h2 className="text-lg font-semibold text-white mb-3 border-b border-slate-700 pb-2">Предстоящие матчи</h2>
@@ -99,6 +140,11 @@ export default function TableTennisPlayerPage() {
                       {formatDateTime(ev.time)}
                     </Link>
                   </span>
+                  {!analyticsLocked && (ev as { forecast_v2?: { forecast_text?: string } }).forecast_v2?.forecast_text ? (
+                    <span className="text-emerald-300 text-xs">
+                      {cleanForecastText((ev as { forecast_v2?: { forecast_text?: string } }).forecast_v2?.forecast_text)}
+                    </span>
+                  ) : null}
                   <Link href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`} className="text-emerald-300 hover:text-emerald-200">Карточка матча</Link>
                 </li>
               ))}
@@ -168,6 +214,11 @@ export default function TableTennisPlayerPage() {
                       {formatDateTime(ev.time)}
                     </Link>
                   </span>
+                  {!analyticsLocked && (ev as { forecast_v2?: { status?: string } }).forecast_v2?.status ? (
+                    <span className={`text-xs font-medium ${forecastStatusClass((ev as { forecast_v2?: { status?: string } }).forecast_v2?.status)}`}>
+                      {formatForecastStatus((ev as { forecast_v2?: { status?: string } }).forecast_v2?.status)}
+                    </span>
+                  ) : null}
                   <Link href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`} className="text-emerald-300 hover:text-emerald-200">Карточка матча</Link>
                 </li>
               ))}

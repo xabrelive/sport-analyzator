@@ -83,3 +83,31 @@ body {
 .gradient-text {
   @apply bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 via-cyan-300 to-cyan-500;
 }
+
+/* Dashboard visual system: blue gradient accents */
+.dashboard-theme a {
+  transition: color 160ms ease, border-color 160ms ease, background-color 160ms ease;
+}
+
+/* Make clickable elements obvious across dashboard pages */
+.dashboard-theme main a {
+  cursor: pointer;
+}
+
+.dashboard-theme main a[class*="hover:text"] {
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  text-decoration-color: rgba(125, 211, 252, 0.45);
+}
+
+.dashboard-theme main a[class*="hover:text"]:hover {
+  text-decoration-color: rgba(186, 230, 253, 0.9);
+}
+
+.dashboard-theme main a:focus-visible {
+  outline: 2px solid rgba(125, 211, 252, 0.7);
+  outline-offset: 2px;
+  border-radius: 0.35rem;
+}

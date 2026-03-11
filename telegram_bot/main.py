@@ -1,6 +1,6 @@
 """
 PingWin Telegram Bot.
-Меню: получить код для регистрации (10 мин), получить информацию.
+Меню: код для регистрации и авторизации, привязать аккаунт, получить информацию.
 """
 import asyncio
 import logging
@@ -25,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Тексты кнопок меню (должны совпадать с клавиатурой)
-BTN_GET_CODE = "Получить код для регистрации (10 мин)"
+BTN_GET_CODE = "Код для регистрации и авторизации"
 BTN_GET_INFO = "Получить информацию"
 BTN_LINK_ACCOUNT = "Привязать аккаунт"
 
@@ -85,7 +85,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
     await update.message.reply_text(
-        f"Привет! Я бот {TELEGRAM_BOT_USERNAME}. Выберите действие в меню ниже или используйте команды.",
+        "Привет! Я бот аналитики PingWin (pingwin.pro).\n\n"
+        f"Выберите действие в меню ниже или используйте команды.",
         reply_markup=MENU_KEYBOARD,
     )
 
@@ -114,14 +115,29 @@ async def cmd_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+async def fetch_bot_info_message() -> str:
+    """Запросить сообщение «Получить информацию» с бэкенда."""
+    url = f"{BACKEND_URL}/api/v1/auth/telegram/bot-info"
+    headers = {"Content-Type": "application/json", "X-Bot-Token": TELEGRAM_BOT_TOKEN}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code == 200:
+            data = r.json()
+            msg = (data.get("message") or "").strip()
+            if msg:
+                return msg
+    except Exception as e:
+        logger.warning("Failed to fetch bot info: %s", e)
+    return "Здесь будет информация о сервисе PingWin."
+
+
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Пункт «Получить информацию» — пока заглушка."""
+    """Пункт «Получить информацию» — сообщение из админки."""
     if not update.message:
         return
-    await update.message.reply_text(
-        "Здесь будет информация о сервисе PingWin.",
-        reply_markup=MENU_KEYBOARD,
-    )
+    text = await fetch_bot_info_message()
+    await update.message.reply_text(text, reply_markup=MENU_KEYBOARD)
 
 
 async def cmd_link_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -191,7 +207,7 @@ async def post_init(app: Application) -> None:
     """Установка списка команд в меню бота (кнопка «/» в чате)."""
     await app.bot.set_my_commands([
         BotCommand("start", "Старт / меню"),
-        BotCommand("code", "Получить код для регистрации (10 мин)"),
+        BotCommand("code", "Код для регистрации и авторизации"),
         BotCommand("link", "Привязать аккаунт по коду с сайта"),
         BotCommand("info", "Получить информацию"),
     ])

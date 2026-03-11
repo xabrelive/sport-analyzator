@@ -38,6 +38,8 @@ export default function DashboardSettingsPage() {
   // Quiet hours
   const [quietStart, setQuietStart] = useState("");
   const [quietEnd, setQuietEnd] = useState("");
+  const [notifyTelegram, setNotifyTelegram] = useState(true);
+  const [notifyEmail, setNotifyEmail] = useState(true);
   const [quietLoading, setQuietLoading] = useState(false);
 
   useEffect(() => {
@@ -48,6 +50,8 @@ export default function DashboardSettingsPage() {
           setProfile(p);
           setQuietStart(p.quiet_hours_start ?? "");
           setQuietEnd(p.quiet_hours_end ?? "");
+          setNotifyTelegram(p.notify_telegram);
+          setNotifyEmail(p.notify_email);
         }
       })
       .catch((e) => !cancelled && setError(e.message))
@@ -146,11 +150,40 @@ export default function DashboardSettingsPage() {
       else data.quiet_hours_start = null;
       if (quietEnd.trim()) data.quiet_hours_end = quietEnd.trim();
       else data.quiet_hours_end = null;
+      data.notify_telegram = notifyTelegram;
+      data.notify_email = notifyEmail;
       const p = await patchMe(data);
       setProfile(p);
       setQuietStart(p.quiet_hours_start ?? "");
       setQuietEnd(p.quiet_hours_end ?? "");
+      setNotifyTelegram(p.notify_telegram);
+      setNotifyEmail(p.notify_email);
       setSuccess("Режим тишины сохранён.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ошибка");
+    } finally {
+      setQuietLoading(false);
+    }
+  }
+
+  async function handleSaveChannels(e: React.FormEvent) {
+    e.preventDefault();
+    setError("");
+    setSuccess("");
+    if (!notifyTelegram && !notifyEmail) {
+      setError("Выберите хотя бы один канал уведомлений, чтобы получать прогнозы.");
+      return;
+    }
+    setQuietLoading(true);
+    try {
+      const p = await patchMe({
+        notify_telegram: notifyTelegram,
+        notify_email: notifyEmail,
+      });
+      setProfile(p);
+      setNotifyTelegram(p.notify_telegram);
+      setNotifyEmail(p.notify_email);
+      setSuccess("Каналы уведомлений сохранены.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка");
     } finally {
@@ -179,6 +212,11 @@ export default function DashboardSettingsPage() {
       {success && (
         <div className="mb-4 p-3 rounded-lg bg-emerald-500/10 text-emerald-400 text-sm">
           {success}
+        </div>
+      )}
+      {profile && !profile.notify_telegram && !profile.notify_email && (
+        <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
+          Выберите хотя бы один канал уведомлений, чтобы получать прогнозы.
         </div>
       )}
 
@@ -306,6 +344,58 @@ export default function DashboardSettingsPage() {
               Уведомления приходят на почту аккаунта: {profile.email_masked}
             </p>
           )}
+        </section>
+
+        {/* Каналы уведомлений */}
+        <section className="rounded-xl border border-slate-700/80 bg-slate-800/40 p-6">
+          <h2 className="font-semibold text-white mb-2">Каналы уведомлений</h2>
+          <p className="text-slate-400 text-sm mb-4">
+            Выберите, куда отправлять прогнозы: в Telegram, на email или в оба канала.
+          </p>
+          <form onSubmit={handleSaveChannels} className="space-y-4">
+            <div className="grid gap-3">
+              <label className="flex items-start gap-3 rounded-lg border border-slate-700 bg-slate-900/40 px-3 py-2.5">
+                <input
+                  type="checkbox"
+                  checked={notifyTelegram}
+                  onChange={(e) => setNotifyTelegram(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-800"
+                />
+                <span>
+                  <span className="block text-sm font-medium text-slate-100">Telegram</span>
+                  <span className="block text-xs text-slate-400">
+                    Уведомления в личные сообщения привязанного аккаунта.
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-start gap-3 rounded-lg border border-slate-700 bg-slate-900/40 px-3 py-2.5">
+                <input
+                  type="checkbox"
+                  checked={notifyEmail}
+                  onChange={(e) => setNotifyEmail(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-800"
+                />
+                <span>
+                  <span className="block text-sm font-medium text-slate-100">Email</span>
+                  <span className="block text-xs text-slate-400">
+                    Уведомления на привязанную почту аккаунта.
+                  </span>
+                </span>
+              </label>
+            </div>
+            {!notifyTelegram && !notifyEmail && (
+              <p className="text-xs text-amber-300">
+                Сейчас каналы выключены. Выберите хотя бы один, чтобы получать прогнозы.
+              </p>
+            )}
+            <button
+              type="submit"
+              disabled={quietLoading}
+              className="rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500 disabled:opacity-50"
+            >
+              {quietLoading ? "Сохранение…" : "Сохранить каналы"}
+            </button>
+          </form>
         </section>
 
         {/* Режим тишины */}

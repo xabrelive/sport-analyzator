@@ -51,6 +51,21 @@ class Settings(BaseSettings):
     betsapi_table_tennis_forecast_delay_minutes: int = 5
     # Минимальный коэффициент на исход прогноза (для выбранной стороны), ниже — прогноз не даём
     betsapi_table_tennis_min_odds_for_forecast: float = 1.4
+    # V2 loops and KPI targets
+    betsapi_table_tennis_v2_features_interval_sec: int = 300
+    betsapi_table_tennis_v2_forecast_interval_sec: int = 60
+    betsapi_table_tennis_v2_result_priority_interval_sec: int = 20
+    betsapi_table_tennis_v2_kpi_guard_interval_sec: int = 60
+    betsapi_table_tennis_v2_forecast_batch_size: int = 400
+    betsapi_table_tennis_v2_target_hit_rate: float = 85.0
+    betsapi_table_tennis_v2_target_picks_per_day: int = 300
+    betsapi_table_tennis_v2_min_confidence_floor: float = 68.0
+    betsapi_table_tennis_v2_min_confidence_ceiling: float = 88.0
+    betsapi_table_tennis_v2_base_min_confidence: float = 74.0
+    betsapi_table_tennis_v2_min_edge_floor: float = 2.0
+    betsapi_table_tennis_v2_min_edge_ceiling: float = 8.0
+    betsapi_table_tennis_v2_base_min_edge: float = 3.0
+    table_tennis_match_sets_to_win: int = 3
 
     # Очередь и воркеры линии (масштабирование при росте объёма данных)
     line_queue_maxsize: int = 32  # макс. батчей в очереди (при переполнении продюсер ждёт)
@@ -69,6 +84,20 @@ class Settings(BaseSettings):
     # Telegram Bot
     telegram_bot_token: str = ""
     telegram_bot_username: str = ""
+    telegram_signals_free_chat_id: str = ""
+    telegram_signals_vip_chat_id: str = ""
+    telegram_signals_vip_public_url: str = ""
+    telegram_channels_loop_interval_sec: int = 60
+    telegram_urgent_lead_minutes: int = 30
+    telegram_free_window_start_hour: int = 9
+    telegram_free_window_end_hour: int = 19
+    telegram_free_daily_posts: int = 3
+    telegram_free_min_lead_minutes: int = 60
+    telegram_vip_hourly_min: int = 3
+    telegram_vip_hourly_max: int = 4
+    vip_access_check_interval_sec: int = 600
+    notifications_batch_interval_minutes: int = 30
+    notifications_loop_interval_sec: int = 60
 
     @property
     def async_database_url(self) -> str:

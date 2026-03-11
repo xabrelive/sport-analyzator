@@ -2,20 +2,16 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import { Header } from "@/components/Header";
 import { Footer } from "@/components/Footer";
-import type { TelegramAuthPayload } from "@/lib/api";
-
-const TELEGRAM_BOT_USERNAME =
-  process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME || "";
 
 const TELEGRAM_BOT_LINK =
   process.env.NEXT_PUBLIC_TELEGRAM_BOT_LINK || "https://t.me/";
 
 function LoginContent() {
-  const { login, loginWithTelegram, loginByTelegramCode, saveToken } = useAuth();
+  const { login, loginByTelegramCode, saveToken } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
   const [email, setEmail] = useState("");
@@ -24,7 +20,6 @@ function LoginContent() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [telegramCodeLoading, setTelegramCodeLoading] = useState(false);
-  const telegramRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const token = searchParams.get("token");
@@ -40,40 +35,6 @@ function LoginContent() {
       router.replace("/dashboard");
     }
   }, [searchParams, saveToken, router]);
-
-  const handleTelegramAuth = useCallback(
-    async (data: TelegramAuthPayload) => {
-      setError("");
-      setLoading(true);
-      try {
-        await loginWithTelegram(data);
-        router.push("/dashboard");
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Ошибка входа через Telegram");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [loginWithTelegram, router]
-  );
-
-  useEffect(() => {
-    if (!TELEGRAM_BOT_USERNAME || !telegramRef.current || typeof window === "undefined") return;
-    const callbackName = "onTelegramAuthCallback";
-    (window as unknown as Record<string, (d: TelegramAuthPayload) => void>)[callbackName] = handleTelegramAuth;
-    const script = document.createElement("script");
-    script.src = "https://telegram.org/js/telegram-widget.js?22";
-    script.setAttribute("data-telegram-login", TELEGRAM_BOT_USERNAME);
-    script.setAttribute("data-size", "large");
-    script.setAttribute("data-onauth", callbackName);
-    script.setAttribute("data-request-access", "write");
-    script.async = true;
-    telegramRef.current.appendChild(script);
-    return () => {
-      delete (window as unknown as Record<string, unknown>)[callbackName];
-      if (telegramRef.current?.contains(script)) telegramRef.current.removeChild(script);
-    };
-  }, [handleTelegramAuth]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -196,20 +157,6 @@ function LoginContent() {
               Открыть бота в Telegram
             </a>
           </form>
-
-          {TELEGRAM_BOT_USERNAME && (
-            <>
-              <div className="my-4 flex items-center gap-3">
-                <span className="flex-1 h-px bg-slate-600" />
-                <span className="text-slate-500 text-xs">или виджет</span>
-                <span className="flex-1 h-px bg-slate-600" />
-              </div>
-              <div className="flex flex-col items-center gap-2">
-                <p className="text-slate-400 text-sm">Войти через Telegram (виджет)</p>
-                <div ref={telegramRef} />
-              </div>
-            </>
-          )}
 
           <p className="mt-6 text-center text-slate-400 text-sm">
             Нет аккаунта?{" "}

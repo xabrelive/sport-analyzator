@@ -1,0 +1,543 @@
+"""Dispatch forecasts to FREE and VIP Telegram channels."""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+from html import escape
+import logging
+import random
+
+import httpx
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import and_, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.db.session import async_session_maker
+from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
+from app.models.table_tennis_line_event import LINE_EVENT_STATUS_SCHEDULED, TableTennisLineEvent
+from app.models.telegram_channel_marker import TelegramChannelMarker
+from app.models.telegram_channel_notification import TelegramChannelNotification
+
+logger = logging.getLogger(__name__)
+CHANNEL_DISPATCHER_ADVISORY_LOCK_KEY = 910002
+
+CHANNEL_FREE = "free"
+CHANNEL_VIP = "vip"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _msk_now(now_utc: datetime | None = None) -> datetime:
+    base = now_utc or _utc_now()
+    return base.astimezone(timezone(timedelta(hours=3)))
+
+
+def _event_link(event_id: str) -> str:
+    return f"https://pingwin.pro/dashboard/table-tennis/matches/{event_id}"
+
+
+def _clean_forecast_text(text: str | None) -> str:
+    if not text:
+        return "Недостаточно данных для расчёта"
+    import re
+
+    return re.sub(r"\s*\(\d+(?:[.,]\d+)?%\)", "", text).replace("%", "").strip()
+
+
+def _countdown(starts_at: datetime, now: datetime) -> str:
+    seconds = int((starts_at - now).total_seconds())
+    if seconds <= 0:
+        return "матч уже начался"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"через {minutes} мин"
+    return f"через {minutes // 60} ч {minutes % 60} мин"
+
+
+def _chat_id(channel: str) -> int | None:
+    raw = settings.telegram_signals_free_chat_id if channel == CHANNEL_FREE else settings.telegram_signals_vip_chat_id
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _cancelled_grace_elapsed(event: TableTennisLineEvent | None, now: datetime) -> bool:
+    if event is None or event.starts_at is None:
+        return True
+    return now >= (event.starts_at + timedelta(hours=2))
+
+
+async def _send_telegram(chat_id: int, text: str, reply_to_message_id: int | None = None) -> int | None:
+    token = (settings.telegram_bot_token or "").strip()
+    if not token:
+        return None
+    payload: dict[str, object] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
+    if r.status_code != 200:
+        logger.warning("Channel telegram send failed: %s %s", r.status_code, r.text[:300])
+        return None
+    data = r.json()
+    if not data.get("ok"):
+        logger.warning("Channel telegram send not ok: %s", data)
+        return None
+    return int((data.get("result") or {}).get("message_id") or 0) or None
+
+
+def _build_event_text(event: TableTennisLineEvent, fc: TableTennisForecastV2, now: datetime) -> str:
+    starts = event.starts_at.astimezone(timezone.utc) if event.starts_at else now
+    odds_text = f"\nКф: {float(fc.odds_used):.2f}" if fc.odds_used is not None else ""
+    return (
+        f"🏆 {escape(event.league_name or '—')}\n"
+        f"{starts.strftime('%d.%m.%Y %H:%M UTC')}\n"
+        f"⏱ {_countdown(starts, now)}\n"
+        f"{escape(event.home_name or '—')} — {escape(event.away_name or '—')}"
+        f"{odds_text}\n"
+        f"Наш прогноз: {escape(_clean_forecast_text(fc.forecast_text))}\n"
+        f"Аналитика матча: <a href=\"{escape(_event_link(str(event.id)))}\">открыть</a>"
+    )
+
+
+async def _ensure_channel_forecast(session: AsyncSession, src: TableTennisForecastV2, channel: str) -> TableTennisForecastV2:
+    existing = (
+        await session.execute(
+            select(TableTennisForecastV2).where(
+                and_(
+                    TableTennisForecastV2.event_id == src.event_id,
+                    TableTennisForecastV2.channel == channel,
+                    TableTennisForecastV2.market == src.market,
+                )
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    row = TableTennisForecastV2(
+        event_id=src.event_id,
+        model_run_id=src.model_run_id,
+        channel=channel,
+        market=src.market,
+        pick_side=src.pick_side,
+        forecast_text=src.forecast_text,
+        probability_pct=src.probability_pct,
+        confidence_score=src.confidence_score,
+        edge_pct=src.edge_pct,
+        odds_used=src.odds_used,
+        status=src.status,
+        final_status=src.final_status,
+        final_sets_score=src.final_sets_score,
+        explanation_summary=src.explanation_summary,
+        created_at=_utc_now(),
+        resolved_at=src.resolved_at,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def _get_candidates(
+    session: AsyncSession,
+    channel: str,
+    min_lead_minutes: int,
+    limit: int,
+) -> list[tuple[TableTennisLineEvent, TableTennisForecastV2]]:
+    now = _utc_now()
+    min_starts = now + timedelta(minutes=max(0, min_lead_minutes))
+    rows = (
+        await session.execute(
+            select(TableTennisLineEvent, TableTennisForecastV2)
+            .join(
+                TableTennisForecastV2,
+                and_(
+                    TableTennisForecastV2.event_id == TableTennisLineEvent.id,
+                    TableTennisForecastV2.channel == "paid",
+                    TableTennisForecastV2.status == "pending",
+                ),
+            )
+            .where(
+                TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
+                TableTennisLineEvent.starts_at > min_starts,
+            )
+            .order_by(TableTennisLineEvent.starts_at.asc(), TableTennisForecastV2.created_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    if not rows:
+        return []
+
+    # uniq by event (latest forecast first due to order)
+    uniq: list[tuple[TableTennisLineEvent, TableTennisForecastV2]] = []
+    seen: set[str] = set()
+    for e, f in rows:
+        eid = str(e.id)
+        if eid in seen:
+            continue
+        seen.add(eid)
+        uniq.append((e, f))
+
+    already = {
+        str(x[0])
+        for x in (
+            await session.execute(
+                select(TelegramChannelNotification.event_id).where(
+                    TelegramChannelNotification.channel == channel,
+                    TelegramChannelNotification.event_id.in_([str(e.id) for e, _ in uniq]),
+                )
+            )
+        ).all()
+    }
+    return [(e, f) for e, f in uniq if str(e.id) not in already]
+
+
+async def _send_events_to_channel(
+    session: AsyncSession,
+    channel: str,
+    events: list[tuple[TableTennisLineEvent, TableTennisForecastV2]],
+) -> int:
+    if not events:
+        return 0
+    chat_id = _chat_id(channel)
+    if chat_id is None:
+        return 0
+    now = _utc_now()
+    text = "\n\n".join(_build_event_text(e, f, now) for e, f in events) + "\n\n🐧 <a href=\"https://pingwin.pro\">pingwin.pro</a> — аналитический сервис"
+    msg_id = await _send_telegram(chat_id, text)
+    if msg_id is None:
+        return 0
+    rows_to_insert = []
+    for e, src_fc in events:
+        forecast_id = src_fc.id
+        try:
+            channel_fc = await _ensure_channel_forecast(session, src_fc, channel=channel)
+            forecast_id = channel_fc.id
+        except Exception:  # noqa: BLE001
+            logger.warning("Channel dispatcher: failed to ensure channel forecast", exc_info=True)
+        rows_to_insert.append(
+            {
+                "channel": channel,
+                "event_id": str(e.id),
+                "forecast_v2_id": forecast_id,
+                "telegram_message_id": msg_id,
+            }
+        )
+    if rows_to_insert:
+        stmt = pg_insert(TelegramChannelNotification).values(rows_to_insert)
+        stmt = stmt.on_conflict_do_nothing(
+            constraint="uq_telegram_channel_notifications_channel_event"
+        )
+        result = await session.execute(stmt)
+        inserted = int(result.rowcount or 0)
+        return inserted
+    return 0
+
+
+async def _ensure_marker(
+    session: AsyncSession,
+    marker_key: str,
+    channel: str,
+    marker_type: str,
+    telegram_message_id: int | None = None,
+) -> bool:
+    existing = (
+        await session.execute(select(TelegramChannelMarker).where(TelegramChannelMarker.marker_key == marker_key))
+    ).scalar_one_or_none()
+    if existing:
+        return False
+    session.add(
+        TelegramChannelMarker(
+            marker_key=marker_key,
+            channel=channel,
+            marker_type=marker_type,
+            telegram_message_id=telegram_message_id,
+        )
+    )
+    return True
+
+
+async def _send_daily_summary(session: AsyncSession, channel: str, hour_utc: int) -> bool:
+    now = _utc_now()
+    if now.hour < hour_utc:
+        return False
+    marker_key = f"{channel}_summary_{now.strftime('%Y%m%d')}"
+    if not await _ensure_marker(session, marker_key, channel, "summary"):
+        return False
+    chat_id = _chat_id(channel)
+    if chat_id is None:
+        return False
+    day_from = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    week_from = day_from - timedelta(days=6)
+
+    day_rows = (
+        await session.execute(
+            select(TelegramChannelNotification, TableTennisForecastV2)
+            .join(TableTennisForecastV2, TableTennisForecastV2.id == TelegramChannelNotification.forecast_v2_id, isouter=True)
+            .where(
+                TelegramChannelNotification.channel == channel,
+                TelegramChannelNotification.sent_at >= day_from,
+            )
+        )
+    ).all()
+    week_rows = (
+        await session.execute(
+            select(TelegramChannelNotification, TableTennisForecastV2)
+            .join(TableTennisForecastV2, TableTennisForecastV2.id == TelegramChannelNotification.forecast_v2_id, isouter=True)
+            .where(
+                TelegramChannelNotification.channel == channel,
+                TelegramChannelNotification.sent_at >= week_from,
+            )
+        )
+    ).all()
+
+    def _c(rows: list[tuple[TelegramChannelNotification, TableTennisForecastV2 | None]]) -> tuple[int, int, int]:
+        total = len(rows)
+        hit = sum(1 for _n, f in rows if f and f.status == "hit")
+        miss = sum(1 for _n, f in rows if f and f.status == "miss")
+        return total, hit, miss
+
+    d_total, d_hit, d_miss = _c(day_rows)
+    w_total, w_hit, w_miss = _c(week_rows)
+    text = (
+        f"📊 Статистика канала за день\n"
+        f"Сегодня: дано {d_total}, угадано {d_hit}, не угадано {d_miss}\n"
+        f"За неделю: дано {w_total}, угадано {w_hit}, не угадано {w_miss}\n\n"
+        f"🐧 <a href=\"https://pingwin.pro\">pingwin.pro</a>"
+    )
+    msg_id = await _send_telegram(chat_id, text)
+    if msg_id:
+        # marker already inserted, only enrich
+        m = (
+            await session.execute(select(TelegramChannelMarker).where(TelegramChannelMarker.marker_key == marker_key))
+        ).scalar_one_or_none()
+        if m:
+            m.telegram_message_id = msg_id
+        return True
+    return False
+
+
+async def _send_result_replies(session: AsyncSession, channel: str) -> int:
+    chat_id = _chat_id(channel)
+    if chat_id is None:
+        return 0
+    rows = (
+        await session.execute(
+            select(TelegramChannelNotification, TableTennisForecastV2, TableTennisLineEvent)
+            .join(TableTennisForecastV2, TableTennisForecastV2.id == TelegramChannelNotification.forecast_v2_id, isouter=True)
+            .join(TableTennisLineEvent, TableTennisLineEvent.id == TelegramChannelNotification.event_id, isouter=True)
+            .where(
+                TelegramChannelNotification.channel == channel,
+                TelegramChannelNotification.result_notified_at.is_(None),
+            )
+            .limit(500)
+        )
+    ).all()
+    grouped: dict[int, list[tuple[TelegramChannelNotification, TableTennisForecastV2 | None, TableTennisLineEvent | None]]] = {}
+    for n, f, e in rows:
+        grouped.setdefault(int(n.telegram_message_id), []).append((n, f, e))
+
+    sent = 0
+    for message_id, entries in grouped.items():
+        now_resolve = _utc_now()
+        all_resolved = all(
+            f is not None
+            and (
+                f.status in {"hit", "miss", "no_result"}
+                or (
+                    f.status == "cancelled"
+                    and _cancelled_grace_elapsed(e, now_resolve)
+                )
+            )
+            for _n, f, e in entries
+        )
+        if not all_resolved:
+            continue
+        lines: list[str] = []
+        for _n, f, e in entries:
+            if f is None:
+                continue
+            mark = "✅" if f.status == "hit" else "❌" if f.status == "miss" else "⚪"
+            match_text = f"{e.home_name or '—'} — {e.away_name or '—'}" if e is not None else "Матч"
+            lines.append(f"{mark} {match_text}: {f.status}")
+        if not lines:
+            continue
+        text = "Итоги прогнозов:\n" + "\n".join(lines)
+        ok = await _send_telegram(chat_id, text, reply_to_message_id=message_id)
+        if not ok:
+            continue
+        now_ts = _utc_now()
+        for n, f, _e in entries:
+            n.result_notified_at = now_ts
+            n.result_status = f.status if f is not None else "no_result"
+        sent += 1
+    return sent
+
+
+async def dispatch_channel_notifications_once() -> dict[str, int]:
+    now = _utc_now()
+    now_msk = _msk_now(now)
+    sent_free = 0
+    sent_vip = 0
+    urgent = 0
+    replies = 0
+    async with async_session_maker() as session:
+        got_lock = bool(
+            (
+                await session.execute(
+                    sa.text("SELECT pg_try_advisory_lock(:k)"),
+                    {"k": CHANNEL_DISPATCHER_ADVISORY_LOCK_KEY},
+                )
+            ).scalar_one()
+        )
+        if not got_lock:
+            return {
+                "free_sent": 0,
+                "vip_sent": 0,
+                "urgent_sent": 0,
+                "result_replies": 0,
+            }
+        try:
+            # Urgent (<30 min): send immediately only to VIP.
+            # FREE-канал ограничен 3 слотами в сутки (ниже) и не участвует в urgent.
+            urgent_minutes = max(1, int(settings.telegram_urgent_lead_minutes))
+            urgent_candidates = (
+                await session.execute(
+                    select(TableTennisLineEvent, TableTennisForecastV2)
+                    .join(
+                        TableTennisForecastV2,
+                        and_(
+                            TableTennisForecastV2.event_id == TableTennisLineEvent.id,
+                            TableTennisForecastV2.channel == "paid",
+                            TableTennisForecastV2.status == "pending",
+                        ),
+                    )
+                    .where(
+                        TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
+                        TableTennisLineEvent.starts_at > now,
+                        TableTennisLineEvent.starts_at <= now + timedelta(minutes=urgent_minutes),
+                    )
+                )
+            ).all()
+            if urgent_candidates:
+                for channel in (CHANNEL_VIP,):
+                    # filter unsent for this channel
+                    unsent = await _get_candidates(session, channel=channel, min_lead_minutes=0, limit=300)
+                    urgent_only = [
+                        (e, f)
+                        for e, f in unsent
+                        if e.starts_at and e.starts_at <= now + timedelta(minutes=urgent_minutes)
+                    ]
+                    if urgent_only:
+                        c = await _send_events_to_channel(session, channel, urgent_only)
+                        urgent += c
+                        if channel == CHANNEL_FREE:
+                            sent_free += c
+                        else:
+                            sent_vip += c
+
+            # FREE regular slots by Moscow time:
+            # 1) 12:00 MSK, 2) 15:00 MSK, 3) 18:00-19:00 MSK.
+            # В каждый слот отправляем максимум 1 случайный матч.
+            msk_day = now_msk.strftime("%Y%m%d")
+            day_start_msk = datetime(now_msk.year, now_msk.month, now_msk.day, tzinfo=now_msk.tzinfo)
+            day_start_utc = day_start_msk.astimezone(timezone.utc)
+            free_sent_today = int(
+                (
+                    await session.execute(
+                        select(func.count(TelegramChannelNotification.id)).where(
+                            TelegramChannelNotification.channel == CHANNEL_FREE,
+                            TelegramChannelNotification.sent_at >= day_start_utc,
+                        )
+                    )
+                ).scalar_one()
+                or 0
+            )
+            free_slots: list[tuple[str, bool]] = [
+                ("12:00", (now_msk.hour > 12) or (now_msk.hour == 12 and now_msk.minute >= 0)),
+                ("15:00", (now_msk.hour > 15) or (now_msk.hour == 15 and now_msk.minute >= 0)),
+                ("18:00-19:00", (now_msk.hour == 18)),
+            ]
+            for slot_name, should_try in free_slots:
+                if free_sent_today >= 3:
+                    break
+                if not should_try:
+                    continue
+                marker_key = f"free_slot_msk_{msk_day}_{slot_name}"
+                created = await _ensure_marker(session, marker_key, CHANNEL_FREE, "slot")
+                if not created:
+                    continue
+                candidates = await _get_candidates(
+                    session,
+                    channel=CHANNEL_FREE,
+                    min_lead_minutes=max(0, int(settings.telegram_free_min_lead_minutes)),
+                    limit=200,
+                )
+                if not candidates:
+                    continue
+                pick = random.choice(candidates)
+                sent_now = await _send_events_to_channel(session, CHANNEL_FREE, [pick])
+                sent_free += sent_now
+                free_sent_today += sent_now
+
+            # VIP hourly (3-4 matches each hour).
+            marker_key = f"vip_hourly_{now.strftime('%Y%m%d_%H')}"
+            if await _ensure_marker(session, marker_key, CHANNEL_VIP, "hourly"):
+                candidates = await _get_candidates(
+                    session,
+                    channel=CHANNEL_VIP,
+                    min_lead_minutes=max(0, int(settings.telegram_free_min_lead_minutes)),
+                    limit=500,
+                )
+                if candidates:
+                    k_min = max(1, int(settings.telegram_vip_hourly_min))
+                    k_max = max(k_min, int(settings.telegram_vip_hourly_max))
+                    k = min(len(candidates), random.randint(k_min, k_max))
+                    picks = random.sample(candidates, k=k)
+                    sent_vip += await _send_events_to_channel(session, CHANNEL_VIP, picks)
+
+            # Daily summaries.
+            await _send_daily_summary(session, CHANNEL_FREE, hour_utc=21)
+            await _send_daily_summary(session, CHANNEL_VIP, hour_utc=23)
+
+            # Result replies.
+            replies += await _send_result_replies(session, CHANNEL_FREE)
+            replies += await _send_result_replies(session, CHANNEL_VIP)
+
+            await session.commit()
+        finally:
+            await session.execute(
+                sa.text("SELECT pg_advisory_unlock(:k)"),
+                {"k": CHANNEL_DISPATCHER_ADVISORY_LOCK_KEY},
+            )
+            await session.commit()
+
+    return {
+        "free_sent": sent_free,
+        "vip_sent": sent_vip,
+        "urgent_sent": urgent,
+        "result_replies": replies,
+    }
+
+
+async def telegram_channel_dispatcher_loop() -> None:
+    interval = max(20, int(settings.telegram_channels_loop_interval_sec))
+    logger.info("Telegram channels loop started: interval=%ss", interval)
+    while True:
+        try:
+            await dispatch_channel_notifications_once()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Telegram channels loop error: %s", e)
+        await asyncio.sleep(interval)

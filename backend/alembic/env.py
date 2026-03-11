@@ -6,7 +6,27 @@ from sqlalchemy import engine_from_config, pool
 
 from app.config import settings
 from app.db.base import Base
-from app.models import User, VerificationCode, TableTennisLineEvent, TableTennisPlayer, TableTennisLeague, TableTennisLeagueRule  # noqa: F401
+from app.models import (
+    User,
+    VerificationCode,
+    TableTennisLineEvent,
+    TableTennisPlayer,
+    TableTennisLeague,
+    TableTennisLeagueRule,
+    TableTennisModelRun,
+    TableTennisPlayerDailyFeature,
+    TableTennisMatchFeature,
+    TableTennisForecastV2,
+    TableTennisForecastExplanation,
+    UserForecastNotification,
+    TelegramChannelNotification,
+    TelegramChannelMarker,
+    BillingProduct,
+    PaymentMethod,
+    UserSubscription,
+    Invoice,
+)  # noqa: F401
+from app.models.subscription_expiry_notification import SubscriptionExpiryNotification  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

@@ -32,6 +32,8 @@ class User(Base):
     telegram_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Для получения уведомлений (привязка почты к аккаунту, зарегистрированному через Telegram)
     notification_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    notify_telegram: Mapped[bool] = mapped_column(Boolean(), default=True, nullable=False)
+    notify_email: Mapped[bool] = mapped_column(Boolean(), default=True, nullable=False)
     # Режим тишины: не слать уведомления в этот интервал (локальное время пользователя)
     quiet_hours_start: Mapped[time | None] = mapped_column(Time(), nullable=True)
     quiet_hours_end: Mapped[time | None] = mapped_column(Time(), nullable=True)

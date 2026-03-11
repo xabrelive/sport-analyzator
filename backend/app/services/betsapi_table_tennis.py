@@ -30,9 +30,9 @@ from app.models.table_tennis_line_event import (
 from app.models.table_tennis_player import TableTennisPlayer
 from app.models.table_tennis_league import TableTennisLeague
 from app.models.table_tennis_league_rule import TableTennisLeagueRule
-from app.models.table_tennis_forecast import TableTennisForecast
+from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
 from app.worker.queue import put_batch as line_put_batch
-from app.services.table_tennis_analytics import compute_forecast_for_event, update_forecast_outcome_for_event
+from app.services.table_tennis_analytics import update_forecast_outcome_for_event
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +198,35 @@ def _derive_live_sets_score(scores: dict[str, dict[str, str]], ss: Any) -> str |
     return None
 
 
+def _is_completed_set_score(home: int, away: int) -> bool:
+    winner = max(home, away)
+    loser = min(home, away)
+    return winner >= 11 and (winner - loser) >= 2
+
+
+def _has_in_progress_set_fragment(live_score: Any) -> bool:
+    if not isinstance(live_score, dict):
+        return False
+    for _, set_data in live_score.items():
+        if not isinstance(set_data, dict):
+            continue
+        home_raw = set_data.get("home")
+        away_raw = set_data.get("away")
+        if home_raw is None and away_raw is None:
+            continue
+        home = _to_int_or_none(home_raw)
+        away = _to_int_or_none(away_raw)
+        if home is None and away is None:
+            continue
+        h = int(home or 0)
+        a = int(away or 0)
+        if h == 0 and a == 0:
+            continue
+        if not _is_completed_set_score(h, a):
+            return True
+    return False
+
+
 async def _load_league_rules_map() -> Dict[str, Dict[str, int]]:
     """Загружает правила лиг для эвристики live/finished/stale."""
     async with async_session_maker() as session:
@@ -339,11 +368,11 @@ async def update_line_live_status_once(update_non_forecast_scores: bool = True) 
             row["live_score"] = scores
 
         row["live_sets_score"] = live_sets_score
-        # Для начавшихся/завершённых матчей не допускаем NULL в счёте по сетам.
+        # Для finished не допускаем NULL в счёте по сетам.
+        # Для live/postponed ничего не "обнуляем", чтобы не затирать предыдущий счёт
+        # при частичных/пустых ответах API.
         if row.get("status") in (
-            LINE_EVENT_STATUS_LIVE,
             LINE_EVENT_STATUS_FINISHED,
-            LINE_EVENT_STATUS_POSTPONED,
         ):
             if row.get("live_sets_score") is None:
                 row["live_sets_score"] = "0-0"
@@ -354,6 +383,7 @@ async def update_line_live_status_once(update_non_forecast_scores: bool = True) 
         return
 
     now = datetime.now(timezone.utc)
+    rules_map = await _load_league_rules_map()
 
     # Сравниваем с текущими значениями, чтобы отмечать изменение счёта только когда оно реально произошло.
     async with async_session_maker() as session:
@@ -608,13 +638,13 @@ async def repair_cancelled_with_scores_once(limit: int = 200) -> int:
         future_ids_result = await session.execute(
             select(TableTennisLineEvent.id)
             .join(
-                TableTennisForecast,
-                TableTennisForecast.event_id == TableTennisLineEvent.id,
+                TableTennisForecastV2,
+                TableTennisForecastV2.event_id == TableTennisLineEvent.id,
             )
             .where(
                 TableTennisLineEvent.status == LINE_EVENT_STATUS_CANCELLED,
                 TableTennisLineEvent.starts_at > now,
-                TableTennisForecast.status.in_(["pending", "cancelled", "no_result"]),
+                TableTennisForecastV2.status.in_(["pending", "cancelled", "no_result"]),
             )
             .group_by(TableTennisLineEvent.id)
             .limit(max(1, int(limit)))
@@ -654,13 +684,13 @@ async def revalidate_cancelled_forecast_events_once(limit: int = 100) -> dict[st
         ids_result = await session.execute(
             select(TableTennisLineEvent.id, func.max(TableTennisLineEvent.updated_at).label("u"))
             .join(
-                TableTennisForecast,
-                TableTennisForecast.event_id == TableTennisLineEvent.id,
+                TableTennisForecastV2,
+                TableTennisForecastV2.event_id == TableTennisLineEvent.id,
             )
             .where(
                 TableTennisLineEvent.status == LINE_EVENT_STATUS_CANCELLED,
                 TableTennisLineEvent.result_status != "locked",
-                TableTennisForecast.status.in_(["pending", "cancelled", "no_result"]),
+                TableTennisForecastV2.status.in_(["pending", "cancelled", "no_result"]),
             )
             .group_by(TableTennisLineEvent.id)
             .order_by(sa.desc("u"))
@@ -722,7 +752,8 @@ async def revalidate_cancelled_forecast_events_once(limit: int = 100) -> dict[st
                 row.live_sets_score = sets_score
                 changed = True
 
-            # Даже если API вернул cancelled, но есть победитель по сетам — считаем матч finished.
+            # Даже если API вернул cancelled/other, переводим в finished только при
+            # действительно финальном счёте и без признаков незавершённого текущего сета.
             left = right = None
             if row.live_sets_score and "-" in row.live_sets_score:
                 try:
@@ -731,7 +762,17 @@ async def revalidate_cancelled_forecast_events_once(limit: int = 100) -> dict[st
                     right = int(r_raw)
                 except (TypeError, ValueError):
                     left = right = None
-            if left is not None and right is not None and left != right:
+            league_id = str(row.league_id or "")
+            league_rules = rules_map.get(league_id, {})
+            required_wins = int(league_rules.get("max_sets_wins", settings.table_tennis_match_sets_to_win or 3))
+            score_final = (
+                left is not None
+                and right is not None
+                and left != right
+                and max(left, right) >= max(1, required_wins)
+            )
+            has_in_progress_set = _has_in_progress_set_fragment(row.live_score)
+            if score_final and not has_in_progress_set:
                 row.status = LINE_EVENT_STATUS_FINISHED
                 row.result_status = "open"
                 row.locked_at = None
@@ -1240,7 +1281,8 @@ async def backfill_missing_sets_scores_once(limit: int = 80) -> int:
             await session.commit()
         updated_count = len(updates)
 
-    # Жёсткая нормализация: для начавшихся/завершённых матчей не допускаем NULL в полях счёта.
+    # Жёсткая нормализация только для finished: в live нельзя подставлять пустой счёт,
+    # иначе можно потерять ранее полученные сеты.
     async with async_session_maker() as session:
         fallback_result = await session.execute(
             sa.text(
@@ -1253,7 +1295,7 @@ async def backfill_missing_sets_scores_once(limit: int = 80) -> int:
                     ELSE live_score
                   END,
                   updated_at = :now
-                WHERE status IN ('live', 'finished', 'postponed')
+                WHERE status IN ('finished')
                   AND (live_sets_score IS NULL OR live_score IS NULL OR live_score::text = 'null')
                 """
             ),
@@ -1297,8 +1339,6 @@ async def check_past_matches_results_once() -> None:
                 ),
                 TableTennisLineEvent.result_status != "locked",
                 TableTennisLineEvent.live_sets_score.is_not(None),
-                TableTennisLineEvent.last_score_changed_at.is_not(None),
-                TableTennisLineEvent.last_score_changed_at <= fifteen_minutes_ago,
             )
         )
         stuck_rows = (await session.execute(q_stuck)).mappings().all()
@@ -1316,7 +1356,10 @@ async def check_past_matches_results_once() -> None:
             stale_after_minutes = int(league_rules.get("stale_after_minutes", 25))
             if required_wins <= 0:
                 continue
-            # Если матч "живой", но долго без изменения счёта и явного победителя нет — считаем данные stale.
+            has_in_progress_set = _has_in_progress_set_fragment(row.get("live_score"))
+
+            # Если матч "живой", но явного победителя по завершённым сетам ещё нет — считаем данные stale
+            # только при длительном отсутствии изменений.
             if max(wins_home, wins_away) < required_wins:
                 last_changed = row.get("last_score_changed_at")
                 if isinstance(last_changed, datetime) and last_changed <= (now - timedelta(minutes=stale_after_minutes)):
@@ -1330,8 +1373,9 @@ async def check_past_matches_results_once() -> None:
                         )
                     )
                 continue
-            # Если кто-то уже набрал нужное количество побед по сетам — матч считаем завершённым.
-            if wins_home >= required_wins or wins_away >= required_wins:
+            # Если кто-то уже набрал нужное количество побед по сетам и нет фрагмента
+            # незавершённого текущего сета — матч считаем завершённым.
+            if (wins_home >= required_wins or wins_away >= required_wins) and not has_in_progress_set:
                 await session.execute(
                     TableTennisLineEvent.__table__.update()
                     .where(TableTennisLineEvent.id == row["id"])
@@ -1345,12 +1389,12 @@ async def check_past_matches_results_once() -> None:
                 )
 
         # Матчи, где нужно сделать 2-часовую проверку.
-        # Приоритет: только те, по которым есть прематч‑прогноз (event_id в table_tennis_forecasts).
+        # Приоритет: только те, по которым есть V2-прематч‑прогноз.
         q1 = (
             select(TableTennisLineEvent.id)
             .join(
-                TableTennisForecast,
-                TableTennisForecast.event_id == TableTennisLineEvent.id,
+                TableTennisForecastV2,
+                TableTennisForecastV2.event_id == TableTennisLineEvent.id,
             )
             .where(
                 TableTennisLineEvent.starts_at <= two_hours_ago,
@@ -1362,8 +1406,8 @@ async def check_past_matches_results_once() -> None:
         q3 = (
             select(TableTennisLineEvent.id)
             .join(
-                TableTennisForecast,
-                TableTennisForecast.event_id == TableTennisLineEvent.id,
+                TableTennisForecastV2,
+                TableTennisForecastV2.event_id == TableTennisLineEvent.id,
             )
             .where(
                 TableTennisLineEvent.starts_at <= three_hours_ago,
@@ -1475,147 +1519,6 @@ async def update_line_missing_odds_once() -> None:
     await _update_missing_odds(event_ids)
 
 
-async def update_line_forecasts_once() -> None:
-    """Один проход: находит матчи в линии со статусом scheduled, с коэффициентами, но без прогноза,
-    и рассчитывает прематч‑аналитику.
-
-    Используется задержка в N минут от момента создания матча (betsapi_table_tennis_forecast_delay_minutes)."""
-    delay_minutes = max(0, getattr(settings, "betsapi_table_tennis_forecast_delay_minutes", 5))
-    delay = timedelta(minutes=delay_minutes)
-    now = datetime.now(timezone.utc)
-    threshold_created_at = now - delay
-
-    async with async_session_maker() as session:
-        result = await session.execute(
-            select(TableTennisLineEvent)
-            .where(
-                TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
-                TableTennisLineEvent.starts_at > now,
-                TableTennisLineEvent.created_at <= threshold_created_at,
-                TableTennisLineEvent.forecast.is_(None),
-                TableTennisLineEvent.odds_1.is_not(None),
-                TableTennisLineEvent.odds_2.is_not(None),
-            )
-            .order_by(TableTennisLineEvent.starts_at.asc())
-        )
-        candidates = list(result.scalars().all())
-        if not candidates:
-            return
-
-        min_odds = float(getattr(settings, "betsapi_table_tennis_min_odds_for_forecast", 1.4) or 1.4)
-
-        for ev_obj in candidates:
-            text, conf = await compute_forecast_for_event(session, ev_obj)
-            if not text:
-                continue
-
-            # Фильтр по минимальному коэффициенту:
-            # если прогноз на П1, проверяем odds_1; если на П2 — odds_2.
-            txt_lower = text.lower()
-            side_odds: float | None = None
-            if "п1" in txt_lower:
-                side_odds = float(ev_obj.odds_1) if ev_obj.odds_1 is not None else None
-            elif "п2" in txt_lower:
-                side_odds = float(ev_obj.odds_2) if ev_obj.odds_2 is not None else None
-            if side_odds is None or side_odds < min_odds:
-                # Коэффициент слишком маленький — прогноз не сохраняем.
-                continue
-
-            ev_obj.forecast = text
-            ev_obj.forecast_confidence = conf
-            ev_obj.updated_at = now
-
-            # Проверяем, есть ли уже прогноз для этого события в данном канале.
-            existing_result = await session.execute(
-                select(TableTennisForecast).where(
-                    TableTennisForecast.event_id == ev_obj.id,
-                    TableTennisForecast.channel == "paid",
-                )
-            )
-            existing = existing_result.scalar_one_or_none()
-            if existing is None:
-                forecast_odds: float | None = None
-                if "п1" in txt_lower:
-                    forecast_odds = float(ev_obj.odds_1) if ev_obj.odds_1 is not None else None
-                elif "п2" in txt_lower:
-                    forecast_odds = float(ev_obj.odds_2) if ev_obj.odds_2 is not None else None
-                session.add(
-                    TableTennisForecast(
-                        event_id=ev_obj.id,
-                        league_id=ev_obj.league_id,
-                        league_name=ev_obj.league_name,
-                        home_id=ev_obj.home_id,
-                        home_name=ev_obj.home_name,
-                        away_id=ev_obj.away_id,
-                        away_name=ev_obj.away_name,
-                        forecast_text=text,
-                        confidence_pct=conf,
-                        forecast_odds=forecast_odds,
-                        status="pending",
-                        channel="paid",
-                    )
-                )
-
-        await session.commit()
-
-
-async def backfill_forecasts_from_existing_events_once() -> int:
-    """Создаёт записи в table_tennis_forecasts для матчей, где forecast уже рассчитан.
-
-    Это нужно для миграции старых данных: когда прогнозы были записаны только в
-    table_tennis_line_events.forecast, но ещё не было таблицы статистики.
-    """
-    async with async_session_maker() as session:
-        result = await session.execute(
-            sa.text(
-                """
-                INSERT INTO table_tennis_forecasts (
-                  event_id,
-                  league_id,
-                  league_name,
-                  home_id,
-                  home_name,
-                  away_id,
-                  away_name,
-                  forecast_text,
-                  confidence_pct,
-                  status,
-                  created_at,
-                  final_status,
-                  final_sets_score,
-                  channel
-                )
-                SELECT
-                  e.id,
-                  e.league_id,
-                  e.league_name,
-                  e.home_id,
-                  e.home_name,
-                  e.away_id,
-                  e.away_name,
-                  e.forecast,
-                  e.forecast_confidence,
-                  'pending' AS status,
-                  COALESCE(e.created_at, NOW()),
-                  NULL AS final_status,
-                  NULL AS final_sets_score,
-                  'paid' AS channel
-                FROM table_tennis_line_events e
-                LEFT JOIN table_tennis_forecasts f
-                  ON f.event_id = e.id
-                WHERE
-                  e.forecast IS NOT NULL
-                  AND f.event_id IS NULL
-                """
-            )
-        )
-        await session.commit()
-        inserted = int(result.rowcount or 0)
-    if inserted:
-        logger.info("BetsAPI forecasts backfill: inserted %s rows into table_tennis_forecasts", inserted)
-    return inserted
-
-
 async def sync_forecast_outcomes_once(limit: int = 200) -> int:
     """Синхронизирует статусы прогнозов с основной таблицей событий.
 
@@ -1626,13 +1529,13 @@ async def sync_forecast_outcomes_once(limit: int = 200) -> int:
         ids_result = await session.execute(
             select(TableTennisLineEvent.id)
             .join(
-                TableTennisForecast,
-                TableTennisForecast.event_id == TableTennisLineEvent.id,
+                TableTennisForecastV2,
+                TableTennisForecastV2.event_id == TableTennisLineEvent.id,
             )
             .where(
                 sa.or_(
                     sa.and_(
-                        TableTennisForecast.status == "pending",
+                        TableTennisForecastV2.status == "pending",
                         sa.or_(
                             TableTennisLineEvent.status.in_(
                                 [LINE_EVENT_STATUS_FINISHED, LINE_EVENT_STATUS_CANCELLED]
@@ -1641,7 +1544,7 @@ async def sync_forecast_outcomes_once(limit: int = 200) -> int:
                         ),
                     ),
                     sa.and_(
-                        TableTennisForecast.status.in_(["cancelled", "no_result"]),
+                        TableTennisForecastV2.status.in_(["cancelled", "no_result"]),
                         TableTennisLineEvent.status.in_(
                             [
                                 LINE_EVENT_STATUS_SCHEDULED,
@@ -1700,10 +1603,10 @@ async def sync_results_from_archive_range_once(
         if only_forecasted:
             base_stmt = (
                 base_stmt.join(
-                    TableTennisForecast,
-                    TableTennisForecast.event_id == TableTennisLineEvent.id,
+                    TableTennisForecastV2,
+                    TableTennisForecastV2.event_id == TableTennisLineEvent.id,
                 )
-                .where(TableTennisForecast.status.in_(["pending", "cancelled", "no_result"]))
+                .where(TableTennisForecastV2.status.in_(["pending", "cancelled", "no_result"]))
                 .group_by(TableTennisLineEvent.id)
             )
         events_result = await session.execute(base_stmt)
@@ -1888,37 +1791,6 @@ async def table_tennis_odds_loop() -> None:
             await update_line_missing_odds_once()
         except Exception as e:  # noqa: BLE001
             logger.exception("BetsAPI: unexpected error in odds loop: %s", e)
-        await asyncio.sleep(interval)
-
-
-async def table_tennis_forecast_loop() -> None:
-    """Фоновый цикл: раз в N минут рассчитывает прематч‑прогнозы для новых матчей в линии."""
-    delay_minutes = max(1, getattr(settings, "betsapi_table_tennis_forecast_delay_minutes", 5))
-    interval = delay_minutes * 60
-    token = (settings.betsapi_token or "").strip()
-    if not token:
-        logger.warning(
-            "BetsAPI: betsapi_token не задан, фоновый расчёт прематч‑прогнозов отключён."
-        )
-        return
-
-    logger.info(
-        "BetsAPI: starting table tennis forecast loop (delay=%s min, interval=%ss)",
-        delay_minutes,
-        interval,
-    )
-
-    # Одноразовый backfill: переносим уже посчитанные прогнозы в статистическую таблицу.
-    try:
-        await backfill_forecasts_from_existing_events_once()
-    except Exception as e:  # noqa: BLE001
-        logger.exception("BetsAPI: error during initial forecasts backfill: %s", e)
-
-    while True:
-        try:
-            await update_line_forecasts_once()
-        except Exception as e:  # noqa: BLE001
-            logger.exception("BetsAPI: unexpected error in forecast loop: %s", e)
         await asyncio.sleep(interval)
 
 

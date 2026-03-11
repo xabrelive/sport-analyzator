@@ -50,7 +50,12 @@ export async function login(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, password }),
   });
-  const data = (await res.json().catch(() => ({}))) as { detail?: string; code?: string; email?: string };
+  const data = (await res.json().catch(() => ({}))) as {
+    detail?: string;
+    code?: string;
+    email?: string;
+    access_token?: string;
+  };
   if (res.status === 403 && data.code === "email_not_verified" && data.email) {
     const e = new Error(data.detail || "Подтвердите почту") as Error & { code?: string; email?: string };
     e.code = "email_not_verified";
@@ -60,7 +65,7 @@ export async function login(
   if (!res.ok) {
     throw new Error(data.detail || res.statusText);
   }
-  return res.json();
+  return { access_token: data.access_token! };
 }
 
 export async function loginByTelegramCode(code: string): Promise<{ access_token: string }> {
@@ -215,7 +220,10 @@ export interface MeProfile {
   notification_email_masked: string | null;
   quiet_hours_start: string | null;
   quiet_hours_end: string | null;
+  notify_telegram: boolean;
+  notify_email: boolean;
   is_telegram_only: boolean;
+  is_superadmin: boolean;
 }
 
 export async function getMe(): Promise<MeProfile> {
@@ -230,6 +238,8 @@ export async function getMe(): Promise<MeProfile> {
 export interface MeSettingsUpdate {
   quiet_hours_start?: string | null;
   quiet_hours_end?: string | null;
+  notify_telegram?: boolean | null;
+  notify_email?: boolean | null;
 }
 
 export async function patchMe(data: MeSettingsUpdate): Promise<MeProfile> {
@@ -353,6 +363,9 @@ export interface TableTennisLineResponse {
   leagues: TableTennisLeague[];
   players_by_league: TableTennisPlayersByLeague[];
   updated_at: number | null;
+  forecast_locked?: boolean;
+  forecast_locked_message?: string;
+  forecast_purchase_url?: string;
 }
 
 export interface TableTennisLiveEvent {
@@ -378,6 +391,9 @@ export interface TableTennisLiveEvent {
 export interface TableTennisLiveResponse {
   events: TableTennisLiveEvent[];
   updated_at: number | null;
+  forecast_locked?: boolean;
+  forecast_locked_message?: string;
+  forecast_purchase_url?: string;
 }
 
 export interface TableTennisMatchCard {
@@ -481,6 +497,7 @@ export interface TableTennisLeagueCard {
 }
 
 export interface TableTennisForecastItem {
+  id?: number;
   event_id: string;
   league_id: string | null;
   league_name: string | null;
@@ -495,6 +512,12 @@ export interface TableTennisForecastItem {
   resolved_at: number | null;
   final_status: string | null;
   final_sets_score: string | null;
+  market?: string | null;
+  pick_side?: string | null;
+  probability_pct?: number | null;
+  confidence_score?: number | null;
+  edge_pct?: number | null;
+  odds_used?: number | null;
   starts_at: number | null;
   odds_1: number | null;
   odds_2: number | null;
@@ -504,6 +527,15 @@ export interface TableTennisForecastItem {
   live_score?: Record<string, { home: string | number | null; away: string | number | null }> | null;
   forecast_odds?: number | null;
   forecast_lead_seconds?: number | null;
+  explanation_summary?: string | null;
+  factors?: Array<{
+    factor_key: string;
+    factor_label: string;
+    factor_value?: string | null;
+    contribution?: number | null;
+    direction?: string | null;
+    rank?: number | null;
+  }>;
 }
 
 export interface TableTennisForecastsResponse {
@@ -511,17 +543,45 @@ export interface TableTennisForecastsResponse {
   page: number;
   page_size: number;
   total: number;
+  forecast_locked?: boolean;
+  forecast_locked_message?: string;
+  forecast_purchase_url?: string;
+  allowed_channels?: string[];
+  only_resolved?: boolean;
 }
 
 export interface TableTennisForecastStats {
   total: number;
   by_status: Record<string, number>;
   hit_rate: number | null;
+  avg_odds?: number | null;
+  forecast_locked?: boolean;
+  forecast_locked_message?: string;
+  forecast_purchase_url?: string;
+  allowed_channels?: string[];
+  only_resolved?: boolean;
+  kpi_runtime?: {
+    dynamic_min_confidence_pct: number;
+    dynamic_min_edge_pct: number;
+    dynamic_min_odds: number;
+    last_hit_rate: number;
+    last_picks_per_day: number;
+    last_updated_at: number;
+  };
 }
 
 export interface TableTennisForecastsStreamPayload {
   stats: TableTennisForecastStats;
   forecasts: TableTennisForecastsResponse;
+  updated_at?: number;
+}
+
+function normalizeForecastItem(it: TableTennisForecastItem): TableTennisForecastItem {
+  return {
+    ...it,
+    confidence_pct: it.confidence_pct ?? it.probability_pct ?? it.confidence_score ?? null,
+    forecast_odds: it.forecast_odds ?? it.odds_used ?? null,
+  };
 }
 
 export interface TableTennisResultsResponse {
@@ -536,10 +596,13 @@ export interface TableTennisResultsResponse {
     date_from?: string | null;
     date_to?: string | null;
   };
+  forecast_locked?: boolean;
+  forecast_locked_message?: string;
+  forecast_purchase_url?: string;
 }
 
 export async function getTableTennisLine(): Promise<TableTennisLineResponse> {
-  const res = await fetch(apiUrl("table-tennis/line"), { headers: authHeaders() });
+  const res = await fetch(apiUrl("table-tennis/line"), { headers: authHeaders(), cache: "no-store" });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error((err as { detail?: string }).detail || res.statusText);
@@ -548,7 +611,7 @@ export async function getTableTennisLine(): Promise<TableTennisLineResponse> {
 }
 
 export async function getTableTennisLive(): Promise<TableTennisLiveResponse> {
-  const res = await fetch(apiUrl("table-tennis/live"), { headers: authHeaders() });
+  const res = await fetch(apiUrl("table-tennis/live"), { headers: authHeaders(), cache: "no-store" });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error((err as { detail?: string }).detail || res.statusText);
@@ -558,6 +621,64 @@ export async function getTableTennisLive(): Promise<TableTennisLiveResponse> {
 
 export async function getTableTennisMatchCard(matchId: string): Promise<TableTennisMatchCard> {
   const res = await fetch(apiUrl(`table-tennis/matches/${encodeURIComponent(matchId)}`), {
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export interface TableTennisMatchCardV2 {
+  match: TableTennisLiveEvent | null;
+  forecast_v2: TableTennisForecastItem | null;
+  forecast_locked?: boolean;
+  forecast_locked_message?: string;
+  forecast_purchase_url?: string;
+  player_context?: {
+    home?: {
+      played?: number;
+      wins?: number;
+      losses?: number;
+      win_rate?: number | null;
+      last5_form?: Array<{
+        event_id: string;
+        result: "W" | "L";
+        opponent_name?: string | null;
+        starts_at?: number | null;
+        sets_score?: string | null;
+      }>;
+      h2h_wins?: number;
+    };
+    away?: {
+      played?: number;
+      wins?: number;
+      losses?: number;
+      win_rate?: number | null;
+      last5_form?: Array<{
+        event_id: string;
+        result: "W" | "L";
+        opponent_name?: string | null;
+        starts_at?: number | null;
+        sets_score?: string | null;
+      }>;
+      h2h_wins?: number;
+    };
+    h2h?: {
+      total?: number;
+      home_wins?: number;
+      away_wins?: number;
+    };
+  };
+}
+
+export async function getTableTennisMatchCardV2(
+  matchId: string,
+  channel = "paid"
+): Promise<TableTennisMatchCardV2> {
+  const qs = new URLSearchParams({ channel }).toString();
+  const res = await fetch(apiUrl(`table-tennis/v2/matches/${encodeURIComponent(matchId)}?${qs}`), {
     headers: authHeaders(),
   });
   if (!res.ok) {
@@ -640,6 +761,30 @@ export async function getTableTennisPlayerCardPaged(
   return res.json();
 }
 
+export async function getTableTennisPlayerCardV2(
+  playerId: string,
+  channel = "paid",
+  pageUpcoming = 1,
+  pageFinished = 1,
+  pageSize = 20
+): Promise<TableTennisPlayerCard & { v2_channel?: string }> {
+  const params = new URLSearchParams({
+    channel,
+    page_upcoming: String(pageUpcoming),
+    page_finished: String(pageFinished),
+    page_size: String(pageSize),
+  });
+  const res = await fetch(
+    apiUrl(`table-tennis/v2/players/${encodeURIComponent(playerId)}?${params.toString()}`),
+    { headers: authHeaders() }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
 export async function getTableTennisLeagueCard(
   leagueId: string,
   pageUpcoming = 1,
@@ -671,15 +816,18 @@ export async function getTableTennisForecastStats(params?: {
   date_to?: string;
   league_id?: string;
   channel?: string;
+  quality_tier?: string;
 }): Promise<TableTennisForecastStats> {
   const search = new URLSearchParams();
   if (params?.date_from) search.set("date_from", params.date_from);
   if (params?.date_to) search.set("date_to", params.date_to);
   if (params?.league_id) search.set("league_id", params.league_id);
   if (params?.channel) search.set("channel", params.channel);
+  if (params?.quality_tier) search.set("quality_tier", params.quality_tier);
   const qs = search.toString();
-  const res = await fetch(apiUrl(`table-tennis/forecasts/stats${qs ? `?${qs}` : ""}`), {
+  const res = await fetch(apiUrl(`table-tennis/v2/forecasts/stats${qs ? `?${qs}` : ""}`), {
     headers: authHeaders(),
+    cache: "no-store",
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -696,6 +844,7 @@ export async function getTableTennisForecasts(params?: {
   date_from?: string;
   date_to?: string;
   channel?: string;
+  quality_tier?: string;
 }): Promise<TableTennisForecastsResponse> {
   const search = new URLSearchParams();
   if (params?.page) search.set("page", String(params.page));
@@ -705,29 +854,34 @@ export async function getTableTennisForecasts(params?: {
   if (params?.date_from) search.set("date_from", params.date_from);
   if (params?.date_to) search.set("date_to", params.date_to);
   if (params?.channel) search.set("channel", params.channel);
+  if (params?.quality_tier) search.set("quality_tier", params.quality_tier);
   const qs = search.toString();
-  const res = await fetch(apiUrl(`table-tennis/forecasts${qs ? `?${qs}` : ""}`), {
+  const res = await fetch(apiUrl(`table-tennis/v2/forecasts${qs ? `?${qs}` : ""}`), {
     headers: authHeaders(),
+    cache: "no-store",
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error((err as { detail?: string }).detail || res.statusText);
   }
-  return res.json();
+  const payload = (await res.json()) as TableTennisForecastsResponse;
+  payload.items = payload.items.map(normalizeForecastItem);
+  return payload;
 }
 
 export function subscribeTableTennisForecastsStream(
   channel: string,
   onData: (data: TableTennisForecastsStreamPayload) => void,
-  onError?: (err: Error) => void
+  onError?: (err: Error) => void,
+  qualityTier = ""
 ): () => void {
   const ac = new AbortController();
   (async () => {
     let reconnectDelayMs = 1000;
     while (!ac.signal.aborted) {
       try {
-        const qs = new URLSearchParams({ channel }).toString();
-        const res = await fetch(apiUrl(`table-tennis/forecasts/stream?${qs}`), {
+        const qs = new URLSearchParams({ channel, quality_tier: qualityTier }).toString();
+        const res = await fetch(apiUrl(`table-tennis/v2/forecasts/stream?${qs}`), {
           headers: authHeaders(),
           cache: "no-store",
           signal: ac.signal,
@@ -748,6 +902,9 @@ export function subscribeTableTennisForecastsStream(
             if (!line.startsWith("data: ")) continue;
             try {
               const data = JSON.parse(line.slice(6)) as TableTennisForecastsStreamPayload;
+              if (data?.forecasts?.items) {
+                data.forecasts.items = data.forecasts.items.map(normalizeForecastItem);
+              }
               onData(data);
             } catch {
               // ignore malformed json
@@ -899,4 +1056,472 @@ export function subscribeTableTennisLineStream(
     }
   })();
   return () => ac.abort();
+}
+
+// --- Admin & billing ---
+
+export interface AdminUserListItem {
+  id: string;
+  email: string;
+  telegram_id: number | null;
+  telegram_username: string | null;
+  notification_email: string | null;
+  is_active: boolean;
+  is_blocked: boolean;
+  is_superadmin: boolean;
+  last_login_at: string | null;
+  created_at: string | null;
+}
+
+export interface AdminUsersResponse {
+  total: number;
+  items: AdminUserListItem[];
+}
+
+export async function getAdminTelegramBotInfo(): Promise<{ message: string }> {
+  const res = await fetch(apiUrl("admin/telegram-bot-info"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function putAdminTelegramBotInfo(message: string): Promise<{ ok: boolean; message: string }> {
+  const res = await fetch(apiUrl("admin/telegram-bot-info"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ message }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function getAdminMe(): Promise<{ id: string; email: string; is_superadmin: boolean }> {
+  const res = await fetch(apiUrl("admin/me"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function getAdminUsers(params?: {
+  q?: string;
+  offset?: number;
+  limit?: number;
+}): Promise<AdminUsersResponse> {
+  const sp = new URLSearchParams();
+  if (params?.q) sp.set("q", params.q);
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  const res = await fetch(apiUrl(`admin/users?${sp.toString()}`), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function patchAdminUser(
+  userId: string,
+  body: {
+    is_active?: boolean;
+    is_blocked?: boolean;
+    is_superadmin?: boolean;
+    notify_telegram?: boolean;
+    notify_email?: boolean;
+  }
+): Promise<{ ok: boolean }> {
+  const res = await fetch(apiUrl(`admin/users/${encodeURIComponent(userId)}`), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export interface AdminSubscription {
+  id: string;
+  service_key: "analytics" | "vip_channel";
+  duration_days: number;
+  valid_until: string;
+  source: string;
+  comment: string | null;
+  created_at: string | null;
+}
+
+export async function getAdminUserSubscriptions(userId: string): Promise<{ items: AdminSubscription[] }> {
+  const res = await fetch(apiUrl(`admin/users/${encodeURIComponent(userId)}/subscriptions`), {
+    headers: authHeaders(),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function upsertAdminSubscription(
+  userId: string,
+  body: { service_key: "analytics" | "vip_channel"; days: number; comment?: string | null }
+): Promise<AdminSubscription> {
+  const res = await fetch(apiUrl(`admin/users/${encodeURIComponent(userId)}/subscriptions`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function deleteAdminSubscription(userId: string, subscriptionId: string): Promise<{ ok: boolean }> {
+  const res = await fetch(
+    apiUrl(`admin/users/${encodeURIComponent(userId)}/subscriptions/${encodeURIComponent(subscriptionId)}`),
+    { method: "DELETE", headers: authHeaders() }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export interface AdminProduct {
+  id: string;
+  code: string;
+  name: string;
+  service_key: string;
+  duration_days: number;
+  price_rub: number;
+  price_usd: number;
+  enabled: boolean;
+  sort_order: number;
+}
+
+export async function getAdminProducts(): Promise<AdminProduct[]> {
+  const res = await fetch(apiUrl("admin/products"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function patchAdminProduct(
+  productId: string,
+  body: { name?: string; price_rub?: number; price_usd?: number; enabled?: boolean; sort_order?: number }
+): Promise<{ ok: boolean }> {
+  const res = await fetch(apiUrl(`admin/products/${encodeURIComponent(productId)}`), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export interface AdminPaymentMethod {
+  id: string;
+  name: string;
+  method_type: string;
+  enabled: boolean;
+  sort_order: number;
+  instructions: string | null;
+}
+
+export async function getAdminPaymentMethods(): Promise<AdminPaymentMethod[]> {
+  const res = await fetch(apiUrl("admin/payment-methods"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function createAdminPaymentMethod(body: {
+  name: string;
+  method_type: "custom" | "card" | "crypto";
+  enabled?: boolean;
+  sort_order?: number;
+  instructions?: string | null;
+}): Promise<{ id: string }> {
+  const res = await fetch(apiUrl("admin/payment-methods"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function patchAdminPaymentMethod(
+  methodId: string,
+  body: { name?: string; method_type?: "custom" | "card" | "crypto"; enabled?: boolean; sort_order?: number; instructions?: string | null }
+): Promise<{ ok: boolean }> {
+  const res = await fetch(apiUrl(`admin/payment-methods/${encodeURIComponent(methodId)}`), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function deleteAdminPaymentMethod(methodId: string): Promise<{ ok: boolean }> {
+  const res = await fetch(apiUrl(`admin/payment-methods/${encodeURIComponent(methodId)}`), {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function sendAdminMessage(body: {
+  target: "free_channel" | "vip_channel" | "telegram_user" | "email";
+  text: string;
+  user_id?: string;
+  email?: string;
+  subject?: string;
+}): Promise<{ ok: boolean }> {
+  const res = await fetch(apiUrl("admin/messages/send"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export interface AdminInvoiceItem {
+  id: string;
+  user_id: string;
+  user_email: string;
+  status: "pending" | "paid" | "cancelled" | string;
+  amount_rub: number;
+  payment_method_id: string | null;
+  comment: string | null;
+  created_at: string | null;
+  paid_at: string | null;
+}
+
+export interface AdminInvoicesResponse {
+  total: number;
+  items: AdminInvoiceItem[];
+}
+
+export async function getAdminInvoices(params?: {
+  status?: "pending" | "paid" | "cancelled" | "";
+  offset?: number;
+  limit?: number;
+}): Promise<AdminInvoicesResponse> {
+  const sp = new URLSearchParams();
+  if (params?.status) sp.set("status", params.status);
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  const qs = sp.toString();
+  const res = await fetch(apiUrl(`admin/invoices${qs ? `?${qs}` : ""}`), {
+    headers: authHeaders(),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function patchAdminInvoiceStatus(
+  invoiceId: string,
+  paid: boolean
+): Promise<{ ok: boolean; invite_sent?: boolean }> {
+  const res = await fetch(apiUrl(`admin/invoices/${encodeURIComponent(invoiceId)}/status`), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ paid }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function getBillingProducts(): Promise<Array<{
+  id: string;
+  code: string;
+  name: string;
+  service_key: string;
+  duration_days: number;
+  price_rub: number;
+  price_usd: number;
+}>> {
+  const res = await fetch(apiUrl("billing/products"), { cache: "no-store" });
+  if (!res.ok) throw new Error(res.statusText);
+  return res.json();
+}
+
+export interface BillingCheckoutItem {
+  product_code: string;
+  quantity?: number;
+}
+
+export interface BillingCheckoutResponse {
+  invoice_id: string;
+  status: string;
+  amount_rub: number;
+  created_at: string | null;
+  detail: string;
+}
+
+export async function createBillingCheckout(body: {
+  items: BillingCheckoutItem[];
+  payment_method_id?: string | null;
+  comment?: string | null;
+}): Promise<BillingCheckoutResponse> {
+  const res = await fetch(apiUrl("billing/checkout"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function getBillingPaymentMethods(): Promise<Array<{
+  id: string;
+  name: string;
+  method_type: string;
+  instructions: string | null;
+}>> {
+  const res = await fetch(apiUrl("billing/payment-methods"), { cache: "no-store" });
+  if (!res.ok) throw new Error(res.statusText);
+  return res.json();
+}
+
+export interface BillingVipAccessResponse {
+  has_active_subscription: boolean;
+  telegram_linked: boolean;
+  is_member: boolean;
+  can_create_invite: boolean;
+  member_status?: string | null;
+  valid_until?: string | null;
+  channel_url?: string | null;
+  message: string;
+}
+
+export async function getBillingVipAccess(): Promise<BillingVipAccessResponse> {
+  const res = await fetch(apiUrl("billing/vip/access"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export interface BillingVipCreateInviteResponse {
+  already_in_channel: boolean;
+  invite_link?: string;
+  channel_url?: string | null;
+  warning?: string;
+  valid_until?: string;
+  message?: string;
+}
+
+export async function createBillingVipInvite(): Promise<BillingVipCreateInviteResponse> {
+  const res = await fetch(apiUrl("billing/vip/create-invite"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export interface BillingMySubscriptionItem {
+  id: string;
+  service_key: "analytics" | "vip_channel" | string;
+  duration_days: number;
+  valid_until: string;
+  source: string;
+  comment: string | null;
+  created_at: string | null;
+}
+
+export interface BillingMyServiceSummary {
+  service_key: "analytics" | "vip_channel" | string;
+  has_subscription: boolean;
+  is_active: boolean;
+  valid_until: string | null;
+  days_left: number;
+  source?: string;
+}
+
+export interface BillingMySubscriptionsResponse {
+  items: BillingMySubscriptionItem[];
+  analytics: BillingMyServiceSummary;
+  vip_channel: BillingMyServiceSummary;
+}
+
+export async function getBillingMySubscriptions(): Promise<BillingMySubscriptionsResponse> {
+  const res = await fetch(apiUrl("billing/subscriptions/my"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export interface BillingMyInvoiceItem {
+  id: string;
+  status: "pending" | "paid" | "cancelled" | string;
+  amount_rub: number;
+  payment_method_id: string | null;
+  comment: string | null;
+  created_at: string | null;
+  paid_at: string | null;
+}
+
+export interface BillingMyInvoicesResponse {
+  items: BillingMyInvoiceItem[];
+}
+
+export async function getBillingMyInvoices(): Promise<BillingMyInvoicesResponse> {
+  const res = await fetch(apiUrl("billing/invoices/my"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
 }

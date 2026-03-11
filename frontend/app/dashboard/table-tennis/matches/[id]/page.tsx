@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { getTableTennisMatchCard, type TableTennisMatchCard } from "@/lib/api";
+import { getTableTennisMatchCardV2, type TableTennisMatchCardV2 } from "@/lib/api";
 
 function formatDateTime(ts: number | undefined): string {
   if (ts == null) return "—";
@@ -21,10 +21,121 @@ function formatDateTime(ts: number | undefined): string {
   }
 }
 
+function formatMatchStatus(status: string | null | undefined): string {
+  if (!status) return "—";
+  if (status === "scheduled") return "Ожидается";
+  if (status === "live") return "В игре";
+  if (status === "finished") return "Завершен";
+  if (status === "cancelled") return "Отменен";
+  if (status === "postponed") return "Перенесен";
+  return status;
+}
+
+function matchStatusClass(status: string | null | undefined): string {
+  if (status === "finished") return "text-emerald-400";
+  if (status === "live") return "text-sky-300";
+  if (status === "cancelled") return "text-amber-300";
+  if (status === "postponed") return "text-amber-300";
+  if (status === "scheduled") return "text-sky-300";
+  return "text-white";
+}
+
+function toSignalLevel(value: number | null | undefined): string {
+  if (value == null) return "умеренный";
+  if (value >= 75) return "очень сильный";
+  if (value >= 65) return "сильный";
+  if (value >= 55) return "рабочий";
+  return "осторожный";
+}
+
+function toEdgeLevel(value: number | null | undefined): string {
+  if (value == null) return "умеренный перевес";
+  if (value >= 10) return "заметный перевес";
+  if (value >= 5) return "хороший перевес";
+  if (value >= 2) return "небольшой перевес";
+  return "минимальный перевес";
+}
+
+function buildHumanSummary(card: TableTennisMatchCardV2 | null): string {
+  const forecast = card?.forecast_v2;
+  if (!forecast?.forecast_text) return "По этому матчу пока недостаточно подтвержденных данных для понятного вывода.";
+  const confidence = toSignalLevel(forecast.probability_pct ?? forecast.confidence_score ?? forecast.confidence_pct ?? null);
+  const edge = toEdgeLevel(forecast.edge_pct ?? null);
+  return `Модель видит ${edge} и дает ${confidence} сигнал в пользу исхода «${forecast.forecast_text}».`;
+}
+
+function factorToHumanText(
+  factor: NonNullable<NonNullable<TableTennisMatchCardV2["forecast_v2"]>["factors"]>[number]
+): string {
+  const key = factor.factor_key || "";
+  const dir = (factor.direction || "neutral") as "home" | "away" | "neutral";
+  const strong = Math.abs(Number(factor.contribution ?? 0)) >= 0.1;
+
+  const sideText = dir === "home" ? "П1" : dir === "away" ? "П2" : "";
+
+  if (key === "form_delta") {
+    if (!sideText) return "По форме за последние 90 дней явного преимущества ни у одной стороны нет.";
+    return strong
+      ? `${sideText} заметно лучше по форме за последние 90 дней.`
+      : `${sideText} немного лучше по форме за последние 90 дней.`;
+  }
+
+  if (key === "h2h_home_wr") {
+    if (!sideText) return "По очным встречам явного преимущества нет.";
+    return strong
+      ? `${sideText} имеет явное преимущество по очным встречам.`
+      : `${sideText} чуть лучше по очным встречам.`;
+  }
+
+  if (key === "fatigue_delta") {
+    if (!sideText) return "По усталости серьёзного перекоса нет.";
+    return strong
+      ? `${sideText} заметно свежее по усталости к этому матчу.`
+      : `${sideText} немного свежее по усталости.`;
+  }
+
+  // Fallback для любых новых факторов
+  if (!sideText) return "Дополнительный фактор без явного перекоса.";
+  return strong
+    ? `${sideText} имеет заметное преимущество по дополнительному фактору.`
+    : `${sideText} чуть лучше по дополнительному фактору.`;
+}
+
+type FormItem = NonNullable<
+  NonNullable<NonNullable<TableTennisMatchCardV2["player_context"]>["home"]>["last5_form"]
+>[number];
+
+function renderFormBadges(form: FormItem[] | undefined) {
+  if (!form || form.length === 0) {
+    return <span className="text-slate-500 text-xs">Нет данных по последним матчам</span>;
+  }
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap">
+      {form.map((item, idx) => {
+        const isWin = item.result === "W";
+        return (
+          <Link
+            key={`${item.event_id}-${idx}`}
+            href={`/dashboard/table-tennis/matches/${encodeURIComponent(item.event_id)}`}
+            className={
+              isWin
+                ? "inline-flex h-6 min-w-6 items-center justify-center rounded-md bg-emerald-500/20 border border-emerald-400/40 text-emerald-300 text-[11px] font-semibold px-1.5 hover:bg-emerald-500/30"
+                : "inline-flex h-6 min-w-6 items-center justify-center rounded-md bg-rose-500/20 border border-rose-400/40 text-rose-300 text-[11px] font-semibold px-1.5 hover:bg-rose-500/30"
+            }
+            title={`${isWin ? "Победа" : "Поражение"}${item.opponent_name ? ` vs ${item.opponent_name}` : ""}${item.sets_score ? ` · ${item.sets_score}` : ""}`}
+          >
+            {item.result}
+          </Link>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function TableTennisMatchCardPage() {
   const params = useParams();
   const id = typeof params.id === "string" ? params.id : "";
-  const [card, setCard] = useState<TableTennisMatchCard | null>(null);
+  const [card, setCard] = useState<TableTennisMatchCardV2 | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -33,7 +144,7 @@ export default function TableTennisMatchCardPage() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    getTableTennisMatchCard(id)
+    getTableTennisMatchCardV2(id)
       .then((res) => !cancelled && setCard(res))
       .catch((e) => !cancelled && setError(e instanceof Error ? e.message : "Ошибка загрузки"))
       .finally(() => !cancelled && setLoading(false));
@@ -47,6 +158,10 @@ export default function TableTennisMatchCardPage() {
   if (!card?.match) return <div className="p-6 md:p-8"><p className="text-slate-400">Матч не найден.</p></div>;
 
   const m = card.match;
+  const f2 = card.forecast_v2;
+  const homeCtx = card.player_context?.home;
+  const awayCtx = card.player_context?.away;
+  const h2h = card.player_context?.h2h;
   const setsLine = m.sets
     ? Object.keys(m.sets)
         .sort((a, b) => Number(a) - Number(b))
@@ -59,6 +174,8 @@ export default function TableTennisMatchCardPage() {
         .join(" ")
     : "";
 
+  const analyticsLocked = card.forecast_locked ?? false;
+
   return (
     <div className="p-6 md:p-8 space-y-8">
       <div>
@@ -67,131 +184,112 @@ export default function TableTennisMatchCardPage() {
         <p className="text-slate-400 text-sm mt-1">{m.league_name} · {formatDateTime(m.time)}</p>
       </div>
 
+      {analyticsLocked && card.forecast_purchase_url && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3">
+          <Link href={card.forecast_purchase_url} className="text-amber-200 hover:text-amber-100 font-medium">
+            {card.forecast_locked_message ?? "Для просмотра аналитики и статистики приобретите подписку на аналитику"}
+          </Link>
+        </div>
+      )}
+
       <section>
         <h2 className="text-lg font-semibold text-white mb-3 border-b border-slate-700 pb-2">Статистика матча</h2>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-          <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3"><span className="text-slate-400 text-sm">Статус</span><p className="text-white font-semibold">{m.status ?? "—"}</p></div>
+          <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3"><span className="text-slate-400 text-sm">Статус</span><p className={`font-semibold ${matchStatusClass(m.status)}`}>{formatMatchStatus(m.status)}</p></div>
           <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3"><span className="text-slate-400 text-sm">Кф П1 / П2 (старт)</span><p className="text-white font-semibold tabular-nums">{m.odds_1 != null ? m.odds_1.toFixed(2) : "—"} / {m.odds_2 != null ? m.odds_2.toFixed(2) : "—"}</p></div>
           <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3"><span className="text-slate-400 text-sm">Счёт по сетам</span><p className="text-emerald-300 font-semibold tabular-nums">{m.sets_score ?? "—"}</p>{setsLine ? <p className="text-xs text-slate-400">({setsLine})</p> : null}</div>
-          <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
-            <span className="text-slate-400 text-sm">Прематч‑прогноз</span>
-            <p className="text-emerald-300 font-semibold text-sm mt-0.5">
-              {card.forecast ?? "—"}
-            </p>
-            {card.forecast_confidence != null && (
-              <p className="text-xs text-slate-400 mt-1">
-                Уверенность модели: {card.forecast_confidence.toFixed(0)}%
+          {!analyticsLocked && (
+            <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
+              <span className="text-slate-400 text-sm">Прематч‑прогноз</span>
+              <p className="text-emerald-300 font-semibold text-sm mt-0.5">
+                {f2?.forecast_text ?? "—"}
               </p>
-            )}
-          </div>
+              {f2?.probability_pct != null && (
+                <p className="text-xs text-slate-400 mt-1">
+                  Вероятность модели: {f2.probability_pct.toFixed(1)}%
+                </p>
+              )}
+              {f2?.edge_pct != null && (
+                <p className="text-xs text-slate-400 mt-1">
+                  Edge: {f2.edge_pct.toFixed(2)}% · Кф: {f2.odds_used != null ? f2.odds_used.toFixed(2) : "—"}
+                </p>
+              )}
+            </div>
+          )}
         </div>
       </section>
 
+      {!analyticsLocked && (
       <section>
-        <h2 className="text-lg font-semibold text-white mb-3 border-b border-slate-700 pb-2">Форма игроков (последние завершённые)</h2>
+        <h2 className="text-lg font-semibold text-white mb-3 border-b border-slate-700 pb-2">Игроки</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
             <p className="text-white font-semibold mb-2">
               <Link href={`/dashboard/table-tennis/players/${encodeURIComponent(m.home_id)}`} className="hover:text-emerald-200">{m.home_name}</Link>
             </p>
-            <p className="text-slate-300 text-sm">Матчей: {card.home_stats?.finished_matches ?? 0}</p>
-            <p className="text-slate-300 text-sm">Победы/Поражения: {card.home_stats?.wins ?? 0}/{card.home_stats?.losses ?? 0}</p>
-            <p className="text-slate-300 text-sm">Winrate: {card.home_stats?.win_rate != null ? `${card.home_stats.win_rate}%` : "—"}</p>
+            <p className="text-slate-300 text-sm">
+              До этого матча: {homeCtx?.wins ?? 0}-{homeCtx?.losses ?? 0} (winrate {homeCtx?.win_rate != null ? `${homeCtx.win_rate.toFixed(1)}%` : "—"}).
+            </p>
+            <div className="mt-2">
+              <p className="text-slate-400 text-xs mb-1">Форма (последние 5):</p>
+              {renderFormBadges(homeCtx?.last5_form)}
+            </div>
+            <p className="text-slate-400 text-xs mt-1">Побед в очных встречах с соперником: {homeCtx?.h2h_wins ?? 0}</p>
           </div>
           <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
             <p className="text-white font-semibold mb-2">
               <Link href={`/dashboard/table-tennis/players/${encodeURIComponent(m.away_id)}`} className="hover:text-emerald-200">{m.away_name}</Link>
             </p>
-            <p className="text-slate-300 text-sm">Матчей: {card.away_stats?.finished_matches ?? 0}</p>
-            <p className="text-slate-300 text-sm">Победы/Поражения: {card.away_stats?.wins ?? 0}/{card.away_stats?.losses ?? 0}</p>
-            <p className="text-slate-300 text-sm">Winrate: {card.away_stats?.win_rate != null ? `${card.away_stats.win_rate}%` : "—"}</p>
+            <p className="text-slate-300 text-sm">
+              До этого матча: {awayCtx?.wins ?? 0}-{awayCtx?.losses ?? 0} (winrate {awayCtx?.win_rate != null ? `${awayCtx.win_rate.toFixed(1)}%` : "—"}).
+            </p>
+            <div className="mt-2">
+              <p className="text-slate-400 text-xs mb-1">Форма (последние 5):</p>
+              {renderFormBadges(awayCtx?.last5_form)}
+            </div>
+            <p className="text-slate-400 text-xs mt-1">Побед в очных встречах с соперником: {awayCtx?.h2h_wins ?? 0}</p>
           </div>
         </div>
+        <p className="text-slate-400 text-xs mt-2">
+          Очные встречи до старта этого матча: {h2h?.home_wins ?? 0}-{h2h?.away_wins ?? 0} (всего {h2h?.total ?? 0}).
+        </p>
+        <div className="mt-2 rounded-lg bg-slate-900/50 border border-slate-700/50 px-3 py-2">
+          <p className="text-slate-300 text-xs">
+            Мини-таймлайн формы: слева более недавние матчи. Зеленый `W` — победа, красный `L` — поражение.
+          </p>
+        </div>
       </section>
+      )}
 
+      {!analyticsLocked && (
       <section>
         <h2 className="text-lg font-semibold text-white mb-3 border-b border-slate-700 pb-2">
-          Аналитика матча
+          V2 Explainability
         </h2>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3 md:col-span-2">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
             <span className="text-slate-400 text-sm">Краткое обоснование</span>
             <p className="text-slate-200 text-sm mt-1">
-              {card.analytics?.justification ?? "Недостаточно данных для подробной аналитики по этому матчу."}
+              {buildHumanSummary(card)}
             </p>
           </div>
           <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
-            <span className="text-slate-400 text-sm">Личные встречи</span>
-            {card.analytics?.head_to_head && card.analytics.head_to_head.total > 0 ? (
-              <p className="text-slate-200 text-sm mt-1">
-                Матчей: {card.analytics.head_to_head.total}
-                <br />
-                {m.home_name}: {card.analytics.head_to_head.home_wins} побед
-                <br />
-                {m.away_name}: {card.analytics.head_to_head.away_wins} побед
-              </p>
+            <p className="text-white font-semibold mb-1">Что повлияло на выбор</p>
+            {f2?.factors && f2.factors.length > 0 ? (
+              <ul className="space-y-2 text-xs text-slate-200">
+                {f2.factors.map((factor) => (
+                  <li key={`${factor.factor_key}-${factor.rank}`}>
+                    {factorToHumanText(factor)}
+                  </li>
+                ))}
+              </ul>
             ) : (
-              <p className="text-slate-500 text-sm mt-1">Личных встреч в базе пока нет.</p>
-            )}
-          </div>
-        </div>
-
-        <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
-            <p className="text-white font-semibold mb-1">{m.home_name} — ключевые моменты</p>
-            {card.analytics?.home_strengths && card.analytics.home_strengths.length > 0 && (
-              <>
-                <p className="text-emerald-300 text-xs mb-1">Сильные стороны:</p>
-                <ul className="list-disc list-inside text-slate-200 text-xs space-y-0.5">
-                  {card.analytics.home_strengths.map((s, idx) => (
-                    <li key={idx}>{s}</li>
-                  ))}
-                </ul>
-              </>
-            )}
-            {card.analytics?.home_weaknesses && card.analytics.home_weaknesses.length > 0 && (
-              <>
-                <p className="text-rose-300 text-xs mt-2 mb-1">Слабые стороны:</p>
-                <ul className="list-disc list-inside text-slate-200 text-xs space-y-0.5">
-                  {card.analytics.home_weaknesses.map((s, idx) => (
-                    <li key={idx}>{s}</li>
-                  ))}
-                </ul>
-              </>
-            )}
-            {!card.analytics?.home_strengths?.length && !card.analytics?.home_weaknesses?.length && (
-              <p className="text-slate-500 text-xs">Недостаточно данных по игроку.</p>
-            )}
-          </div>
-
-          <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
-            <p className="text-white font-semibold mb-1">{m.away_name} — ключевые моменты</p>
-            {card.analytics?.away_strengths && card.analytics.away_strengths.length > 0 && (
-              <>
-                <p className="text-emerald-300 text-xs mb-1">Сильные стороны:</p>
-                <ul className="list-disc list-inside text-slate-200 text-xs space-y-0.5">
-                  {card.analytics.away_strengths.map((s, idx) => (
-                    <li key={idx}>{s}</li>
-                  ))}
-                </ul>
-              </>
-            )}
-            {card.analytics?.away_weaknesses && card.analytics.away_weaknesses.length > 0 && (
-              <>
-                <p className="text-rose-300 text-xs mt-2 mb-1">Слабые стороны:</p>
-                <ul className="list-disc list-inside text-slate-200 text-xs space-y-0.5">
-                  {card.analytics.away_weaknesses.map((s, idx) => (
-                    <li key={idx}>{s}</li>
-                  ))}
-                </ul>
-              </>
-            )}
-            {!card.analytics?.away_strengths?.length && !card.analytics?.away_weaknesses?.length && (
-              <p className="text-slate-500 text-xs">Недостаточно данных по игроку.</p>
+              <p className="text-slate-500 text-xs">Пояснения модели пока не доступны.</p>
             )}
           </div>
         </div>
       </section>
+      )}
     </div>
   );
 }

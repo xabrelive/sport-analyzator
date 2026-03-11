@@ -7,6 +7,10 @@ from app.api.v1.auth import get_current_user
 from app.db.session import get_async_session
 from app.models.user import User
 from app.schemas.me import MeProfile, MeSettingsUpdate
+from app.services.subscription_access import (
+    has_analytics_subscription,
+    has_vip_channel_subscription,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter()
@@ -47,8 +51,11 @@ def _str_to_time(s: str | None) -> time | None:
 @router.get("", response_model=MeProfile)
 async def get_me(
     user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ):
     """Профиль и настройки уведомлений: привязки Telegram/почты, режим тишины."""
+    has_analytics = await has_analytics_subscription(user.id, session)
+    has_vip = await has_vip_channel_subscription(user.id, session)
     telegram_linked = user.telegram_id is not None
     is_tg_only = user.is_telegram_only()
     email_linked = not is_tg_only or (user.notification_email or "").strip() != ""
@@ -63,7 +70,12 @@ async def get_me(
         notification_email_masked=_mask_email(notification_email) if notification_email else None,
         quiet_hours_start=_time_to_str(user.quiet_hours_start),
         quiet_hours_end=_time_to_str(user.quiet_hours_end),
+        notify_telegram=bool(user.notify_telegram),
+        notify_email=bool(user.notify_email),
         is_telegram_only=is_tg_only,
+        is_superadmin=bool(getattr(user, "is_superadmin", False)),
+        has_analytics_subscription=has_analytics,
+        has_vip_channel_subscription=has_vip,
     )
 
 
@@ -74,10 +86,16 @@ async def update_me(
     session: AsyncSession = Depends(get_async_session),
 ):
     """Обновить настройки: режим тишины."""
+    has_analytics = await has_analytics_subscription(user.id, session)
+    has_vip = await has_vip_channel_subscription(user.id, session)
     if data.quiet_hours_start is not None:
         user.quiet_hours_start = _str_to_time(data.quiet_hours_start)
     if data.quiet_hours_end is not None:
         user.quiet_hours_end = _str_to_time(data.quiet_hours_end)
+    if data.notify_telegram is not None:
+        user.notify_telegram = bool(data.notify_telegram)
+    if data.notify_email is not None:
+        user.notify_email = bool(data.notify_email)
     await session.commit()
     await session.refresh(user)
     telegram_linked = user.telegram_id is not None
@@ -94,7 +112,12 @@ async def update_me(
         notification_email_masked=_mask_email(notification_email) if notification_email else None,
         quiet_hours_start=_time_to_str(user.quiet_hours_start),
         quiet_hours_end=_time_to_str(user.quiet_hours_end),
+        notify_telegram=bool(user.notify_telegram),
+        notify_email=bool(user.notify_email),
         is_telegram_only=is_tg_only,
+        is_superadmin=bool(getattr(user, "is_superadmin", False)),
+        has_analytics_subscription=has_analytics,
+        has_vip_channel_subscription=has_vip,
     )
 
 
