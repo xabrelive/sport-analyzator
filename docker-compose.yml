@@ -85,6 +85,54 @@ services:
       backend:
         condition: service_healthy
 
+  telegram_bot_free:
+    build:
+      context: ./telegram_bot
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_SIGNALS_FREE_BOT_TOKEN:-}
+      BOT_MODE: channel_only
+      CHANNEL_BOT_DM_REPLY: "Этот бот публикует сообщения только в FREE-канал. Личный кабинет: https://pingwin.pro"
+      BACKEND_URL: http://backend:11001
+      FRONTEND_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  telegram_bot_ml_paid:
+    build:
+      context: ./telegram_bot
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_SIGNALS_VIP_BOT_TOKEN:-}
+      BOT_MODE: channel_only
+      CHANNEL_BOT_DM_REPLY: "Этот бот публикует сообщения только в платный ML-канал. Личный кабинет: https://pingwin.pro"
+      BACKEND_URL: http://backend:11001
+      FRONTEND_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  telegram_bot_no_ml:
+    build:
+      context: ./telegram_bot
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_SIGNALS_NO_ML_BOT_TOKEN:-}
+      BOT_MODE: channel_only
+      CHANNEL_BOT_DM_REPLY: "Этот бот публикует сообщения только в no-ML канал. Личный кабинет: https://pingwin.pro"
+      BACKEND_URL: http://backend:11001
+      FRONTEND_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://pingwin.pro}
+    depends_on:
+      backend:
+        condition: service_healthy
+
   ml_worker:
     build:
       context: ./backend

@@ -1,4 +1,4 @@
-"""ML модели: XGBoost/LightGBM с поддержкой GPU."""
+"""ML модели: LightGBM (GPU) + вспомогательные CPU-модели."""
 from __future__ import annotations
 
 import json
@@ -50,7 +50,7 @@ TARGET_SET = "target_set"  # любой сет (для p_set → Monte Carlo)
 
 
 def _detect_gpu() -> dict[str, Any]:
-    """Определяет доступность GPU для XGBoost/LightGBM.
+    """Определяет доступность GPU для LightGBM.
     ML_USE_GPU=false — принудительно CPU.
     ML_USE_AMD_GPU=1 — AMD MI50 (ROCm/HIP), device=hip.
     Иначе — NVIDIA CUDA."""
@@ -213,70 +213,32 @@ def _train_binary_model(df: pd.DataFrame, target_col: str, use_gpu: bool | None 
     y = df[target_col]
     scale_pos_weight = max(0.1, (y == 0).sum() / max(1, (y == 1).sum()))
 
-    try:
-        import xgboost as xgb
-    except ImportError:
-        import lightgbm as lgb
-        from sklearn.utils.class_weight import compute_sample_weight
-        gpu = _detect_gpu()
-        params = {
-            "objective": "binary",
-            "metric": "auc",
-            "num_leaves": 31,
-            "learning_rate": 0.05,
-            "n_estimators": 300,
-            "verbose": -1,
-        }
-        if use_gpu and gpu["device"] == "cuda":
-            params["device"] = "cuda"
-        model = lgb.LGBMClassifier(**params)
-        sw = compute_sample_weight("balanced", y)
-        model.fit(X, y, sample_weight=sw)
-        return model
+    import lightgbm as lgb
+    from sklearn.utils.class_weight import compute_sample_weight
 
-    gpu = _detect_gpu() if use_gpu else {"tree_method": "hist", "device": "cpu"}
+    gpu = _detect_gpu() if use_gpu else {"device": "cpu"}
     params = {
-        "objective": "binary:logistic",
-        "eval_metric": "auc",
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "n_estimators": 300,
-        "tree_method": gpu["tree_method"],
-        "device": gpu["device"],
-        "verbosity": 0,
-        "scale_pos_weight": scale_pos_weight,
+        "objective": "binary",
+        "metric": "auc",
+        "num_leaves": 63,
+        "learning_rate": 0.03,
+        "n_estimators": 400,
+        "verbose": -1,
     }
-    if gpu["device"] in ("cuda", "cuda:0", "hip"):
-        logger.info("XGBoost: обучение на GPU (device=%s)", gpu["device"])
-    try:
-        model = xgb.XGBClassifier(**params)
-        if gpu["device"] in ("cuda", "cuda:0", "hip"):
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                model.fit(X, y)
-            for warn in w:
-                msg = str(warn.message)
-                if "No visible GPU is found" in msg or "Device is changed from GPU to CPU" in msg:
-                    raise RuntimeError(msg)
-        else:
-            model.fit(X, y)
-    except Exception as e:
-        err_str = str(e).lower()
-        if "no visible gpu is found" in err_str or "device is changed from gpu to cpu" in err_str:
-            raise RuntimeError(f"XGBoost не видит GPU внутри контейнера: {e}") from e
-        if "nokernelimage" in err_str or "no kernel image" in err_str or "cudaerror" in err_str or "hiperror" in err_str:
-            logger.warning("XGBoost GPU failed (%s), fallback на CPU", e)
-            params["device"] = "cpu"
-            params["tree_method"] = "hist"
-            model = xgb.XGBClassifier(**params)
-            model.fit(X, y)
-        else:
-            raise
+    if use_gpu and str(gpu["device"]).startswith("cuda"):
+        # Для LightGBM GPU-режим включается через device/accelerator.
+        params["device"] = "cuda"
+    else:
+        params["device_type"] = "cpu"
+
+    model = lgb.LGBMClassifier(**params)
+    sw = compute_sample_weight("balanced", y)
+    model.fit(X, y, sample_weight=sw)
     return model
 
 
 def train_match_model(df: pd.DataFrame, use_gpu: bool | None = None) -> Any:
-    """Обучает модель победы в матче (XGBoost)."""
+    """Обучает модель победы в матче (LightGBM)."""
     return _train_binary_model(df, TARGET_MATCH, use_gpu)
 
 
@@ -323,7 +285,7 @@ def save_models(
     p_point_model: Any | None = None,
     version: str = "v1",
 ) -> str:
-    """Сохраняет модели на диск (joblib для CalibratedClassifierCV, иначе XGB/LGB native)."""
+    """Сохраняет модели на диск (joblib для всех моделей, включая LightGBM)."""
     import joblib
     model_dir = Path(getattr(settings, "ml_model_dir", None) or os.environ.get("ML_MODEL_DIR", "/tmp/pingwin_ml_models"))
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -335,13 +297,7 @@ def save_models(
         models.append(("p_point", p_point_model))
     for name, model in models:
         path = f"{prefix}_{name}.joblib"
-        if hasattr(model, "calibrated_classifiers_"):
-            joblib.dump(model, path)
-        else:
-            try:
-                model.save_model(path.replace(".joblib", ".json"))
-            except AttributeError:
-                joblib.dump(model, path)
+        joblib.dump(model, path)
     meta = {"version": version, "features": FEATURE_COLS}
     with open(f"{prefix}_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -353,47 +309,20 @@ def load_models(version: str = "v1") -> tuple[Any, Any, Any | None, Any | None]:
     import joblib
     model_dir = Path(getattr(settings, "ml_model_dir", None) or os.environ.get("ML_MODEL_DIR", "/tmp/pingwin_ml_models"))
     prefix = model_dir / f"tt_ml_{version}"
-    joblib_match = Path(f"{prefix}_match.joblib")
-    json_match = Path(f"{prefix}_match.json")
-    set_model = None
-    p_point_model = None
-    set_joblib = Path(f"{prefix}_set.joblib")
-    p_point_joblib = Path(f"{prefix}_p_point.joblib")
-    if set_joblib.exists():
-        set_model = joblib.load(set_joblib)
-    if p_point_joblib.exists():
-        p_point_model = joblib.load(p_point_joblib)
-    if joblib_match.exists():
-        match_model = joblib.load(joblib_match)
-        set1_model = joblib.load(f"{prefix}_set1.joblib")
-    elif json_match.exists():
-        import xgboost as xgb
-        match_model = xgb.XGBClassifier()
-        match_model.load_model(str(json_match))
-        set1_model = xgb.XGBClassifier()
-        set1_model.load_model(str(prefix) + "_set1.json")
-        if set_model is None and Path(f"{prefix}_set.json").exists():
-            set_model = xgb.XGBClassifier()
-            set_model.load_model(str(prefix) + "_set.json")
-    elif (Path(str(prefix) + "_match.txt").exists() and Path(str(prefix) + "_set1.txt").exists()):
-        import lightgbm as lgb
+    match_path = Path(f"{prefix}_match.joblib")
+    set1_path = Path(f"{prefix}_set1.joblib")
+    set_path = Path(f"{prefix}_set.joblib")
+    p_point_path = Path(f"{prefix}_p_point.joblib")
 
-        class _LGBWrapper:
-            def __init__(self, booster):
-                self._booster = booster
-
-            def predict_proba(self, X):
-                p = self._booster.predict(X)
-                return np.column_stack([1 - p, p])
-
-        match_model = _LGBWrapper(lgb.Booster(model_file=str(prefix) + "_match.txt"))
-        set1_model = _LGBWrapper(lgb.Booster(model_file=str(prefix) + "_set1.txt"))
-        if set_model is None and Path(f"{prefix}_set.txt").exists():
-            set_model = _LGBWrapper(lgb.Booster(model_file=str(prefix) + "_set.txt"))
-    else:
+    if not (match_path.exists() and set1_path.exists()):
         raise FileNotFoundError(
             f"ML-модели не найдены в {model_dir}. Запустите retrain (Full rebuild или Переобучить)."
         )
+
+    match_model = joblib.load(match_path)
+    set1_model = joblib.load(set1_path)
+    set_model = joblib.load(set_path) if set_path.exists() else None
+    p_point_model = joblib.load(p_point_path) if p_point_path.exists() else None
     return match_model, set1_model, set_model, p_point_model
 
 
@@ -422,40 +351,26 @@ def _calibrate_model(model: Any, X: pd.DataFrame, y: pd.Series, groups: pd.Serie
         return model
 
 
-def _verify_xgboost_gpu() -> bool:
-    """Проверяет, что XGBoost реально использует GPU (warmup)."""
+def _verify_lightgbm_gpu() -> bool:
+    """Проверяет, что LightGBM реально использует GPU (warmup)."""
     try:
-        import subprocess
-        import sys
-        probe_code = (
-            "import warnings, numpy as np, xgboost as xgb; "
-            "X=np.random.rand(256,8).astype('float32'); "
-            "y=np.random.randint(0,2,256).astype('int32'); "
-            "m=xgb.XGBClassifier(tree_method='hist',device='cuda:0',n_estimators=3,verbosity=0); "
-            "warnings.simplefilter('always'); "
-            "m.fit(X,y); "
-            "print('XGB_GPU_WARMUP_OK')"
-        )
-        r = subprocess.run(
-            [sys.executable, "-c", probe_code],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-        out = (r.stdout or "") + "\n" + (r.stderr or "")
-        if r.returncode != 0:
-            logger.warning("XGBoost GPU warmup failed (rc=%s): %s", r.returncode, out.strip()[:800])
-            return False
-        if "No visible GPU is found" in out or "Device is changed from GPU to CPU" in out:
-            logger.warning("XGBoost GPU warmup warning: %s", out.strip()[:800])
-            return False
-        if "XGB_GPU_WARMUP_OK" not in out:
-            logger.warning("XGBoost GPU warmup ambiguous output: %s", out.strip()[:800])
-            return False
-        logger.info("XGBoost: GPU warmup OK")
+        import lightgbm as lgb
+        import numpy as np
+
+        X = np.random.rand(256, 8).astype("float32")
+        y = np.random.randint(0, 2, 256).astype("int32")
+        train_data = lgb.Dataset(X, label=y)
+        params = {
+            "objective": "binary",
+            "metric": "auc",
+            "device": "cuda",
+            "verbose": -1,
+        }
+        lgb.train(params, train_data, num_boost_round=10)
+        logger.info("LightGBM: GPU warmup OK")
         return True
     except Exception as e:
-        logger.warning("XGBoost GPU warmup failed: %s", e)
+        logger.warning("LightGBM GPU warmup failed: %s", e)
         return False
 
 
@@ -478,9 +393,10 @@ def retrain_models_if_needed(min_rows: int = 100, version: str = "v1", progress_
     gpu = _detect_gpu()
     device = gpu.get("device", "cpu")
     if use_gpu and str(device).startswith("cuda"):
-        if not _verify_xgboost_gpu():
+        # В GPU-only режиме считаем ошибкой любую ситуацию, когда CUDA не может быть использована.
+        if not _verify_lightgbm_gpu():
             raise RuntimeError(
-                "GPU включен, но XGBoost не может использовать CUDA внутри контейнера. "
+                "GPU включен, но LightGBM не может использовать CUDA внутри контейнера. "
                 "Проверьте совместимость CUDA image и драйвера."
             )
     _log(f"  Match-модель: старт ({len(df)} строк, {'CUDA' if use_gpu else 'CPU'}, ~5–15 мин GPU / ~20–40 мин CPU)")

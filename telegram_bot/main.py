@@ -12,6 +12,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from config import (
     BACKEND_URL,
+    BOT_MODE,
+    CHANNEL_BOT_DM_REPLY,
     FRONTEND_URL,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_BOT_USERNAME,
@@ -84,6 +86,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Приветствие и показ меню."""
     if not update.effective_user or not update.message:
         return
+    if BOT_MODE == "channel_only":
+        await update.message.reply_text(CHANNEL_BOT_DM_REPLY)
+        return
     await update.message.reply_text(
         "Привет! Я бот аналитики PingWin (pingwin.pro).\n\n"
         f"Выберите действие в меню ниже или используйте команды.",
@@ -94,6 +99,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Выдать код для регистрации на сайте (действует 10 минут)."""
     if not update.effective_user or not update.message:
+        return
+    if BOT_MODE == "channel_only":
+        await update.message.reply_text(CHANNEL_BOT_DM_REPLY)
         return
     user = update.effective_user
     telegram_id = user.id
@@ -136,6 +144,9 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Пункт «Получить информацию» — сообщение из админки."""
     if not update.message:
         return
+    if BOT_MODE == "channel_only":
+        await update.message.reply_text(CHANNEL_BOT_DM_REPLY)
+        return
     text = await fetch_bot_info_message()
     await update.message.reply_text(text, reply_markup=MENU_KEYBOARD)
 
@@ -143,6 +154,9 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_link_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Инструкция: как привязать аккаунт по коду с сайта."""
     if not update.message:
+        return
+    if BOT_MODE == "channel_only":
+        await update.message.reply_text(CHANNEL_BOT_DM_REPLY)
         return
     settings_url = f"{FRONTEND_URL}/dashboard/settings"
     await update.message.reply_text(
@@ -180,6 +194,9 @@ async def link_by_code(telegram_id: int, username: str | None, code: str) -> tup
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка нажатий кнопок меню и ввод кода для привязки."""
     if not update.message or not update.message.text:
+        return
+    if BOT_MODE == "channel_only":
+        await update.message.reply_text(CHANNEL_BOT_DM_REPLY)
         return
     text = update.message.text.strip()
     if text == BTN_GET_CODE:

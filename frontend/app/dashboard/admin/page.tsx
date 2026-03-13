@@ -13,6 +13,7 @@ import {
   getAdminMlVerify,
   getAdminPaymentMethods,
   getAdminProducts,
+  getAdminTelegramDispatchConfig,
   getAdminTelegramBotInfo,
   getAdminUsers,
   patchAdminInvoiceStatus,
@@ -29,6 +30,7 @@ import {
   postAdminMlSyncLeagues,
   postAdminMlSyncPlayers,
   putAdminTelegramBotInfo,
+  putAdminTelegramDispatchConfig,
   sendAdminMessage,
   type AdminInvoiceItem,
   type AdminMlDashboard,
@@ -156,9 +158,95 @@ function LinkifiedText({ text }: { text: string }) {
   );
 }
 
+function DispatchConfigPreview({ cfgText }: { cfgText: string }) {
+  let cfg: Record<string, unknown> | null = null;
+  try {
+    cfg = cfgText.trim() ? (JSON.parse(cfgText) as Record<string, unknown>) : null;
+  } catch {
+    cfg = null;
+  }
+  if (!cfg) {
+    return <p className="text-xs text-amber-300">JSON невалиден — предпросмотр недоступен.</p>;
+  }
+  const free = (cfg.free as Record<string, unknown> | undefined) || {};
+  const vip = (cfg.vip as Record<string, unknown> | undefined) || {};
+  const noMl = (cfg.no_ml_channel as Record<string, unknown> | undefined) || {};
+  const slotsToText = (slotsRaw: unknown) => {
+    const slots = Array.isArray(slotsRaw) ? slotsRaw : [];
+    return slots
+      .map((s) => {
+        const it = (s as Record<string, unknown>) || {};
+        const t = String(it.time_msk || "??:??");
+        const src = String(it.source || "no_ml");
+        const count = Number(it.count || 1);
+        return `${t} · ${count} шт · source=${src}`;
+      })
+      .join(" | ");
+  };
+  return (
+    <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300">
+      <p className="font-medium text-slate-200 mb-2">Предпросмотр расписаний</p>
+      <p>FREE: {Boolean(free.enabled ?? true) ? (slotsToText(free.slots) || "—") : "выключен"}</p>
+      <p>PAID/ML: {Boolean(vip.enabled ?? true) ? (slotsToText(vip.slots) || "—") : "выключен"}</p>
+      <p>
+        NO_ML stream: {Boolean(noMl.enabled ?? true) ? (Boolean(noMl.stream_enabled ?? false) ? "включен" : "выключен") : "канал выключен"}, interval=
+        {String(noMl.stream_interval_minutes ?? "30")}m, group_limit={String(noMl.stream_group_limit ?? "20")}, source=
+        {String(noMl.stream_source ?? "no_ml")}
+      </p>
+      <p>
+        Daily summary UTC: free={free.daily_summary_hour_utc == null ? "off" : String(free.daily_summary_hour_utc)}, paid=
+        {vip.daily_summary_hour_utc == null ? "off" : String(vip.daily_summary_hour_utc)}, no_ml=
+        {noMl.daily_summary_hour_utc == null ? "off" : String(noMl.daily_summary_hour_utc)}
+      </p>
+    </div>
+  );
+}
+
+function DispatchConfigHelp() {
+  return (
+    <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300 space-y-2">
+      <p className="font-medium text-slate-200">Подсказка по ключам расписания</p>
+      <p>
+        <span className="text-slate-100">Источники (`source`):</span> <code>no_ml</code> или <code>paid</code>.
+      </p>
+      <p>
+        <span className="text-slate-100">Формат времени:</span> <code>time_msk</code> в виде <code>HH:MM</code> (MSK, 24ч), пример: <code>11:00</code>.
+      </p>
+      <p>
+        <span className="text-slate-100">Общее:</span> <code>enabled</code> (boolean), <code>min_lead_minutes</code> (number),{" "}
+        <code>daily_summary_hour_utc</code> (0-23 или <code>null</code> для выключения).
+      </p>
+      <p>
+        <span className="text-slate-100">FREE / VIP:</span> обязательные ключи в слоте: <code>time_msk</code>, <code>source</code>,{" "}
+        <code>count</code>.
+      </p>
+      <p>
+        <span className="text-slate-100">NO_ML stream:</span> <code>stream_enabled</code> (boolean),{" "}
+        <code>stream_interval_minutes</code> (&gt;=5), <code>stream_group_limit</code> (&gt;=1),{" "}
+        <code>stream_fetch_limit</code> (&gt;=1), <code>stream_source</code> (<code>no_ml</code> | <code>paid</code>).
+      </p>
+      <p>
+        <span className="text-slate-100">Минимально обязательная структура:</span> верхние ключи <code>free</code>, <code>vip</code>,{" "}
+        <code>no_ml_channel</code>. Если ключ отсутствует, будут применены дефолты сервиса.
+      </p>
+    </div>
+  );
+}
+
 export default function AdminPage() {
+  type AdminTab =
+    | "users"
+    | "products"
+    | "methods"
+    | "invoices"
+    | "ml"
+    | "bot_info"
+    | "schedules"
+    | "messages";
+
   const [allowed, setAllowed] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<AdminTab>("users");
 
   const [users, setUsers] = useState<AdminUserListItem[]>([]);
   const [usersTotal, setUsersTotal] = useState(0);
@@ -172,11 +260,14 @@ export default function AdminPage() {
   const [invoicesStatus, setInvoicesStatus] = useState<"" | "pending" | "paid" | "cancelled">("pending");
 
   const [sending, setSending] = useState(false);
-  const [messageTarget, setMessageTarget] = useState<"free_channel" | "vip_channel" | "telegram_user" | "email">("free_channel");
+  const [messageTarget, setMessageTarget] = useState<"free_channel" | "vip_channel" | "no_ml_channel" | "telegram_user" | "telegram_all_users" | "email">("free_channel");
   const [messageText, setMessageText] = useState("");
   const [messageUserId, setMessageUserId] = useState("");
   const [messageEmail, setMessageEmail] = useState("");
   const [messageSubject, setMessageSubject] = useState("Сообщение от PingWin");
+  const [messageImageUrl, setMessageImageUrl] = useState("");
+  const [messageImageUrls, setMessageImageUrls] = useState("");
+  const [messageResult, setMessageResult] = useState<string>("");
 
   const [newMethodName, setNewMethodName] = useState("");
   const [newMethodType, setNewMethodType] = useState<"custom" | "card" | "crypto">("custom");
@@ -184,6 +275,8 @@ export default function AdminPage() {
 
   const [botInfoMessage, setBotInfoMessage] = useState("");
   const [botInfoSaving, setBotInfoSaving] = useState(false);
+  const [dispatchCfgText, setDispatchCfgText] = useState("");
+  const [dispatchCfgSaving, setDispatchCfgSaving] = useState(false);
 
   const [mlStats, setMlStats] = useState<AdminMlStats | null>(null);
   const [mlDashboard, setMlDashboard] = useState<AdminMlDashboard | null>(null);
@@ -210,6 +303,21 @@ export default function AdminPage() {
   const totalPages = useMemo(() => Math.max(1, Math.ceil(usersTotal / pageSize)), [usersTotal]);
   const currentPage = useMemo(() => Math.floor(usersOffset / pageSize) + 1, [usersOffset]);
 
+  const dispatchCfgObj = useMemo<Record<string, unknown> | null>(() => {
+    try {
+      return dispatchCfgText.trim() ? (JSON.parse(dispatchCfgText) as Record<string, unknown>) : {};
+    } catch {
+      return null;
+    }
+  }, [dispatchCfgText]);
+
+  const updateDispatchCfg = (updater: (cfg: Record<string, unknown>) => void) => {
+    const base = dispatchCfgObj && typeof dispatchCfgObj === "object" ? dispatchCfgObj : {};
+    const clone = JSON.parse(JSON.stringify(base)) as Record<string, unknown>;
+    updater(clone);
+    setDispatchCfgText(JSON.stringify(clone, null, 2));
+  };
+
   const loadUsers = async () => {
     const data = await getAdminUsers({ q: usersQ, offset: usersOffset, limit: pageSize });
     setUsers(data.items);
@@ -230,6 +338,7 @@ export default function AdminPage() {
           setInvoicesTotal(r.total);
         }),
         getAdminTelegramBotInfo().then((r) => setBotInfoMessage(r.message || "")),
+        getAdminTelegramDispatchConfig().then((r) => setDispatchCfgText(JSON.stringify(r.config || {}, null, 2))),
         getAdminMlStats().then(setMlStats).catch(() => setMlStats(null)),
         getAdminMlDashboard().then(setMlDashboard).catch(() => setMlDashboard(null)),
       ]);
@@ -288,25 +397,40 @@ export default function AdminPage() {
     return <div className="p-6 text-rose-300">Доступ запрещён. {error || ""}</div>;
   }
 
-  return (
-    <div className="p-4 md:p-6 space-y-8">
-      <div>
-        <h1 className="text-2xl font-semibold text-white">Админка</h1>
-        <p className="text-slate-400 mt-1">Управление пользователями, подписками, тарифами, платёжками и рассылками.</p>
-        <nav className="flex flex-wrap gap-2 mt-3">
-          <a href="#admin-users" className="text-sm text-sky-400 hover:text-sky-300">Пользователи</a>
-          <span className="text-slate-600">·</span>
-          <a href="#admin-products" className="text-sm text-sky-400 hover:text-sky-300">Тарифы</a>
-          <span className="text-slate-600">·</span>
-          <a href="#admin-methods" className="text-sm text-sky-400 hover:text-sky-300">Платёжки</a>
-          <span className="text-slate-600">·</span>
-          <a href="#admin-invoices" className="text-sm text-sky-400 hover:text-sky-300">Инвойсы</a>
-          <span className="text-slate-600">·</span>
-          <a href="#admin-ml" className="text-sm text-emerald-400 hover:text-emerald-300 font-medium">ML (модели, синхронизация)</a>
-        </nav>
-      </div>
+  const tabBtn = (tab: AdminTab, label: string) => (
+    <button
+      type="button"
+      onClick={() => setActiveTab(tab)}
+      className={`w-full rounded px-3 py-2 text-left text-sm border ${
+        activeTab === tab
+          ? "border-sky-500/50 bg-sky-500/20 text-sky-100"
+          : "border-slate-700 text-slate-300 hover:bg-slate-800"
+      }`}
+    >
+      {label}
+    </button>
+  );
 
-      <section id="admin-users" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+  return (
+    <div className="p-4 md:p-6">
+      <div className="mb-4">
+        <h1 className="text-2xl font-semibold text-white">Админка</h1>
+        <p className="text-slate-400 mt-1">Управление пользователями, подписками, тарифами, платежами и рассылками.</p>
+      </div>
+      <div className="grid gap-6 md:grid-cols-[240px_minmax(0,1fr)]">
+        <aside className="h-fit rounded-xl border border-slate-800 bg-slate-900/40 p-3 space-y-2 md:sticky md:top-4">
+          {tabBtn("users", "Пользователи")}
+          {tabBtn("products", "Тарифы")}
+          {tabBtn("methods", "Платежки")}
+          {tabBtn("invoices", "Инвойсы")}
+          {tabBtn("ml", "ML")}
+          {tabBtn("bot_info", "Бот: инфо")}
+          {tabBtn("schedules", "Боты: расписания")}
+          {tabBtn("messages", "Рассылки")}
+        </aside>
+        <div className="space-y-8">
+
+      <section className={`${activeTab === "users" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
         <h2 className="text-lg text-white mb-3">Пользователи</h2>
         <div className="flex flex-wrap gap-2 mb-3">
           <input
@@ -389,7 +513,7 @@ export default function AdminPage() {
         </div>
       </section>
 
-      <section id="admin-products" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section className={`${activeTab === "products" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
         <h2 className="text-lg text-white mb-3">Тарифы (биллинг)</h2>
         <div className="space-y-2">
           {products.map((p) => (
@@ -442,7 +566,7 @@ export default function AdminPage() {
         </div>
       </section>
 
-      <section id="admin-methods" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section className={`${activeTab === "methods" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
         <h2 className="text-lg text-white mb-3">Платёжки</h2>
         <div className="grid gap-2 md:grid-cols-[1fr_140px_1fr_auto] mb-4">
           <input value={newMethodName} onChange={(e) => setNewMethodName(e.target.value)} placeholder="Название (например: Безналичная оплата)" className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
@@ -533,7 +657,7 @@ export default function AdminPage() {
         </div>
       </section>
 
-      <section id="admin-invoices" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section className={`${activeTab === "invoices" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
         <h2 className="text-lg text-white mb-3">Инвойсы</h2>
         <div className="flex flex-wrap items-center gap-2 mb-3">
           {[
@@ -614,7 +738,7 @@ export default function AdminPage() {
         </div>
       </section>
 
-      <section id="admin-ml" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section className={`${activeTab === "ml" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
         <h2 className="text-lg text-white mb-3">ML-база (pingwin_ml)</h2>
         <div className="rounded-lg border border-slate-700 bg-slate-900/80 p-3 mb-4 text-sm text-slate-300 space-y-2">
           <p className="font-medium text-slate-200">Два источника заполнения:</p>
@@ -1016,7 +1140,7 @@ export default function AdminPage() {
         {mlRetrainResult && <p className="text-sm text-slate-300 mt-2">{mlRetrainResult}</p>}
       </section>
 
-      <section className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section className={`${activeTab === "bot_info" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
         <h2 className="text-lg text-white mb-3">Сообщение бота «Получить информацию»</h2>
         <p className="text-slate-400 text-sm mb-2">
           Текст, который видят пользователи в Telegram-боте при нажатии на кнопку «Получить информацию».
@@ -1047,19 +1171,498 @@ export default function AdminPage() {
         </button>
       </section>
 
-      <section className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section className={`${activeTab === "schedules" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
+        <h2 className="text-lg text-white mb-3">Настройка расписаний ботов (JSON)</h2>
+        <p className="text-slate-400 text-sm mb-2">
+          Полностью настраиваемые правила `откуда/сколько/куда`: слоты для FREE и PAID/ML, stream с группировкой для NO_ML, daily summary.
+        </p>
+        <DispatchConfigHelp />
+        <DispatchConfigPreview cfgText={dispatchCfgText} />
+        {dispatchCfgObj ? (
+          <div className="my-3 grid gap-3 md:grid-cols-2">
+            <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300">
+              <p className="mb-2 font-medium text-slate-200">FREE: слоты</p>
+              <div className="mb-2 grid grid-cols-3 gap-2">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={Boolean((dispatchCfgObj.free as Record<string, unknown> | undefined)?.enabled ?? true)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const free = (cfg.free as Record<string, unknown>) || {};
+                        free.enabled = e.target.checked;
+                        cfg.free = free;
+                      })
+                    }
+                  />
+                  enabled
+                </label>
+                <label>
+                  min_lead
+                  <input
+                    type="number"
+                    min={0}
+                    value={Number((dispatchCfgObj.free as Record<string, unknown> | undefined)?.min_lead_minutes ?? 60)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const free = (cfg.free as Record<string, unknown>) || {};
+                        free.min_lead_minutes = Number(e.target.value || 0);
+                        cfg.free = free;
+                      })
+                    }
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  />
+                </label>
+                <label>
+                  summary UTC
+                  <input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={(dispatchCfgObj.free as Record<string, unknown> | undefined)?.daily_summary_hour_utc === null ? "" : String((dispatchCfgObj.free as Record<string, unknown> | undefined)?.daily_summary_hour_utc ?? "")}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const free = (cfg.free as Record<string, unknown>) || {};
+                        free.daily_summary_hour_utc = e.target.value === "" ? null : Number(e.target.value);
+                        cfg.free = free;
+                      })
+                    }
+                    placeholder="пусто = выкл"
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  />
+                </label>
+              </div>
+              {Array.isArray((dispatchCfgObj.free as Record<string, unknown> | undefined)?.slots) ? (
+                ((dispatchCfgObj.free as Record<string, unknown>).slots as Array<Record<string, unknown>>).map((slot, idx) => (
+                  <div key={`free-slot-${idx}`} className="mb-2 grid grid-cols-4 gap-2">
+                    <input
+                      value={String(slot.time_msk ?? "")}
+                      onChange={(e) =>
+                        updateDispatchCfg((cfg) => {
+                          const free = (cfg.free as Record<string, unknown>) || {};
+                          const slots = Array.isArray(free.slots) ? ([...free.slots] as Array<Record<string, unknown>>) : [];
+                          slots[idx] = { ...(slots[idx] || {}), time_msk: e.target.value };
+                          free.slots = slots;
+                          cfg.free = free;
+                        })
+                      }
+                      className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                    />
+                    <select
+                      value={String(slot.source ?? "no_ml")}
+                      onChange={(e) =>
+                        updateDispatchCfg((cfg) => {
+                          const free = (cfg.free as Record<string, unknown>) || {};
+                          const slots = Array.isArray(free.slots) ? ([...free.slots] as Array<Record<string, unknown>>) : [];
+                          slots[idx] = { ...(slots[idx] || {}), source: e.target.value };
+                          free.slots = slots;
+                          cfg.free = free;
+                        })
+                      }
+                      className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                    >
+                      <option value="no_ml">no_ml</option>
+                      <option value="paid">paid</option>
+                    </select>
+                    <input
+                      type="number"
+                      min={1}
+                      value={Number(slot.count ?? 1)}
+                      onChange={(e) =>
+                        updateDispatchCfg((cfg) => {
+                          const free = (cfg.free as Record<string, unknown>) || {};
+                          const slots = Array.isArray(free.slots) ? ([...free.slots] as Array<Record<string, unknown>>) : [];
+                          slots[idx] = { ...(slots[idx] || {}), count: Number(e.target.value || 1) };
+                          free.slots = slots;
+                          cfg.free = free;
+                        })
+                      }
+                      className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                    />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateDispatchCfg((cfg) => {
+                          const free = (cfg.free as Record<string, unknown>) || {};
+                          const slots = Array.isArray(free.slots) ? ([...free.slots] as Array<Record<string, unknown>>) : [];
+                          slots.splice(idx, 1);
+                          free.slots = slots;
+                          cfg.free = free;
+                        })
+                      }
+                      className="rounded border border-rose-700 px-2 py-1 text-rose-300 hover:bg-rose-950/30"
+                    >
+                      удалить
+                    </button>
+                  </div>
+                ))
+              ) : null}
+              <button
+                type="button"
+                onClick={() =>
+                  updateDispatchCfg((cfg) => {
+                    const free = (cfg.free as Record<string, unknown>) || {};
+                    const slots = Array.isArray(free.slots) ? ([...free.slots] as Array<Record<string, unknown>>) : [];
+                    slots.push({ time_msk: "11:00", source: "no_ml", count: 1 });
+                    free.slots = slots;
+                    cfg.free = free;
+                  })
+                }
+                className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800"
+              >
+                + добавить слот
+              </button>
+            </div>
+            <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300">
+              <p className="mb-2 font-medium text-slate-200">PAID/ML: слоты</p>
+              <div className="mb-2 grid grid-cols-3 gap-2">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={Boolean((dispatchCfgObj.vip as Record<string, unknown> | undefined)?.enabled ?? true)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const vip = (cfg.vip as Record<string, unknown>) || {};
+                        vip.enabled = e.target.checked;
+                        cfg.vip = vip;
+                      })
+                    }
+                  />
+                  enabled
+                </label>
+                <label>
+                  min_lead
+                  <input
+                    type="number"
+                    min={0}
+                    value={Number((dispatchCfgObj.vip as Record<string, unknown> | undefined)?.min_lead_minutes ?? 60)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const vip = (cfg.vip as Record<string, unknown>) || {};
+                        vip.min_lead_minutes = Number(e.target.value || 0);
+                        cfg.vip = vip;
+                      })
+                    }
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  />
+                </label>
+                <label>
+                  summary UTC
+                  <input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={(dispatchCfgObj.vip as Record<string, unknown> | undefined)?.daily_summary_hour_utc === null ? "" : String((dispatchCfgObj.vip as Record<string, unknown> | undefined)?.daily_summary_hour_utc ?? "")}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const vip = (cfg.vip as Record<string, unknown>) || {};
+                        vip.daily_summary_hour_utc = e.target.value === "" ? null : Number(e.target.value);
+                        cfg.vip = vip;
+                      })
+                    }
+                    placeholder="пусто = выкл"
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  />
+                </label>
+              </div>
+              {Array.isArray((dispatchCfgObj.vip as Record<string, unknown> | undefined)?.slots) ? (
+                ((dispatchCfgObj.vip as Record<string, unknown>).slots as Array<Record<string, unknown>>).map((slot, idx) => (
+                  <div key={`vip-slot-${idx}`} className="mb-2 grid grid-cols-4 gap-2">
+                    <input
+                      value={String(slot.time_msk ?? "")}
+                      onChange={(e) =>
+                        updateDispatchCfg((cfg) => {
+                          const vip = (cfg.vip as Record<string, unknown>) || {};
+                          const slots = Array.isArray(vip.slots) ? ([...vip.slots] as Array<Record<string, unknown>>) : [];
+                          slots[idx] = { ...(slots[idx] || {}), time_msk: e.target.value };
+                          vip.slots = slots;
+                          cfg.vip = vip;
+                        })
+                      }
+                      className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                    />
+                    <select
+                      value={String(slot.source ?? "no_ml")}
+                      onChange={(e) =>
+                        updateDispatchCfg((cfg) => {
+                          const vip = (cfg.vip as Record<string, unknown>) || {};
+                          const slots = Array.isArray(vip.slots) ? ([...vip.slots] as Array<Record<string, unknown>>) : [];
+                          slots[idx] = { ...(slots[idx] || {}), source: e.target.value };
+                          vip.slots = slots;
+                          cfg.vip = vip;
+                        })
+                      }
+                      className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                    >
+                      <option value="no_ml">no_ml</option>
+                      <option value="paid">paid</option>
+                    </select>
+                    <input
+                      type="number"
+                      min={1}
+                      value={Number(slot.count ?? 1)}
+                      onChange={(e) =>
+                        updateDispatchCfg((cfg) => {
+                          const vip = (cfg.vip as Record<string, unknown>) || {};
+                          const slots = Array.isArray(vip.slots) ? ([...vip.slots] as Array<Record<string, unknown>>) : [];
+                          slots[idx] = { ...(slots[idx] || {}), count: Number(e.target.value || 1) };
+                          vip.slots = slots;
+                          cfg.vip = vip;
+                        })
+                      }
+                      className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                    />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateDispatchCfg((cfg) => {
+                          const vip = (cfg.vip as Record<string, unknown>) || {};
+                          const slots = Array.isArray(vip.slots) ? ([...vip.slots] as Array<Record<string, unknown>>) : [];
+                          slots.splice(idx, 1);
+                          vip.slots = slots;
+                          cfg.vip = vip;
+                        })
+                      }
+                      className="rounded border border-rose-700 px-2 py-1 text-rose-300 hover:bg-rose-950/30"
+                    >
+                      удалить
+                    </button>
+                  </div>
+                ))
+              ) : null}
+              <button
+                type="button"
+                onClick={() =>
+                  updateDispatchCfg((cfg) => {
+                    const vip = (cfg.vip as Record<string, unknown>) || {};
+                    const slots = Array.isArray(vip.slots) ? ([...vip.slots] as Array<Record<string, unknown>>) : [];
+                    slots.push({ time_msk: "12:00", source: "paid", count: 1 });
+                    vip.slots = slots;
+                    cfg.vip = vip;
+                  })
+                }
+                className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800"
+              >
+                + добавить слот
+              </button>
+            </div>
+            <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300 md:col-span-2">
+              <p className="mb-2 font-medium text-slate-200">NO_ML: поток с группировкой</p>
+              <div className="mb-2 grid gap-2 md:grid-cols-4">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={Boolean((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.enabled ?? true)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const no = (cfg.no_ml_channel as Record<string, unknown>) || {};
+                        no.enabled = e.target.checked;
+                        cfg.no_ml_channel = no;
+                      })
+                    }
+                  />
+                  enabled
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={Boolean((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.stream_enabled ?? false)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const no = (cfg.no_ml_channel as Record<string, unknown>) || {};
+                        no.stream_enabled = e.target.checked;
+                        cfg.no_ml_channel = no;
+                      })
+                    }
+                  />
+                  stream_enabled
+                </label>
+                <label>
+                  min_lead
+                  <input
+                    type="number"
+                    min={0}
+                    value={Number((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.min_lead_minutes ?? 60)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const no = (cfg.no_ml_channel as Record<string, unknown>) || {};
+                        no.min_lead_minutes = Number(e.target.value || 0);
+                        cfg.no_ml_channel = no;
+                      })
+                    }
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  />
+                </label>
+                <label>
+                  summary UTC
+                  <input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={(dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.daily_summary_hour_utc === null ? "" : String((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.daily_summary_hour_utc ?? "")}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const no = (cfg.no_ml_channel as Record<string, unknown>) || {};
+                        no.daily_summary_hour_utc = e.target.value === "" ? null : Number(e.target.value);
+                        cfg.no_ml_channel = no;
+                      })
+                    }
+                    placeholder="пусто = выкл"
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  />
+                </label>
+              </div>
+              <div className="grid gap-2 md:grid-cols-4">
+                <label>
+                  interval, мин
+                  <input
+                    type="number"
+                    min={5}
+                    value={Number((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.stream_interval_minutes ?? 30)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const no = (cfg.no_ml_channel as Record<string, unknown>) || {};
+                        no.stream_interval_minutes = Number(e.target.value || 30);
+                        cfg.no_ml_channel = no;
+                      })
+                    }
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  />
+                </label>
+                <label>
+                  group_limit
+                  <input
+                    type="number"
+                    min={1}
+                    value={Number((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.stream_group_limit ?? 20)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const no = (cfg.no_ml_channel as Record<string, unknown>) || {};
+                        no.stream_group_limit = Number(e.target.value || 20);
+                        cfg.no_ml_channel = no;
+                      })
+                    }
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  />
+                </label>
+                <label>
+                  fetch_limit
+                  <input
+                    type="number"
+                    min={1}
+                    value={Number((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.stream_fetch_limit ?? 500)}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const no = (cfg.no_ml_channel as Record<string, unknown>) || {};
+                        no.stream_fetch_limit = Number(e.target.value || 500);
+                        cfg.no_ml_channel = no;
+                      })
+                    }
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  />
+                </label>
+                <label>
+                  source
+                  <select
+                    value={String((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.stream_source ?? "no_ml")}
+                    onChange={(e) =>
+                      updateDispatchCfg((cfg) => {
+                        const no = (cfg.no_ml_channel as Record<string, unknown>) || {};
+                        no.stream_source = e.target.value;
+                        cfg.no_ml_channel = no;
+                      })
+                    }
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
+                  >
+                    <option value="no_ml">no_ml</option>
+                    <option value="paid">paid</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        <textarea
+          value={dispatchCfgText}
+          onChange={(e) => setDispatchCfgText(e.target.value)}
+          rows={12}
+          className="w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-white my-2"
+        />
+        <button
+          type="button"
+          onClick={() => {
+            setDispatchCfgText(JSON.stringify({
+              free: {
+                enabled: true,
+                slots: [
+                  { time_msk: "11:00", source: "no_ml", count: 1 },
+                  { time_msk: "15:00", source: "no_ml", count: 1 },
+                  { time_msk: "17:00", source: "no_ml", count: 1 },
+                ],
+                min_lead_minutes: 60,
+                daily_summary_hour_utc: 21,
+              },
+              vip: {
+                enabled: true,
+                slots: [
+                  { time_msk: "12:00", source: "no_ml", count: 3 },
+                  { time_msk: "16:00", source: "no_ml", count: 3 },
+                  { time_msk: "19:00", source: "no_ml", count: 3 },
+                ],
+                min_lead_minutes: 60,
+                daily_summary_hour_utc: 23,
+              },
+              no_ml_channel: {
+                enabled: true,
+                stream_enabled: true,
+                stream_interval_minutes: 30,
+                stream_source: "no_ml",
+                stream_group_limit: 20,
+                stream_fetch_limit: 500,
+                min_lead_minutes: 60,
+                daily_summary_hour_utc: 22,
+              },
+            }, null, 2));
+          }}
+          className="mr-2 rounded border border-slate-600 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
+        >
+          Подставить шаблон (3 канала)
+        </button>
+        <button
+          type="button"
+          disabled={dispatchCfgSaving}
+          onClick={async () => {
+            try {
+              setDispatchCfgSaving(true);
+              const parsed = JSON.parse(dispatchCfgText || "{}") as Record<string, unknown>;
+              await putAdminTelegramDispatchConfig(parsed);
+            } catch (e) {
+              setError(e instanceof Error ? e.message : "Ошибка сохранения расписания");
+            } finally {
+              setDispatchCfgSaving(false);
+            }
+          }}
+          className="rounded bg-violet-600 px-4 py-2 text-sm text-white hover:bg-violet-500 disabled:opacity-50"
+        >
+          {dispatchCfgSaving ? "Сохранение…" : "Сохранить расписание"}
+        </button>
+      </section>
+
+      <section className={`${activeTab === "messages" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
         <h2 className="text-lg text-white mb-3">Рассылки (каналы / бот / email)</h2>
         <div className="grid gap-3 md:grid-cols-2">
           <label className="text-sm text-slate-300">
             Куда
             <select
               value={messageTarget}
-              onChange={(e) => setMessageTarget(e.target.value as "free_channel" | "vip_channel" | "telegram_user" | "email")}
+              onChange={(e) => setMessageTarget(e.target.value as "free_channel" | "vip_channel" | "no_ml_channel" | "telegram_user" | "telegram_all_users" | "email")}
               className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
             >
               <option value="free_channel">FREE канал</option>
-              <option value="vip_channel">VIP канал</option>
+              <option value="vip_channel">ML (платный) канал</option>
+              <option value="no_ml_channel">NO_ML канал</option>
               <option value="telegram_user">Пользователь в Telegram</option>
+              <option value="telegram_all_users">Все пользователи Telegram-бота</option>
               <option value="email">Email</option>
             </select>
           </label>
@@ -1091,6 +1694,25 @@ export default function AdminPage() {
             className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
           />
         </label>
+        <label className="mt-3 block text-sm text-slate-300">
+          Картинка (URL, опционально)
+          <input
+            value={messageImageUrl}
+            onChange={(e) => setMessageImageUrl(e.target.value)}
+            placeholder="https://..."
+            className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
+          />
+        </label>
+        <label className="mt-3 block text-sm text-slate-300">
+          Несколько картинок (по одной ссылке в строке, опционально)
+          <textarea
+            value={messageImageUrls}
+            onChange={(e) => setMessageImageUrls(e.target.value)}
+            rows={3}
+            placeholder={"https://...\nhttps://..."}
+            className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
+          />
+        </label>
         <button
           type="button"
           disabled={sending || !messageText.trim()}
@@ -1098,14 +1720,27 @@ export default function AdminPage() {
             try {
               setSending(true);
               setError(null);
-              await sendAdminMessage({
+              setMessageResult("");
+              const res = await sendAdminMessage({
                 target: messageTarget,
                 text: messageText,
                 user_id: messageUserId || undefined,
                 email: messageEmail || undefined,
                 subject: messageSubject || undefined,
+                image_url: messageImageUrl.trim() || undefined,
+                image_urls: messageImageUrls
+                  .split(/\r?\n/)
+                  .map((x) => x.trim())
+                  .filter(Boolean),
               });
+              if (messageTarget === "telegram_all_users") {
+                setMessageResult(`Отправлено: ${res.sent ?? 0} из ${res.total ?? 0}`);
+              } else {
+                setMessageResult("Сообщение отправлено");
+              }
               setMessageText("");
+              setMessageImageUrl("");
+              setMessageImageUrls("");
             } catch (e) {
               setError(e instanceof Error ? e.message : "Ошибка отправки");
             } finally {
@@ -1116,8 +1751,11 @@ export default function AdminPage() {
         >
           {sending ? "Отправка..." : "Отправить"}
         </button>
+        {messageResult ? <p className="mt-2 text-sm text-emerald-300">{messageResult}</p> : null}
         {error ? <p className="mt-2 text-sm text-rose-300">{error}</p> : null}
       </section>
+        </div>
+      </div>
     </div>
   );
 }

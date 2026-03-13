@@ -110,6 +110,11 @@ class Settings(BaseSettings):
     telegram_signals_free_chat_id: str = ""
     telegram_signals_vip_chat_id: str = ""
     telegram_signals_vip_public_url: str = ""
+    # Отдельные боты для каждого канала (если заданы, перекрывают общий telegram_bot_token)
+    telegram_signals_free_bot_token: str = ""
+    telegram_signals_vip_bot_token: str = ""
+    telegram_signals_no_ml_bot_token: str = ""
+    telegram_signals_no_ml_chat_id: str = ""
     telegram_channels_loop_interval_sec: int = 60
     telegram_urgent_lead_minutes: int = 30
     telegram_free_window_start_hour: int = 9

@@ -1180,7 +1180,7 @@ export async function patchAdminUser(
 
 export interface AdminSubscription {
   id: string;
-  service_key: "analytics" | "vip_channel";
+  service_key: "analytics" | "analytics_no_ml" | "vip_channel";
   duration_days: number;
   valid_until: string;
   source: string;
@@ -1202,7 +1202,7 @@ export async function getAdminUserSubscriptions(userId: string): Promise<{ items
 
 export async function upsertAdminSubscription(
   userId: string,
-  body: { service_key: "analytics" | "vip_channel"; days: number; comment?: string | null }
+  body: { service_key: "analytics" | "analytics_no_ml" | "vip_channel"; days: number; comment?: string | null }
 ): Promise<AdminSubscription> {
   const res = await fetch(apiUrl(`admin/users/${encodeURIComponent(userId)}/subscriptions`), {
     method: "POST",
@@ -1331,16 +1331,40 @@ export async function deleteAdminPaymentMethod(methodId: string): Promise<{ ok: 
 }
 
 export async function sendAdminMessage(body: {
-  target: "free_channel" | "vip_channel" | "telegram_user" | "email";
+  target: "free_channel" | "vip_channel" | "no_ml_channel" | "telegram_user" | "telegram_all_users" | "email";
   text: string;
   user_id?: string;
   email?: string;
   subject?: string;
-}): Promise<{ ok: boolean }> {
+  image_url?: string;
+  image_urls?: string[];
+}): Promise<{ ok: boolean; total?: number; sent?: number }> {
   const res = await fetch(apiUrl("admin/messages/send"), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function getAdminTelegramDispatchConfig(): Promise<{ config: Record<string, unknown> | null }> {
+  const res = await fetch(apiUrl("admin/telegram-dispatch-config"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || res.statusText);
+  }
+  return res.json();
+}
+
+export async function putAdminTelegramDispatchConfig(config: Record<string, unknown>): Promise<{ ok: boolean }> {
+  const res = await fetch(apiUrl("admin/telegram-dispatch-config"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ config }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));

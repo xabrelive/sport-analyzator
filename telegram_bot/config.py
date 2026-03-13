@@ -29,3 +29,10 @@ _raw = env("FRONTEND_PUBLIC_URL") or env("FRONTEND_URL") or _PUBLIC_DEFAULT
 FRONTEND_URL = _raw.rstrip("/")
 if "localhost" in FRONTEND_URL or "127.0.0.1" in FRONTEND_URL:
     FRONTEND_URL = _PUBLIC_DEFAULT
+
+# Режимы: user_notifications (основной бот) | channel_only (канальный бот)
+BOT_MODE = env("BOT_MODE", "user_notifications").lower()
+CHANNEL_BOT_DM_REPLY = env(
+    "CHANNEL_BOT_DM_REPLY",
+    "Этот бот публикует сообщения только в канал. Все настройки доступны на https://pingwin.pro",
+)

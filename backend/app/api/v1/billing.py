@@ -327,3 +327,5 @@ async def billing_vip_create_invite(
         "warning": "Ссылка одноразовая: после перехода она станет недействительной.",
         "valid_until": active.valid_until.isoformat(),
     }
+
+

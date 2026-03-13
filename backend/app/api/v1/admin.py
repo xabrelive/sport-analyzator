@@ -6,6 +6,7 @@ from decimal import Decimal
 from uuid import UUID
 
 import httpx
+import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
@@ -21,12 +22,14 @@ from app.models.payment_method import PaymentMethod
 from app.models.user import User
 from app.models.user_subscription import UserSubscription
 from app.services.email import send_html_email
+from app.services.telegram_channel_dispatcher import _load_dispatch_cfg
 from app.services.vip_channel_access import send_vip_invite_to_user
 
 router = APIRouter()
 
 ALLOWED_SERVICE_KEYS = {"analytics", "analytics_no_ml", "vip_channel"}
-ALLOWED_MESSAGE_TARGETS = {"free_channel", "vip_channel", "telegram_user", "email"}
+ALLOWED_MESSAGE_TARGETS = {"free_channel", "vip_channel", "no_ml_channel", "telegram_user", "telegram_all_users", "email"}
+DISPATCH_CFG_KEY = "telegram_dispatch_config"
 
 
 def _utc_now() -> datetime:
@@ -50,24 +53,84 @@ def _event_link(event_id: str) -> str:
     return f"{base}/dashboard/table-tennis/matches/{event_id}"
 
 
-async def _send_telegram(chat_id: int, text: str) -> int | None:
-    token = (settings.telegram_bot_token or "").strip()
+def _channel_token(target: str | None) -> str:
+    if target == "free_channel":
+        return (settings.telegram_signals_free_bot_token or "").strip()
+    if target == "vip_channel":
+        return (settings.telegram_signals_vip_bot_token or "").strip()
+    if target == "no_ml_channel":
+        return (settings.telegram_signals_no_ml_bot_token or "").strip()
+    return (settings.telegram_bot_token or "").strip()
+
+
+async def _send_telegram(chat_id: int, text: str, *, target: str | None = None, image_url: str | None = None) -> int | None:
+    token = _channel_token(target)
     if not token:
         return None
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+    method = "sendPhoto" if (image_url or "").strip() else "sendMessage"
+    payload = {"chat_id": chat_id, "parse_mode": "HTML"}
+    if method == "sendPhoto":
+        payload["photo"] = (image_url or "").strip()
+        payload["caption"] = text
+    else:
+        payload["text"] = text
+        payload["disable_web_page_preview"] = True
     async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
+        resp = await client.post(f"https://api.telegram.org/bot{token}/{method}", json=payload)
     if resp.status_code != 200:
         return None
     data = resp.json()
     if not data.get("ok"):
         return None
     return int((data.get("result") or {}).get("message_id") or 0) or None
+
+
+async def _send_telegram_with_images(
+    chat_id: int,
+    text: str,
+    *,
+    target: str | None = None,
+    image_url: str | None = None,
+    image_urls: list[str] | None = None,
+) -> int | None:
+    token = _channel_token(target)
+    if not token:
+        return None
+    imgs = [u.strip() for u in (image_urls or []) if u and u.strip()]
+    if image_url and image_url.strip():
+        imgs.append(image_url.strip())
+    # dedupe preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for u in imgs:
+        if u in seen:
+            continue
+        seen.add(u)
+        deduped.append(u)
+    if len(deduped) <= 1:
+        return await _send_telegram(
+            chat_id=chat_id,
+            text=text,
+            target=target,
+            image_url=(deduped[0] if deduped else None),
+        )
+
+    media = []
+    for i, u in enumerate(deduped):
+        if i == 0:
+            media.append({"type": "photo", "media": u, "caption": text, "parse_mode": "HTML"})
+        else:
+            media.append({"type": "photo", "media": u})
+    payload = {"chat_id": chat_id, "media": media}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(f"https://api.telegram.org/bot{token}/sendMediaGroup", json=payload)
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    if not data.get("ok"):
+        return None
+    first = (data.get("result") or [{}])[0]
+    return int(first.get("message_id") or 0) or None
 
 
 def _date_to_iso(d: date) -> str:
@@ -199,7 +262,7 @@ async def user_subscriptions(
 
 
 class UpsertSubscriptionBody(BaseModel):
-    service_key: str = Field(..., pattern="^(analytics|vip_channel)$")
+    service_key: str = Field(..., pattern="^(analytics|analytics_no_ml|vip_channel)$")
     days: int = Field(default=30, ge=1, le=365)
     comment: str | None = None
 
@@ -530,11 +593,13 @@ async def patch_invoice_status(
 
 
 class AdminMessageBody(BaseModel):
-    target: str = Field(..., pattern="^(free_channel|vip_channel|telegram_user|email)$")
+    target: str = Field(..., pattern="^(free_channel|vip_channel|no_ml_channel|telegram_user|telegram_all_users|email)$")
     text: str = Field(..., min_length=1, max_length=5000)
     user_id: str | None = None
     email: str | None = None
     subject: str | None = None
+    image_url: str | None = None
+    image_urls: list[str] | None = None
 
 
 @router.post("/messages/send")
@@ -549,8 +614,13 @@ async def send_admin_message(
     if not text:
         raise HTTPException(status_code=400, detail="Пустое сообщение")
 
-    if body.target in {"free_channel", "vip_channel"}:
-        chat_raw = settings.telegram_signals_free_chat_id if body.target == "free_channel" else settings.telegram_signals_vip_chat_id
+    if body.target in {"free_channel", "vip_channel", "no_ml_channel"}:
+        if body.target == "free_channel":
+            chat_raw = settings.telegram_signals_free_chat_id
+        elif body.target == "vip_channel":
+            chat_raw = settings.telegram_signals_vip_chat_id
+        else:
+            chat_raw = settings.telegram_signals_no_ml_chat_id
         chat_raw = (chat_raw or "").strip()
         if not chat_raw:
             raise HTTPException(status_code=400, detail="Chat ID канала не настроен")
@@ -558,7 +628,13 @@ async def send_admin_message(
             chat_id = int(chat_raw)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Некорректный chat_id в настройках") from exc
-        mid = await _send_telegram(chat_id, text)
+        mid = await _send_telegram_with_images(
+            chat_id=chat_id,
+            text=text,
+            target=body.target,
+            image_url=(body.image_url or "").strip() or None,
+            image_urls=body.image_urls or [],
+        )
         if mid is None:
             raise HTTPException(status_code=502, detail="Не удалось отправить в Telegram канал")
         return {"ok": True, "telegram_message_id": mid}
@@ -573,10 +649,38 @@ async def send_admin_message(
         user = (await session.execute(select(User).where(User.id == uid))).scalar_one_or_none()
         if user is None or user.telegram_id is None:
             raise HTTPException(status_code=404, detail="Пользователь не найден или Telegram не привязан")
-        mid = await _send_telegram(int(user.telegram_id), text)
+        mid = await _send_telegram_with_images(
+            chat_id=int(user.telegram_id),
+            text=text,
+            image_url=(body.image_url or "").strip() or None,
+            image_urls=body.image_urls or [],
+        )
         if mid is None:
             raise HTTPException(status_code=502, detail="Не удалось отправить в Telegram пользователю")
         return {"ok": True, "telegram_message_id": mid}
+
+    if body.target == "telegram_all_users":
+        users = (
+            await session.execute(
+                select(User).where(User.telegram_id.is_not(None))
+            )
+        ).scalars().all()
+        total = 0
+        sent = 0
+        for user in users:
+            total += 1
+            try:
+                mid = await _send_telegram_with_images(
+                    chat_id=int(user.telegram_id),  # type: ignore[arg-type]
+                    text=text,
+                    image_url=(body.image_url or "").strip() or None,
+                    image_urls=body.image_urls or [],
+                )
+                if mid is not None:
+                    sent += 1
+            except Exception:
+                continue
+        return {"ok": True, "total": total, "sent": sent}
 
     target_email = (body.email or "").strip()
     if not target_email and body.user_id:
@@ -595,6 +699,43 @@ async def send_admin_message(
     ok = send_html_email(target_email, subj, text, html)
     if not ok:
         raise HTTPException(status_code=502, detail="Не удалось отправить email")
+    return {"ok": True}
+
+
+@router.get("/telegram-dispatch-config")
+async def get_telegram_dispatch_config(
+    _: User = Depends(require_superadmin),
+    session: AsyncSession = Depends(get_async_session),
+):
+    cfg = await _load_dispatch_cfg(session)
+    row = (await session.execute(select(AppSetting).where(AppSetting.key == DISPATCH_CFG_KEY))).scalar_one_or_none()
+    has_saved = bool(row and (row.value or "").strip())
+    try:
+        raw_cfg = json.loads(row.value) if has_saved else None
+    except Exception:
+        raw_cfg = None
+    return {"config": cfg, "raw_config": raw_cfg, "has_saved": has_saved}
+
+
+class TelegramDispatchConfigBody(BaseModel):
+    config: dict
+
+
+@router.put("/telegram-dispatch-config")
+async def put_telegram_dispatch_config(
+    body: TelegramDispatchConfigBody,
+    _: User = Depends(require_superadmin),
+    session: AsyncSession = Depends(get_async_session),
+):
+    serialized = json.dumps(body.config, ensure_ascii=False)
+    row = (
+        await session.execute(select(AppSetting).where(AppSetting.key == DISPATCH_CFG_KEY))
+    ).scalar_one_or_none()
+    if row:
+        row.value = serialized
+    else:
+        session.add(AppSetting(key=DISPATCH_CFG_KEY, value=serialized))
+    await session.commit()
     return {"ok": True}
 
 

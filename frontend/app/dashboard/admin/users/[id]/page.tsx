@@ -17,7 +17,7 @@ export default function AdminUserDetailPage() {
   const userId = params?.id || "";
   const [allowed, setAllowed] = useState<boolean | null>(null);
   const [subs, setSubs] = useState<AdminSubscription[]>([]);
-  const [serviceKey, setServiceKey] = useState<"analytics" | "vip_channel">("analytics");
+  const [serviceKey, setServiceKey] = useState<"analytics" | "analytics_no_ml" | "vip_channel">("analytics");
   const [days, setDays] = useState(30);
   const [comment, setComment] = useState("");
   const [isBlocked, setIsBlocked] = useState(false);
@@ -84,11 +84,12 @@ export default function AdminUserDetailPage() {
             Услуга
             <select
               value={serviceKey}
-              onChange={(e) => setServiceKey(e.target.value as "analytics" | "vip_channel")}
+              onChange={(e) => setServiceKey(e.target.value as "analytics" | "analytics_no_ml" | "vip_channel")}
               className="mt-1 block rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
             >
               <option value="analytics">Аналитика</option>
-              <option value="vip_channel">VIP канал</option>
+              <option value="vip_channel">ML (платный) канал</option>
+              <option value="analytics_no_ml">NO_ML аналитика</option>
             </select>
           </label>
           <label className="text-sm text-slate-300">

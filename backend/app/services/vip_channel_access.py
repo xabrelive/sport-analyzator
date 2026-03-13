@@ -54,6 +54,8 @@ async def _telegram_api(method: str, payload: dict) -> dict | None:
     return data
 
 
+
+
 async def _send_telegram_message(chat_id: int, text: str) -> bool:
     data = await _telegram_api(
         "sendMessage",

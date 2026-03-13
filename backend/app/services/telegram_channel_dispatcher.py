@@ -1,20 +1,22 @@
-"""Dispatch forecasts to FREE and VIP Telegram channels."""
+"""Dispatch forecasts to FREE, VIP and no-ML Telegram channels."""
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
 from html import escape
+import json
 import logging
 import random
 
 import httpx
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.session import async_session_maker
+from app.models.app_setting import AppSetting
 from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
 from app.models.table_tennis_line_event import LINE_EVENT_STATUS_SCHEDULED, TableTennisLineEvent
 from app.models.telegram_channel_marker import TelegramChannelMarker
@@ -25,6 +27,34 @@ CHANNEL_DISPATCHER_ADVISORY_LOCK_KEY = 910002
 
 CHANNEL_FREE = "free"
 CHANNEL_VIP = "vip"
+CHANNEL_NO_ML = "no_ml_channel"
+DISPATCH_CFG_KEY = "telegram_dispatch_config"
+
+DEFAULT_DISPATCH_CFG: dict = {
+    "free": {
+        "enabled": True,
+        "slots": [],
+        "min_lead_minutes": 60,
+        "daily_summary_hour_utc": None,
+    },
+    "vip": {
+        "enabled": True,
+        "slots": [],
+        "min_lead_minutes": 60,
+        "daily_summary_hour_utc": None,
+    },
+    "no_ml_channel": {
+        "enabled": True,
+        # Потоковая отправка всех no_ml прогнозов с группировкой.
+        "stream_enabled": False,
+        "stream_interval_minutes": 30,
+        "stream_source": "no_ml",
+        "stream_group_limit": 20,
+        "stream_fetch_limit": 500,
+        "min_lead_minutes": 60,
+        "daily_summary_hour_utc": None,
+    },
+}
 
 
 def _utc_now() -> datetime:
@@ -59,7 +89,14 @@ def _countdown(starts_at: datetime, now: datetime) -> str:
 
 
 def _chat_id(channel: str) -> int | None:
-    raw = settings.telegram_signals_free_chat_id if channel == CHANNEL_FREE else settings.telegram_signals_vip_chat_id
+    if channel == CHANNEL_FREE:
+        raw = settings.telegram_signals_free_chat_id
+    elif channel == CHANNEL_VIP:
+        raw = settings.telegram_signals_vip_chat_id
+    elif channel == CHANNEL_NO_ML:
+        raw = settings.telegram_signals_no_ml_chat_id
+    else:
+        raw = ""
     raw = (raw or "").strip()
     if not raw:
         return None
@@ -75,8 +112,96 @@ def _cancelled_grace_elapsed(event: TableTennisLineEvent | None, now: datetime) 
     return now >= (event.starts_at + timedelta(hours=2))
 
 
-async def _send_telegram(chat_id: int, text: str, reply_to_message_id: int | None = None) -> int | None:
-    token = (settings.telegram_bot_token or "").strip()
+def _slot_passed(now_msk: datetime, slot: str) -> bool:
+    try:
+        hh, mm = slot.split(":")
+        h, m = int(hh), int(mm)
+    except Exception:
+        return False
+    return (now_msk.hour > h) or (now_msk.hour == h and now_msk.minute >= m)
+
+
+def _slot_time(slot_item: dict) -> str:
+    return str(slot_item.get("time_msk") or "").strip()
+
+
+def _slot_source(slot_item: dict) -> str:
+    src = str(slot_item.get("source") or "no_ml").strip().lower()
+    return "paid" if src == "paid" else "no_ml"
+
+
+async def _pick_candidates(
+    session: AsyncSession,
+    target_channel: str,
+    source: str,
+    min_lead_minutes: int,
+    limit: int,
+) -> list[tuple[TableTennisLineEvent, TableTennisForecastV2]]:
+    if source == "paid":
+        return await _get_candidates(
+            session=session,
+            channel=target_channel,
+            min_lead_minutes=min_lead_minutes,
+            limit=limit,
+        )
+    return await _get_no_ml_candidates_for_channel(
+        session=session,
+        channel=target_channel,
+        min_lead_minutes=min_lead_minutes,
+        limit=limit,
+    )
+
+
+async def _load_dispatch_cfg(session: AsyncSession) -> dict:
+    row = (
+        await session.execute(select(AppSetting).where(AppSetting.key == DISPATCH_CFG_KEY))
+    ).scalar_one_or_none()
+    if not row or not row.value:
+        return DEFAULT_DISPATCH_CFG
+    try:
+        parsed = json.loads(row.value)
+        if not isinstance(parsed, dict):
+            return DEFAULT_DISPATCH_CFG
+        cfg = json.loads(json.dumps(DEFAULT_DISPATCH_CFG))
+        for key in ("free", "vip", "no_ml_channel"):
+            if isinstance(parsed.get(key), dict):
+                cfg[key].update(parsed[key])
+        # Backward compatibility for old format.
+        free = cfg.get("free", {})
+        if isinstance(free, dict) and not isinstance(free.get("slots"), list):
+            slots = []
+            for t in list(free.get("slots_msk", []) or []):
+                slots.append({"time_msk": str(t), "source": "paid", "count": int(free.get("ml_per_slot", 1) or 1)})
+            if slots:
+                free["slots"] = slots
+        vip = cfg.get("vip", {})
+        if isinstance(vip, dict) and not isinstance(vip.get("slots"), list):
+            slots = []
+            for t in list(vip.get("slots_msk", []) or []):
+                slots.append({"time_msk": str(t), "source": "paid", "count": int(vip.get("per_slot", 1) or 1)})
+            if slots:
+                vip["slots"] = slots
+        no_ml = cfg.get("no_ml_channel", {})
+        if isinstance(no_ml, dict):
+            if "stream_interval_minutes" not in no_ml and "interval_minutes" in no_ml:
+                no_ml["stream_interval_minutes"] = no_ml.get("interval_minutes")
+            if "stream_group_limit" not in no_ml and "group_limit" in no_ml:
+                no_ml["stream_group_limit"] = no_ml.get("group_limit")
+        return cfg
+    except Exception:
+        return DEFAULT_DISPATCH_CFG
+
+
+async def _send_telegram(chat_id: int, text: str, reply_to_message_id: int | None = None, *, channel: str) -> int | None:
+    # Каналы отправляются только своими ботами (без fallback на основной user-бот).
+    if channel == CHANNEL_FREE:
+        token = (settings.telegram_signals_free_bot_token or "").strip()
+    elif channel == CHANNEL_VIP:
+        token = (settings.telegram_signals_vip_bot_token or "").strip()
+    elif channel == CHANNEL_NO_ML:
+        token = (settings.telegram_signals_no_ml_bot_token or "").strip()
+    else:
+        token = ""
     if not token:
         return None
     payload: dict[str, object] = {
@@ -216,7 +341,7 @@ async def _send_events_to_channel(
         return 0
     now = _utc_now()
     text = "\n\n".join(_build_event_text(e, f, now) for e, f in events) + "\n\n🐧 <a href=\"https://pingwin.pro\">pingwin.pro</a> — аналитический сервис"
-    msg_id = await _send_telegram(chat_id, text)
+    msg_id = await _send_telegram(chat_id, text, channel=channel)
     if msg_id is None:
         return 0
     rows_to_insert = []
@@ -372,7 +497,7 @@ async def _send_daily_summary(session: AsyncSession, channel: str, hour_utc: int
         f"За неделю: дано {w_total}, угадано {w_hit}, не угадано {w_miss}\n\n"
         f"🐧 <a href=\"https://pingwin.pro\">pingwin.pro</a>"
     )
-    msg_id = await _send_telegram(chat_id, text)
+    msg_id = await _send_telegram(chat_id, text, channel=channel)
     if msg_id:
         # marker already inserted, only enrich
         m = (
@@ -430,7 +555,7 @@ async def _send_result_replies(session: AsyncSession, channel: str) -> int:
         if not lines:
             continue
         text = "Итоги прогнозов:\n" + "\n".join(lines)
-        ok = await _send_telegram(chat_id, text, reply_to_message_id=message_id)
+        ok = await _send_telegram(chat_id, text, reply_to_message_id=message_id, channel=channel)
         if not ok:
             continue
         now_ts = _utc_now()
@@ -449,6 +574,10 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
     urgent = 0
     replies = 0
     async with async_session_maker() as session:
+        dispatch_cfg = await _load_dispatch_cfg(session)
+        free_cfg = dispatch_cfg.get("free", {})
+        vip_cfg = dispatch_cfg.get("vip", {})
+        no_ml_cfg = dispatch_cfg.get("no_ml_channel", {})
         got_lock = bool(
             (
                 await session.execute(
@@ -465,148 +594,97 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                 "result_replies": 0,
             }
         try:
-            # Urgent (<30 min): send immediately only to VIP.
-            # FREE-канал ограничен 3 слотами в сутки (ниже) и не участвует в urgent.
-            urgent_minutes = max(1, int(settings.telegram_urgent_lead_minutes))
-            urgent_candidates = (
-                await session.execute(
-                    select(TableTennisLineEvent, TableTennisForecastV2)
-                    .join(
-                        TableTennisForecastV2,
-                        and_(
-                            TableTennisForecastV2.event_id == TableTennisLineEvent.id,
-                            TableTennisForecastV2.channel == "paid",
-                            TableTennisForecastV2.status == "pending",
-                        ),
+            if bool(free_cfg.get("enabled", True)):
+                # FREE slots: источник и количество настраиваются по каждому слоту.
+                msk_day = now_msk.strftime("%Y%m%d")
+                for slot_item in list(free_cfg.get("slots", [])):
+                    slot_name = _slot_time(slot_item)
+                    if not slot_name or not _slot_passed(now_msk, slot_name):
+                        continue
+                    marker_key = f"free_slot_msk_{msk_day}_{slot_name}"
+                    created = await _ensure_marker(session, marker_key, CHANNEL_FREE, "slot")
+                    if not created:
+                        continue
+                    source = _slot_source(slot_item)
+                    per_slot = max(1, int(slot_item.get("count") or 1))
+                    candidates = await _pick_candidates(
+                        session,
+                        target_channel=CHANNEL_FREE,
+                        source=source,
+                        min_lead_minutes=max(0, int(free_cfg.get("min_lead_minutes", settings.telegram_free_min_lead_minutes))),
+                        limit=200,
                     )
-                    .where(
-                        TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
-                        TableTennisLineEvent.starts_at > now,
-                        TableTennisLineEvent.starts_at <= now + timedelta(minutes=urgent_minutes),
+                    if not candidates:
+                        continue
+                    k = min(len(candidates), per_slot)
+                    picks = random.sample(candidates, k=k)
+                    sent_now = await _send_events_to_channel(session, CHANNEL_FREE, picks)
+                    sent_free += sent_now
+
+            # VIP (paid ML) slots: источник и количество настраиваются по каждому слоту.
+            if bool(vip_cfg.get("enabled", True)):
+                vip_day = now_msk.strftime("%Y%m%d")
+                for slot_item in list(vip_cfg.get("slots", [])):
+                    slot_name = _slot_time(slot_item)
+                    if not slot_name or not _slot_passed(now_msk, slot_name):
+                        continue
+                    marker_key = f"vip_slot_msk_{vip_day}_{slot_name}"
+                    created = await _ensure_marker(session, marker_key, CHANNEL_VIP, "slot")
+                    if not created:
+                        continue
+                    source = _slot_source(slot_item)
+                    per_slot = max(1, int(slot_item.get("count") or 1))
+                    candidates = await _pick_candidates(
+                        session=session,
+                        target_channel=CHANNEL_VIP,
+                        source=source,
+                        min_lead_minutes=max(0, int(vip_cfg.get("min_lead_minutes", settings.telegram_free_min_lead_minutes))),
+                        limit=500,
                     )
-                )
-            ).all()
-            if urgent_candidates:
-                for channel in (CHANNEL_VIP,):
-                    # filter unsent for this channel
-                    unsent = await _get_candidates(session, channel=channel, min_lead_minutes=0, limit=300)
-                    urgent_only = [
-                        (e, f)
-                        for e, f in unsent
-                        if e.starts_at and e.starts_at <= now + timedelta(minutes=urgent_minutes)
-                    ]
-                    if urgent_only:
-                        c = await _send_events_to_channel(session, channel, urgent_only)
-                        urgent += c
-                        if channel == CHANNEL_FREE:
-                            sent_free += c
-                        else:
-                            sent_vip += c
-
-            # FREE regular slots by Moscow time:
-            # 1) 11:00 MSK, 2) 15:00 MSK, 3) 17:00 MSK.
-            # В каждый слот отправляем максимум 1 случайный матч (из ML-аналитики).
-            msk_day = now_msk.strftime("%Y%m%d")
-            day_start_msk = datetime(now_msk.year, now_msk.month, now_msk.day, tzinfo=now_msk.tzinfo)
-            day_start_utc = day_start_msk.astimezone(timezone.utc)
-            free_sent_today = int(
-                (
-                    await session.execute(
-                        select(func.count(TelegramChannelNotification.id)).where(
-                            TelegramChannelNotification.channel == CHANNEL_FREE,
-                            TelegramChannelNotification.sent_at >= day_start_utc,
-                        )
-                    )
-                ).scalar_one()
-                or 0
-            )
-            free_slots: list[tuple[str, bool]] = [
-                ("11:00", (now_msk.hour > 11) or (now_msk.hour == 11 and now_msk.minute >= 0)),
-                ("15:00", (now_msk.hour > 15) or (now_msk.hour == 15 and now_msk.minute >= 0)),
-                ("17:00", (now_msk.hour > 17) or (now_msk.hour == 17 and now_msk.minute >= 0)),
-            ]
-            for slot_name, should_try in free_slots:
-                if free_sent_today >= 3:
-                    break
-                if not should_try:
-                    continue
-                marker_key = f"free_slot_msk_{msk_day}_{slot_name}"
-                created = await _ensure_marker(session, marker_key, CHANNEL_FREE, "slot")
-                if not created:
-                    continue
-                candidates = await _get_candidates(
-                    session,
-                    channel=CHANNEL_FREE,
-                    min_lead_minutes=max(0, int(settings.telegram_free_min_lead_minutes)),
-                    limit=200,
-                )
-                if not candidates:
-                    continue
-                pick = random.choice(candidates)
-                sent_now = await _send_events_to_channel(session, CHANNEL_FREE, [pick])
-                sent_free += sent_now
-                free_sent_today += sent_now
-
-                # Дополнительно: один матч из аналитики без ML в бесплатный канал.
-                candidates_no_ml_free = await _get_no_ml_candidates_for_channel(
-                    session,
-                    CHANNEL_FREE,
-                    min_lead_minutes=max(0, int(settings.telegram_free_min_lead_minutes)),
-                    limit=200,
-                )
-                if candidates_no_ml_free:
-                    pick_no_ml_free = random.choice(candidates_no_ml_free)
-                    sent_free += await _send_events_to_channel(session, CHANNEL_FREE, [pick_no_ml_free])
-
-            # VIP hourly (3-4 matches each hour) из основной (ML) аналитики.
-            marker_key = f"vip_hourly_{now.strftime('%Y%m%d_%H')}"
-            if await _ensure_marker(session, marker_key, CHANNEL_VIP, "hourly"):
-                candidates = await _get_candidates(
-                    session,
-                    channel=CHANNEL_VIP,
-                    min_lead_minutes=max(0, int(settings.telegram_free_min_lead_minutes)),
-                    limit=500,
-                )
-                if candidates:
-                    k_min = max(1, int(settings.telegram_vip_hourly_min))
-                    k_max = max(k_min, int(settings.telegram_vip_hourly_max))
-                    k = min(len(candidates), random.randint(k_min, k_max))
+                    if not candidates:
+                        continue
+                    k = min(len(candidates), per_slot)
                     picks = random.sample(candidates, k=k)
                     sent_vip += await _send_events_to_channel(session, CHANNEL_VIP, picks)
 
-            # VIP: три раза в день (12:00, 16:00, 19:00 МСК) отправляем по одному
-            # случайному прогнозу из аналитики без ML.
-            vip_day = now_msk.strftime("%Y%m%d")
-            vip_slots: list[tuple[str, bool]] = [
-                ("12:00", (now_msk.hour > 12) or (now_msk.hour == 12 and now_msk.minute >= 0)),
-                ("16:00", (now_msk.hour > 16) or (now_msk.hour == 16 and now_msk.minute >= 0)),
-                ("19:00", (now_msk.hour > 19) or (now_msk.hour == 19 and now_msk.minute >= 0)),
-            ]
-            for slot_name, should_try in vip_slots:
-                if not should_try:
-                    continue
-                marker_key = f"vip_no_ml_slot_msk_{vip_day}_{slot_name}"
-                created = await _ensure_marker(session, marker_key, CHANNEL_VIP, "slot_no_ml")
-                if not created:
-                    continue
-                candidates_no_ml = await _get_no_ml_candidates_for_channel(
-                    session,
-                    CHANNEL_VIP,
-                    min_lead_minutes=max(0, int(settings.telegram_free_min_lead_minutes)),
-                    limit=200,
+            # no_ml channel stream: отправляем все новые события пачкой не чаще N минут.
+            if bool(no_ml_cfg.get("enabled", True)) and bool(no_ml_cfg.get("stream_enabled", False)):
+                interval_minutes = max(5, int(no_ml_cfg.get("stream_interval_minutes", 30)))
+                bucket_minute = (now.minute // interval_minutes) * interval_minutes
+                bucket_start = datetime(
+                    now.year, now.month, now.day, now.hour, bucket_minute, tzinfo=timezone.utc
                 )
-                if not candidates_no_ml:
-                    continue
-                pick_no_ml = random.choice(candidates_no_ml)
-                sent_vip += await _send_events_to_channel(session, CHANNEL_VIP, [pick_no_ml])
+                marker_key = f"no_ml_stream_{bucket_start.strftime('%Y%m%d_%H%M')}"
+                if await _ensure_marker(session, marker_key, CHANNEL_NO_ML, "stream_no_ml"):
+                    source = str(no_ml_cfg.get("stream_source") or "no_ml").strip().lower()
+                    fetch_limit = max(1, int(no_ml_cfg.get("stream_fetch_limit", 500)))
+                    group_limit = max(1, int(no_ml_cfg.get("stream_group_limit", 20)))
+                    candidates = await _pick_candidates(
+                        session=session,
+                        target_channel=CHANNEL_NO_ML,
+                        source=("paid" if source == "paid" else "no_ml"),
+                        min_lead_minutes=max(0, int(no_ml_cfg.get("min_lead_minutes", settings.telegram_free_min_lead_minutes))),
+                        limit=fetch_limit,
+                    )
+                    if candidates:
+                        picks = candidates[:group_limit]
+                        await _send_events_to_channel(session, CHANNEL_NO_ML, picks)
 
             # Daily summaries.
-            await _send_daily_summary(session, CHANNEL_FREE, hour_utc=21)
-            await _send_daily_summary(session, CHANNEL_VIP, hour_utc=23)
+            free_summary_hour = free_cfg.get("daily_summary_hour_utc")
+            if bool(free_cfg.get("enabled", True)) and free_summary_hour is not None:
+                await _send_daily_summary(session, CHANNEL_FREE, hour_utc=int(free_summary_hour))
+            vip_summary_hour = vip_cfg.get("daily_summary_hour_utc")
+            if bool(vip_cfg.get("enabled", True)) and vip_summary_hour is not None:
+                await _send_daily_summary(session, CHANNEL_VIP, hour_utc=int(vip_summary_hour))
+            no_ml_summary_hour = no_ml_cfg.get("daily_summary_hour_utc")
+            if bool(no_ml_cfg.get("enabled", True)) and no_ml_summary_hour is not None:
+                await _send_daily_summary(session, CHANNEL_NO_ML, hour_utc=int(no_ml_summary_hour))
 
             # Result replies.
             replies += await _send_result_replies(session, CHANNEL_FREE)
             replies += await _send_result_replies(session, CHANNEL_VIP)
+            replies += await _send_result_replies(session, CHANNEL_NO_ML)
 
             await session.commit()
         finally:
