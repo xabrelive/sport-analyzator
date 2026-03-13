@@ -75,6 +75,22 @@ def _cancelled_grace_elapsed(event: TableTennisLineEvent | None, now: datetime) 
     return now >= (event.starts_at + timedelta(hours=2))
 
 
+def _is_late_appeared(
+    event: TableTennisLineEvent,
+    forecast: TableTennisForecastV2,
+    *,
+    min_lead_minutes: int,
+    now: datetime,
+) -> bool:
+    """Match/forecast appeared too close to start (< min_lead): send out of turn."""
+    if event.starts_at is None or forecast.created_at is None:
+        return False
+    if event.starts_at <= now:
+        return False
+    threshold = event.starts_at - timedelta(minutes=max(0, min_lead_minutes))
+    return forecast.created_at >= threshold
+
+
 def _telegram_match_block(event: TableTennisLineEvent, forecast: TableTennisForecastV2, now: datetime) -> str:
     starts = event.starts_at.astimezone(timezone.utc) if event.starts_at else now
     when = starts.strftime("%d.%m.%Y %H:%M UTC")
@@ -300,6 +316,7 @@ async def dispatch_forecast_notifications_once() -> dict[str, int]:
     now = _utc_now()
     batch_minutes = max(1, int(getattr(settings, "notifications_batch_interval_minutes", 30)))
     urgent_minutes = max(1, int(getattr(settings, "telegram_urgent_lead_minutes", 30)))
+    min_lead_minutes = max(0, int(getattr(settings, "telegram_free_min_lead_minutes", 60)))
     delivered_events = 0
     delivered_messages = 0
     result_replies = 0
@@ -349,7 +366,15 @@ async def dispatch_forecast_notifications_once() -> dict[str, int]:
                     urgent_cutoff = now + timedelta(minutes=urgent_minutes)
                     urgent_unsent = [
                         (e, f) for e, f in unsent
-                        if e.starts_at is not None and e.starts_at <= urgent_cutoff
+                        if (
+                            (e.starts_at is not None and e.starts_at <= urgent_cutoff)
+                            or _is_late_appeared(
+                                e,
+                                f,
+                                min_lead_minutes=min_lead_minutes,
+                                now=now,
+                            )
+                        )
                     ]
                     regular_unsent = [
                         (e, f) for e, f in unsent

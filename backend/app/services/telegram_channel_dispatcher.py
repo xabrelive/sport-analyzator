@@ -130,6 +130,22 @@ def _slot_source(slot_item: dict) -> str:
     return "paid" if src == "paid" else "no_ml"
 
 
+def _is_late_appeared(
+    event: TableTennisLineEvent,
+    forecast: TableTennisForecastV2,
+    *,
+    min_lead_minutes: int,
+    now: datetime,
+) -> bool:
+    """Forecast appeared too close to match start (< min_lead)."""
+    if event.starts_at is None or forecast.created_at is None:
+        return False
+    if event.starts_at <= now:
+        return False
+    threshold = event.starts_at - timedelta(minutes=max(0, min_lead_minutes))
+    return forecast.created_at >= threshold
+
+
 async def _pick_candidates(
     session: AsyncSession,
     target_channel: str,
@@ -150,6 +166,65 @@ async def _pick_candidates(
         min_lead_minutes=min_lead_minutes,
         limit=limit,
     )
+
+
+async def _pick_late_appeared_candidates(
+    session: AsyncSession,
+    target_channel: str,
+    source: str,
+    min_lead_minutes: int,
+    limit: int,
+) -> list[tuple[TableTennisLineEvent, TableTennisForecastV2]]:
+    now = _utc_now()
+    max_starts = now + timedelta(minutes=max(0, min_lead_minutes))
+    src_channel = "paid" if source == "paid" else "no_ml"
+    rows = (
+        await session.execute(
+            select(TableTennisLineEvent, TableTennisForecastV2)
+            .join(
+                TableTennisForecastV2,
+                and_(
+                    TableTennisForecastV2.event_id == TableTennisLineEvent.id,
+                    TableTennisForecastV2.channel == src_channel,
+                    TableTennisForecastV2.status == "pending",
+                ),
+            )
+            .where(
+                TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
+                TableTennisLineEvent.starts_at > now,
+                TableTennisLineEvent.starts_at <= max_starts,
+            )
+            .order_by(TableTennisLineEvent.starts_at.asc(), TableTennisForecastV2.created_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    if not rows:
+        return []
+
+    uniq: list[tuple[TableTennisLineEvent, TableTennisForecastV2]] = []
+    seen: set[str] = set()
+    for e, f in rows:
+        eid = str(e.id)
+        if eid in seen:
+            continue
+        seen.add(eid)
+        if _is_late_appeared(e, f, min_lead_minutes=min_lead_minutes, now=now):
+            uniq.append((e, f))
+    if not uniq:
+        return []
+
+    already = {
+        str(x[0])
+        for x in (
+            await session.execute(
+                select(TelegramChannelNotification.event_id).where(
+                    TelegramChannelNotification.channel == target_channel,
+                    TelegramChannelNotification.event_id.in_([str(e.id) for e, _ in uniq]),
+                )
+            )
+        ).all()
+    }
+    return [(e, f) for e, f in uniq if str(e.id) not in already]
 
 
 async def _load_dispatch_cfg(session: AsyncSession) -> dict:
@@ -646,6 +721,23 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                     k = min(len(candidates), per_slot)
                     picks = random.sample(candidates, k=k)
                     sent_vip += await _send_events_to_channel(session, CHANNEL_VIP, picks)
+
+            # no_ml urgent: поздно появившиеся матчи отправляем вне расписания.
+            if bool(no_ml_cfg.get("enabled", True)):
+                source = str(no_ml_cfg.get("stream_source") or "no_ml").strip().lower()
+                fetch_limit = max(1, int(no_ml_cfg.get("stream_fetch_limit", 500)))
+                group_limit = max(1, int(no_ml_cfg.get("stream_group_limit", 20)))
+                min_lead = max(0, int(no_ml_cfg.get("min_lead_minutes", settings.telegram_free_min_lead_minutes)))
+                urgent_candidates = await _pick_late_appeared_candidates(
+                    session=session,
+                    target_channel=CHANNEL_NO_ML,
+                    source=("paid" if source == "paid" else "no_ml"),
+                    min_lead_minutes=min_lead,
+                    limit=fetch_limit,
+                )
+                if urgent_candidates:
+                    picks = urgent_candidates[:group_limit]
+                    urgent += await _send_events_to_channel(session, CHANNEL_NO_ML, picks)
 
             # no_ml channel stream: отправляем все новые события пачкой не чаще N минут.
             if bool(no_ml_cfg.get("enabled", True)) and bool(no_ml_cfg.get("stream_enabled", False)):

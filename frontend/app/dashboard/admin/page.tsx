@@ -158,6 +158,23 @@ function LinkifiedText({ text }: { text: string }) {
   );
 }
 
+function HintBadge({ text }: { text: string }) {
+  return (
+    <span className="relative inline-flex items-center group align-middle">
+      <button
+        type="button"
+        className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-400 bg-slate-800 text-[10px] text-slate-100 cursor-help"
+        aria-label="Показать подсказку"
+      >
+        ?
+      </button>
+      <span className="pointer-events-none absolute left-1/2 top-full z-30 mt-1 hidden w-72 -translate-x-1/2 rounded border border-slate-600 bg-slate-950/95 px-2 py-1 text-[11px] leading-snug text-slate-200 shadow-xl group-hover:block group-focus-within:block">
+        {text}
+      </span>
+    </span>
+  );
+}
+
 function DispatchConfigPreview({ cfgText }: { cfgText: string }) {
   let cfg: Record<string, unknown> | null = null;
   try {
@@ -224,6 +241,10 @@ function DispatchConfigHelp() {
         <span className="text-slate-100">NO_ML stream:</span> <code>stream_enabled</code> (boolean),{" "}
         <code>stream_interval_minutes</code> (&gt;=5), <code>stream_group_limit</code> (&gt;=1),{" "}
         <code>stream_fetch_limit</code> (&gt;=1), <code>stream_source</code> (<code>no_ml</code> | <code>paid</code>).
+      </p>
+      <p>
+        <span className="text-slate-100">Внеочередная отправка:</span> если матч/прогноз появился позже чем за{" "}
+        <code>min_lead_minutes</code> до старта, он отправляется сразу (вне интервала).
       </p>
       <p>
         <span className="text-slate-100">Минимально обязательная структура:</span> верхние ключи <code>free</code>, <code>vip</code>,{" "}
@@ -401,6 +422,23 @@ export default function AdminPage() {
     <button
       type="button"
       onClick={() => setActiveTab(tab)}
+      title={
+        tab === "users"
+          ? "Управление пользователями"
+          : tab === "products"
+            ? "Настройка тарифов"
+            : tab === "methods"
+              ? "Настройка способов оплаты"
+              : tab === "invoices"
+                ? "Модерация инвойсов"
+                : tab === "ml"
+                  ? "ML синхронизация и обучение"
+                  : tab === "bot_info"
+                    ? "Текст бота «Получить информацию»"
+                    : tab === "schedules"
+                      ? "Расписание каналов и источников"
+                      : "Ручные рассылки"
+      }
       className={`w-full rounded px-3 py-2 text-left text-sm border ${
         activeTab === tab
           ? "border-sky-500/50 bg-sky-500/20 text-sky-100"
@@ -431,12 +469,13 @@ export default function AdminPage() {
         <div className="space-y-8">
 
       <section className={`${activeTab === "users" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
-        <h2 className="text-lg text-white mb-3">Пользователи</h2>
+        <h2 className="text-lg text-white mb-3 flex items-center gap-2">Пользователи <HintBadge text="Поиск, просмотр и управление статусом пользователей." /></h2>
         <div className="flex flex-wrap gap-2 mb-3">
           <input
             value={usersQ}
             onChange={(e) => setUsersQ(e.target.value)}
             placeholder="Поиск по email / username / notification email"
+            title="Поиск по email, telegram username и notification email."
             className="w-full md:w-96 rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
           />
           <button
@@ -446,6 +485,7 @@ export default function AdminPage() {
               void loadUsers();
             }}
             className="rounded bg-sky-600 px-3 py-2 text-sm text-white hover:bg-sky-500"
+            title="Применить фильтр поиска и перезагрузить список."
           >
             Найти
           </button>
@@ -499,6 +539,7 @@ export default function AdminPage() {
             disabled={usersOffset === 0}
             onClick={() => setUsersOffset((v) => Math.max(0, v - pageSize))}
             className="disabled:opacity-40"
+            title="Предыдущая страница."
           >
             Назад
           </button>
@@ -507,6 +548,7 @@ export default function AdminPage() {
             disabled={usersOffset + pageSize >= usersTotal}
             onClick={() => setUsersOffset((v) => v + pageSize)}
             className="disabled:opacity-40"
+            title="Следующая страница."
           >
             Вперёд
           </button>
@@ -514,7 +556,7 @@ export default function AdminPage() {
       </section>
 
       <section className={`${activeTab === "products" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
-        <h2 className="text-lg text-white mb-3">Тарифы (биллинг)</h2>
+        <h2 className="text-lg text-white mb-3 flex items-center gap-2">Тарифы (биллинг) <HintBadge text="Редактирование цен RUB/USD и доступности тарифов." /></h2>
         <div className="space-y-2">
           {products.map((p) => (
             <div key={p.id} className="flex flex-wrap items-center gap-2 rounded border border-slate-800 p-2">
@@ -526,6 +568,7 @@ export default function AdminPage() {
               <input
                 type="number"
                 value={p.price_rub}
+                title="Цена тарифа в рублях."
                 onChange={(e) => {
                   const val = Number(e.target.value || 0);
                   setProducts((prev) => prev.map((x) => (x.id === p.id ? { ...x, price_rub: val } : x)));
@@ -537,6 +580,7 @@ export default function AdminPage() {
                 type="number"
                 step="0.01"
                 value={p.price_usd}
+                title="Цена тарифа в долларах."
                 onChange={(e) => {
                   const val = Number(e.target.value || 0);
                   setProducts((prev) => prev.map((x) => (x.id === p.id ? { ...x, price_usd: val } : x)));
@@ -547,6 +591,7 @@ export default function AdminPage() {
                 <input
                   type="checkbox"
                   checked={p.enabled}
+                  title="Включить/выключить тариф на витрине."
                   onChange={(e) => setProducts((prev) => prev.map((x) => (x.id === p.id ? { ...x, enabled: e.target.checked } : x)))}
                 />
                 активен
@@ -558,6 +603,7 @@ export default function AdminPage() {
                   await getAdminProducts().then(setProducts);
                 }}
                 className="rounded bg-sky-600 px-2 py-1 text-xs text-white hover:bg-sky-500"
+                title="Сохранить изменения тарифа."
               >
                 Сохранить
               </button>
@@ -567,15 +613,15 @@ export default function AdminPage() {
       </section>
 
       <section className={`${activeTab === "methods" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
-        <h2 className="text-lg text-white mb-3">Платёжки</h2>
+        <h2 className="text-lg text-white mb-3 flex items-center gap-2">Платёжки <HintBadge text="Методы оплаты и инструкции, которые видит пользователь при создании инвойса." /></h2>
         <div className="grid gap-2 md:grid-cols-[1fr_140px_1fr_auto] mb-4">
-          <input value={newMethodName} onChange={(e) => setNewMethodName(e.target.value)} placeholder="Название (например: Безналичная оплата)" className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
-          <select value={newMethodType} onChange={(e) => setNewMethodType(e.target.value as "custom" | "card" | "crypto")} className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white">
+          <input value={newMethodName} onChange={(e) => setNewMethodName(e.target.value)} placeholder="Название (например: Безналичная оплата)" title="Название способа оплаты, видимое пользователю." className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
+          <select value={newMethodType} onChange={(e) => setNewMethodType(e.target.value as "custom" | "card" | "crypto")} title="Технический тип метода оплаты." className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white">
             <option value="custom">custom</option>
             <option value="card">card</option>
             <option value="crypto">crypto</option>
           </select>
-          <textarea value={newMethodInstructions} onChange={(e) => setNewMethodInstructions(e.target.value)} placeholder="Сообщение для пользователя: как и куда оплатить (можно @telegram, t.me/..., https://...)" rows={2} className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
+          <textarea value={newMethodInstructions} onChange={(e) => setNewMethodInstructions(e.target.value)} placeholder="Сообщение для пользователя: как и куда оплатить (можно @telegram, t.me/..., https://...)" title="Инструкция к оплате, показывается в модалке инвойса." rows={2} className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
           <button
             type="button"
             onClick={async () => {
@@ -590,6 +636,7 @@ export default function AdminPage() {
               await getAdminPaymentMethods().then(setMethods);
             }}
             className="rounded bg-sky-600 px-3 py-2 text-sm text-white hover:bg-sky-500"
+            title="Добавить новый способ оплаты."
           >
             Добавить
           </button>
@@ -607,6 +654,7 @@ export default function AdminPage() {
                 <input
                   type="checkbox"
                   checked={m.enabled}
+                  title="Включить/выключить способ оплаты."
                   onChange={(e) => setMethods((prev) => prev.map((x) => (x.id === m.id ? { ...x, enabled: e.target.checked } : x)))}
                 />
                 включен
@@ -621,6 +669,7 @@ export default function AdminPage() {
                   await getAdminPaymentMethods().then(setMethods);
                 }}
                 className="rounded border border-slate-700 px-2 py-1 text-xs hover:bg-slate-800"
+                title="Сохранить состояние и текст инструкции."
               >
                 Сохранить
               </button>
@@ -631,6 +680,7 @@ export default function AdminPage() {
                   await getAdminPaymentMethods().then(setMethods);
                 }}
                 className="rounded border border-rose-700/60 px-2 py-1 text-xs text-rose-300 hover:bg-rose-950/40"
+                title="Удалить способ оплаты из системы."
               >
                 Удалить
               </button>
@@ -644,6 +694,7 @@ export default function AdminPage() {
                 }
                 rows={3}
                 placeholder="Сообщение для пользователя по оплате"
+                title="Редактирование текста инструкции по оплате."
                 className="w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-white"
               />
               {m.instructions ? (
@@ -658,7 +709,7 @@ export default function AdminPage() {
       </section>
 
       <section className={`${activeTab === "invoices" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
-        <h2 className="text-lg text-white mb-3">Инвойсы</h2>
+        <h2 className="text-lg text-white mb-3 flex items-center gap-2">Инвойсы <HintBadge text="Ручная модерация статусов инвойсов: оплатить/отклонить." /></h2>
         <div className="flex flex-wrap items-center gap-2 mb-3">
           {[
             { id: "pending", label: "Ожидают" },
@@ -713,6 +764,7 @@ export default function AdminPage() {
                           setInvoicesTotal(r.total);
                         }}
                         className="rounded border border-emerald-700/60 px-2 py-1 text-xs text-emerald-300 hover:bg-emerald-950/40 disabled:opacity-40"
+                        title="Подтвердить оплату инвойса и выдать подписку."
                       >
                         Оплачен
                       </button>
@@ -726,6 +778,7 @@ export default function AdminPage() {
                           setInvoicesTotal(r.total);
                         }}
                         className="rounded border border-rose-700/60 px-2 py-1 text-xs text-rose-300 hover:bg-rose-950/40 disabled:opacity-40"
+                        title="Отклонить инвойс."
                       >
                         Отклонить
                       </button>
@@ -739,7 +792,7 @@ export default function AdminPage() {
       </section>
 
       <section className={`${activeTab === "ml" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
-        <h2 className="text-lg text-white mb-3">ML-база (pingwin_ml)</h2>
+        <h2 className="text-lg text-white mb-3 flex items-center gap-2">ML-база (pingwin_ml) <HintBadge text="Синхронизация и обслуживание ML-базы, прогресса задач и переобучения." /></h2>
         <div className="rounded-lg border border-slate-700 bg-slate-900/80 p-3 mb-4 text-sm text-slate-300 space-y-2">
           <p className="font-medium text-slate-200">Два источника заполнения:</p>
           <ol className="list-decimal list-inside space-y-1 text-xs">
@@ -1141,7 +1194,7 @@ export default function AdminPage() {
       </section>
 
       <section className={`${activeTab === "bot_info" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
-        <h2 className="text-lg text-white mb-3">Сообщение бота «Получить информацию»</h2>
+        <h2 className="text-lg text-white mb-3 flex items-center gap-2">Сообщение бота «Получить информацию» <HintBadge text="Текст ответа основного Telegram-бота на кнопку получения информации." /></h2>
         <p className="text-slate-400 text-sm mb-2">
           Текст, который видят пользователи в Telegram-боте при нажатии на кнопку «Получить информацию».
         </p>
@@ -1150,6 +1203,7 @@ export default function AdminPage() {
           onChange={(e) => setBotInfoMessage(e.target.value)}
           rows={6}
           placeholder="Введите сообщение для бота..."
+          title="Текст ответа в основном Telegram-боте для кнопки «Получить информацию»."
           className="w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white mb-2"
         />
         <button
@@ -1166,13 +1220,14 @@ export default function AdminPage() {
             }
           }}
           className="rounded bg-sky-600 px-4 py-2 text-sm text-white hover:bg-sky-500 disabled:opacity-50"
+          title="Сохранить текст сообщения бота."
         >
           {botInfoSaving ? "Сохранение…" : "Сохранить"}
         </button>
       </section>
 
       <section className={`${activeTab === "schedules" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
-        <h2 className="text-lg text-white mb-3">Настройка расписаний ботов (JSON)</h2>
+        <h2 className="text-lg text-white mb-3 flex items-center gap-2">Настройка расписаний ботов (JSON) <HintBadge text="Настройка, когда и из какого источника отправлять прогнозы в каналы." /></h2>
         <p className="text-slate-400 text-sm mb-2">
           Полностью настраиваемые правила `откуда/сколько/куда`: слоты для FREE и PAID/ML, stream с группировкой для NO_ML, daily summary.
         </p>
@@ -1181,9 +1236,12 @@ export default function AdminPage() {
         {dispatchCfgObj ? (
           <div className="my-3 grid gap-3 md:grid-cols-2">
             <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300">
-              <p className="mb-2 font-medium text-slate-200">FREE: слоты</p>
+              <p className="mb-2 font-medium text-slate-200 inline-flex items-center gap-2">
+                FREE: слоты
+                <HintBadge text="Расписание отправок в бесплатный канал. Каждый слот: время (MSK), источник и количество прогнозов." />
+              </p>
               <div className="mb-2 grid grid-cols-3 gap-2">
-                <label className="flex items-center gap-2">
+                <label className="flex items-center gap-2" title="Включает/выключает отправки в FREE канал.">
                   <input
                     type="checkbox"
                     checked={Boolean((dispatchCfgObj.free as Record<string, unknown> | undefined)?.enabled ?? true)}
@@ -1197,8 +1255,15 @@ export default function AdminPage() {
                   />
                   enabled
                 </label>
-                <label>
-                  min_lead
+                <div className="inline-flex items-center gap-1 text-slate-300">
+                  <span>enabled</span>
+                  <HintBadge text="Если выключено, FREE-слоты полностью игнорируются." />
+                </div>
+                <label title="Минимум минут до старта матча, чтобы прогноз можно было отправить.">
+                  <span className="inline-flex items-center gap-1">
+                    min_lead
+                    <HintBadge text="Минимальный запас времени до старта матча (в минутах)." />
+                  </span>
                   <input
                     type="number"
                     min={0}
@@ -1213,8 +1278,11 @@ export default function AdminPage() {
                     className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
                   />
                 </label>
-                <label>
-                  summary UTC
+                <label title="Час в UTC для суточной статистики, пусто — выключено.">
+                  <span className="inline-flex items-center gap-1">
+                    summary UTC
+                    <HintBadge text="Час (0-23) отправки суточной сводки; пусто = выключено." />
+                  </span>
                   <input
                     type="number"
                     min={0}
@@ -1237,6 +1305,7 @@ export default function AdminPage() {
                   <div key={`free-slot-${idx}`} className="mb-2 grid grid-cols-4 gap-2">
                     <input
                       value={String(slot.time_msk ?? "")}
+                      title="Время отправки слота в формате HH:MM (MSK)."
                       onChange={(e) =>
                         updateDispatchCfg((cfg) => {
                           const free = (cfg.free as Record<string, unknown>) || {};
@@ -1250,6 +1319,7 @@ export default function AdminPage() {
                     />
                     <select
                       value={String(slot.source ?? "no_ml")}
+                      title="Источник прогнозов для слота: no_ml или paid."
                       onChange={(e) =>
                         updateDispatchCfg((cfg) => {
                           const free = (cfg.free as Record<string, unknown>) || {};
@@ -1268,6 +1338,7 @@ export default function AdminPage() {
                       type="number"
                       min={1}
                       value={Number(slot.count ?? 1)}
+                      title="Сколько прогнозов отправлять в этот слот."
                       onChange={(e) =>
                         updateDispatchCfg((cfg) => {
                           const free = (cfg.free as Record<string, unknown>) || {};
@@ -1281,6 +1352,7 @@ export default function AdminPage() {
                     />
                     <button
                       type="button"
+                      title="Удалить слот расписания."
                       onClick={() =>
                         updateDispatchCfg((cfg) => {
                           const free = (cfg.free as Record<string, unknown>) || {};
@@ -1299,6 +1371,7 @@ export default function AdminPage() {
               ) : null}
               <button
                 type="button"
+                title="Добавить новый слот в FREE канал."
                 onClick={() =>
                   updateDispatchCfg((cfg) => {
                     const free = (cfg.free as Record<string, unknown>) || {};
@@ -1314,9 +1387,12 @@ export default function AdminPage() {
               </button>
             </div>
             <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300">
-              <p className="mb-2 font-medium text-slate-200">PAID/ML: слоты</p>
+              <p className="mb-2 font-medium text-slate-200 inline-flex items-center gap-2">
+                PAID/ML: слоты
+                <HintBadge text="Расписание отправок в платный ML-канал. Для каждого слота задайте время, источник и количество." />
+              </p>
               <div className="mb-2 grid grid-cols-3 gap-2">
-                <label className="flex items-center gap-2">
+                <label className="flex items-center gap-2" title="Включает/выключает отправки в PAID/ML канал.">
                   <input
                     type="checkbox"
                     checked={Boolean((dispatchCfgObj.vip as Record<string, unknown> | undefined)?.enabled ?? true)}
@@ -1330,8 +1406,15 @@ export default function AdminPage() {
                   />
                   enabled
                 </label>
-                <label>
-                  min_lead
+                <div className="inline-flex items-center gap-1 text-slate-300">
+                  <span>enabled</span>
+                  <HintBadge text="Если выключено, PAID/ML-слоты полностью игнорируются." />
+                </div>
+                <label title="Минимум минут до старта матча, чтобы прогноз можно было отправить.">
+                  <span className="inline-flex items-center gap-1">
+                    min_lead
+                    <HintBadge text="Минимальный запас времени до старта матча (в минутах)." />
+                  </span>
                   <input
                     type="number"
                     min={0}
@@ -1346,8 +1429,11 @@ export default function AdminPage() {
                     className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
                   />
                 </label>
-                <label>
-                  summary UTC
+                <label title="Час в UTC для суточной статистики, пусто — выключено.">
+                  <span className="inline-flex items-center gap-1">
+                    summary UTC
+                    <HintBadge text="Час (0-23) отправки суточной сводки; пусто = выключено." />
+                  </span>
                   <input
                     type="number"
                     min={0}
@@ -1370,6 +1456,7 @@ export default function AdminPage() {
                   <div key={`vip-slot-${idx}`} className="mb-2 grid grid-cols-4 gap-2">
                     <input
                       value={String(slot.time_msk ?? "")}
+                      title="Время отправки слота в формате HH:MM (MSK)."
                       onChange={(e) =>
                         updateDispatchCfg((cfg) => {
                           const vip = (cfg.vip as Record<string, unknown>) || {};
@@ -1383,6 +1470,7 @@ export default function AdminPage() {
                     />
                     <select
                       value={String(slot.source ?? "no_ml")}
+                      title="Источник прогнозов для слота: no_ml или paid."
                       onChange={(e) =>
                         updateDispatchCfg((cfg) => {
                           const vip = (cfg.vip as Record<string, unknown>) || {};
@@ -1401,6 +1489,7 @@ export default function AdminPage() {
                       type="number"
                       min={1}
                       value={Number(slot.count ?? 1)}
+                      title="Сколько прогнозов отправлять в этот слот."
                       onChange={(e) =>
                         updateDispatchCfg((cfg) => {
                           const vip = (cfg.vip as Record<string, unknown>) || {};
@@ -1414,6 +1503,7 @@ export default function AdminPage() {
                     />
                     <button
                       type="button"
+                      title="Удалить слот расписания."
                       onClick={() =>
                         updateDispatchCfg((cfg) => {
                           const vip = (cfg.vip as Record<string, unknown>) || {};
@@ -1432,6 +1522,7 @@ export default function AdminPage() {
               ) : null}
               <button
                 type="button"
+                title="Добавить новый слот в PAID/ML канал."
                 onClick={() =>
                   updateDispatchCfg((cfg) => {
                     const vip = (cfg.vip as Record<string, unknown>) || {};
@@ -1447,9 +1538,12 @@ export default function AdminPage() {
               </button>
             </div>
             <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300 md:col-span-2">
-              <p className="mb-2 font-medium text-slate-200">NO_ML: поток с группировкой</p>
+              <p className="mb-2 font-medium text-slate-200 inline-flex items-center gap-2">
+                NO_ML: поток с группировкой
+                <HintBadge text="Потоковая отправка новых прогнозов в канал no_ml пачками по интервалу." />
+              </p>
               <div className="mb-2 grid gap-2 md:grid-cols-4">
-                <label className="flex items-center gap-2">
+                <label className="flex items-center gap-2" title="Включает/выключает весь канал NO_ML.">
                   <input
                     type="checkbox"
                     checked={Boolean((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.enabled ?? true)}
@@ -1463,7 +1557,11 @@ export default function AdminPage() {
                   />
                   enabled
                 </label>
-                <label className="flex items-center gap-2">
+                <div className="inline-flex items-center gap-1 text-slate-300">
+                  <span>enabled</span>
+                  <HintBadge text="Полностью выключает или включает отправки в NO_ML канал." />
+                </div>
+                <label className="flex items-center gap-2" title="Включает потоковую отправку в NO_ML канал.">
                   <input
                     type="checkbox"
                     checked={Boolean((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.stream_enabled ?? false)}
@@ -1477,8 +1575,15 @@ export default function AdminPage() {
                   />
                   stream_enabled
                 </label>
-                <label>
-                  min_lead
+                <div className="inline-flex items-center gap-1 text-slate-300">
+                  <span>stream_enabled</span>
+                  <HintBadge text="Если выключено, потоковые отправки не выполняются (даже если enabled=true)." />
+                </div>
+                <label title="Минимум минут до старта матча, чтобы прогноз можно было отправить.">
+                  <span className="inline-flex items-center gap-1">
+                    min_lead
+                    <HintBadge text="Минимальный запас времени до старта матча (в минутах)." />
+                  </span>
                   <input
                     type="number"
                     min={0}
@@ -1493,8 +1598,11 @@ export default function AdminPage() {
                     className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
                   />
                 </label>
-                <label>
-                  summary UTC
+                <label title="Час в UTC для суточной статистики, пусто — выключено.">
+                  <span className="inline-flex items-center gap-1">
+                    summary UTC
+                    <HintBadge text="Час (0-23) отправки суточной сводки; пусто = выключено." />
+                  </span>
                   <input
                     type="number"
                     min={0}
@@ -1513,8 +1621,11 @@ export default function AdminPage() {
                 </label>
               </div>
               <div className="grid gap-2 md:grid-cols-4">
-                <label>
-                  interval, мин
+                <label title="Интервал между потоковыми отправками в минутах (не чаще).">
+                  <span className="inline-flex items-center gap-1">
+                    interval, мин
+                    <HintBadge text="Минимальный интервал между двумя отправками потока." />
+                  </span>
                   <input
                     type="number"
                     min={5}
@@ -1529,8 +1640,11 @@ export default function AdminPage() {
                     className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
                   />
                 </label>
-                <label>
-                  group_limit
+                <label title="Максимум прогнозов в одной отправке.">
+                  <span className="inline-flex items-center gap-1">
+                    group_limit
+                    <HintBadge text="Максимальное число прогнозов в одном пакете отправки." />
+                  </span>
                   <input
                     type="number"
                     min={1}
@@ -1545,8 +1659,11 @@ export default function AdminPage() {
                     className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
                   />
                 </label>
-                <label>
-                  fetch_limit
+                <label title="Сколько кандидатов максимум читать из БД за цикл.">
+                  <span className="inline-flex items-center gap-1">
+                    fetch_limit
+                    <HintBadge text="Верхний лимит чтения кандидатов из БД за один цикл." />
+                  </span>
                   <input
                     type="number"
                     min={1}
@@ -1561,8 +1678,11 @@ export default function AdminPage() {
                     className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
                   />
                 </label>
-                <label>
-                  source
+                <label title="Источник для потока: no_ml или paid.">
+                  <span className="inline-flex items-center gap-1">
+                    source
+                    <HintBadge text="Источник прогнозов: no_ml или paid." />
+                  </span>
                   <select
                     value={String((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.stream_source ?? "no_ml")}
                     onChange={(e) =>
@@ -1585,11 +1705,13 @@ export default function AdminPage() {
         <textarea
           value={dispatchCfgText}
           onChange={(e) => setDispatchCfgText(e.target.value)}
+          title="Расписание в формате JSON. Можно редактировать вручную."
           rows={12}
           className="w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-white my-2"
         />
         <button
           type="button"
+          title="Подставить базовый пример расписания для 3 каналов."
           onClick={() => {
             setDispatchCfgText(JSON.stringify({
               free: {
@@ -1631,6 +1753,7 @@ export default function AdminPage() {
         <button
           type="button"
           disabled={dispatchCfgSaving}
+          title="Сохранить расписание в базу данных."
           onClick={async () => {
             try {
               setDispatchCfgSaving(true);
@@ -1649,13 +1772,14 @@ export default function AdminPage() {
       </section>
 
       <section className={`${activeTab === "messages" ? "block" : "hidden"} rounded-xl border border-slate-800 bg-slate-900/40 p-4`}>
-        <h2 className="text-lg text-white mb-3">Рассылки (каналы / бот / email)</h2>
+        <h2 className="text-lg text-white mb-3 flex items-center gap-2">Рассылки (каналы / бот / email) <HintBadge text="Ручная рассылка в канал, конкретному пользователю, всем пользователям бота или на email." /></h2>
         <div className="grid gap-3 md:grid-cols-2">
           <label className="text-sm text-slate-300">
             Куда
             <select
               value={messageTarget}
               onChange={(e) => setMessageTarget(e.target.value as "free_channel" | "vip_channel" | "no_ml_channel" | "telegram_user" | "telegram_all_users" | "email")}
+              title="Тип получателя: канал, один пользователь, все пользователи бота или email."
               className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
             >
               <option value="free_channel">FREE канал</option>
@@ -1669,18 +1793,18 @@ export default function AdminPage() {
           {messageTarget === "telegram_user" ? (
             <label className="text-sm text-slate-300">
               user_id
-              <input value={messageUserId} onChange={(e) => setMessageUserId(e.target.value)} className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
+              <input value={messageUserId} onChange={(e) => setMessageUserId(e.target.value)} title="UUID пользователя для точечной отправки в Telegram." className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
             </label>
           ) : null}
           {messageTarget === "email" ? (
             <>
               <label className="text-sm text-slate-300">
                 Email
-                <input value={messageEmail} onChange={(e) => setMessageEmail(e.target.value)} className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
+                <input value={messageEmail} onChange={(e) => setMessageEmail(e.target.value)} title="Email получателя для рассылки." className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
               </label>
               <label className="text-sm text-slate-300">
                 Тема
-                <input value={messageSubject} onChange={(e) => setMessageSubject(e.target.value)} className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
+                <input value={messageSubject} onChange={(e) => setMessageSubject(e.target.value)} title="Тема email-сообщения." className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
               </label>
             </>
           ) : null}
@@ -1691,6 +1815,7 @@ export default function AdminPage() {
             value={messageText}
             onChange={(e) => setMessageText(e.target.value)}
             rows={5}
+            title="Основной текст рассылки. Поддерживается HTML-формат Telegram на стороне API."
             className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
           />
         </label>
@@ -1700,6 +1825,7 @@ export default function AdminPage() {
             value={messageImageUrl}
             onChange={(e) => setMessageImageUrl(e.target.value)}
             placeholder="https://..."
+            title="Одна ссылка на изображение для отправки вместе с текстом."
             className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
           />
         </label>
@@ -1710,6 +1836,7 @@ export default function AdminPage() {
             onChange={(e) => setMessageImageUrls(e.target.value)}
             rows={3}
             placeholder={"https://...\nhttps://..."}
+            title="Несколько ссылок на изображения, по одной в строке."
             className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white"
           />
         </label>
@@ -1748,6 +1875,7 @@ export default function AdminPage() {
             }
           }}
           className="mt-3 rounded bg-sky-600 px-4 py-2 text-sm text-white hover:bg-sky-500 disabled:opacity-50"
+          title="Отправить сообщение по выбранному target."
         >
           {sending ? "Отправка..." : "Отправить"}
         </button>
