@@ -8,6 +8,7 @@ from app.models.table_tennis_league_rule import TableTennisLeagueRule
 from app.models.table_tennis_model_run import TableTennisModelRun
 from app.models.table_tennis_player_daily_feature import TableTennisPlayerDailyFeature
 from app.models.table_tennis_match_feature import TableTennisMatchFeature
+from app.models.table_tennis_forecast_early_scan import TableTennisForecastEarlyScan
 from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
 from app.models.table_tennis_forecast_explanation import TableTennisForecastExplanation
 from app.models.user_forecast_notification import UserForecastNotification
@@ -29,6 +30,7 @@ __all__ = [
     "TableTennisModelRun",
     "TableTennisPlayerDailyFeature",
     "TableTennisMatchFeature",
+    "TableTennisForecastEarlyScan",
     "TableTennisForecastV2",
     "TableTennisForecastExplanation",
     "UserForecastNotification",

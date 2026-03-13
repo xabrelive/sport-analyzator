@@ -7,6 +7,7 @@ import {
   fetchLeagues,
   fetchMatchesByLeague,
   fetchFinishedMatches,
+  fetchMatchesOverview,
   fetchSignals,
   type League,
   type Match,
@@ -237,13 +238,16 @@ function LeaguesPageContent() {
 
   useEffect(() => {
     if (!selectedId || tab !== "live") return;
-    const leagueId: string = selectedId;
     let cancelled = false;
     setLoadingLive(true);
+    const leagueId: string = selectedId;
+
     function load() {
-      fetchMatchesByLeague(leagueId, "live")
-        .then((data) => {
-          if (!cancelled) setLiveMatches(data);
+      fetchMatchesOverview({ limit_live: 200, limit_upcoming: 0 })
+        .then(({ live }) => {
+          if (cancelled) return;
+          const filtered = (live ?? []).filter((m) => m.league?.id === leagueId);
+          setLiveMatches(filtered);
         })
         .catch((e) => {
           if (!cancelled) setError(e instanceof Error ? e.message : "Ошибка загрузки лайва");

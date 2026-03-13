@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchMatchesLive, type Match } from "@/lib/api";
+import { fetchMatchesOverview, type Match } from "@/lib/api";
 import { MatchCard } from "@/components/MatchCard";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useAuth } from "@/contexts/AuthContext";
@@ -51,11 +51,10 @@ export default function SportLivePage() {
     }
     isFetchingRef.current = true;
     try {
-      const { live } = await fetchMatchesLive(200);
-      const onlyLive = (live ?? []).filter((m) => (m.status || "").toLowerCase() === "live");
-      setMatches(onlyLive);
-      setCachedMatches(onlyLive);
-      setCached<Match[]>(cacheKey, onlyLive);
+      const { live } = await fetchMatchesOverview({ limit_live: 200, limit_upcoming: 0 });
+      setMatches(live);
+      setCachedMatches(live);
+      setCached<Match[]>(cacheKey, live);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка загрузки");
     } finally {

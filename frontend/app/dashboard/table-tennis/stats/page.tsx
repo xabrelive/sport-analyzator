@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
   getTableTennisForecastStats,
@@ -11,6 +12,7 @@ import {
 
 const STORAGE_KEY_STATS_COMPACT = "tt_stats_compact_mode_v1";
 type PeriodFilter = "today" | "1d" | "7d" | "30d";
+type PhaseFilter = "all" | "upcoming" | "live";
 
 const PERIODS: Array<{ id: PeriodFilter; label: string }> = [
   { id: "today", label: "Сегодня" },
@@ -101,10 +103,12 @@ const ALL_TABS = [
   { id: "paid" as const, label: "Платная подписка" },
   { id: "bot_signals" as const, label: "Сигналы из бота" },
   { id: "vip" as const, label: "Вип канал" },
+  { id: "no_ml" as const, label: "Аналитика без ML" },
 ];
 
 export default function TableTennisStatsPage() {
-  const [activeTab, setActiveTab] = useState<"free" | "paid" | "vip" | "bot_signals">("paid");
+  const searchParams = useSearchParams();
+  const [activeTab, setActiveTab] = useState<"free" | "paid" | "vip" | "bot_signals" | "no_ml">("paid");
   const [period, setPeriod] = useState<PeriodFilter>("7d");
   const [stats, setStats] = useState<TableTennisForecastStats | null>(null);
   const [items, setItems] = useState<TableTennisForecastItem[]>([]);
@@ -121,6 +125,7 @@ export default function TableTennisStatsPage() {
   const [compactMode, setCompactMode] = useState(false);
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
   const [sortByStart, setSortByStart] = useState<"asc" | "desc">("desc");
+  const [phaseFilter, setPhaseFilter] = useState<PhaseFilter>("all");
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -131,6 +136,14 @@ export default function TableTennisStatsPage() {
     if (typeof window === "undefined") return;
     localStorage.setItem(STORAGE_KEY_STATS_COMPACT, compactMode ? "1" : "0");
   }, [compactMode]);
+
+  useEffect(() => {
+    const ch = (searchParams.get("channel") || "").toLowerCase();
+    if (ch === "free" || ch === "paid" || ch === "vip" || ch === "bot_signals" || ch === "no_ml") {
+      setActiveTab(ch);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -174,10 +187,15 @@ export default function TableTennisStatsPage() {
     };
   }, [page, pageSize, statusFilter, activeTab, qualityTier, period]);
 
-  const sortedItems = useMemo(
-    () => sortByMatchStart(items, sortByStart),
-    [items, sortByStart],
-  );
+  const sortedItems = useMemo(() => {
+    const filtered = items.filter((it) => {
+      if (phaseFilter === "all") return true;
+      if (phaseFilter === "live") return it.event_status === "live";
+      if (phaseFilter === "upcoming") return it.event_status === "scheduled";
+      return true;
+    });
+    return sortByMatchStart(filtered, sortByStart);
+  }, [items, sortByStart, phaseFilter]);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const cellPadClass = compactMode ? "px-2 py-1.5" : "px-3 py-2";
@@ -308,6 +326,51 @@ export default function TableTennisStatsPage() {
             {p.label}
           </button>
         ))}
+        <div className="inline-flex items-center gap-1 ml-2">
+          <span className="text-xs text-slate-500">Матчи:</span>
+          <button
+            type="button"
+            onClick={() => {
+              setPhaseFilter("all");
+              setPage(1);
+            }}
+            className={`px-2 py-1 rounded-md text-xs ${
+              phaseFilter === "all"
+                ? "bg-sky-500/20 border border-sky-500/40 text-sky-100"
+                : "border border-slate-700 text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            Все
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setPhaseFilter("upcoming");
+              setPage(1);
+            }}
+            className={`px-2 py-1 rounded-md text-xs ${
+              phaseFilter === "upcoming"
+                ? "bg-sky-500/20 border border-sky-500/40 text-sky-100"
+                : "border border-slate-700 text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            Ещё не начались
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setPhaseFilter("live");
+              setPage(1);
+            }}
+            className={`px-2 py-1 rounded-md text-xs ${
+              phaseFilter === "live"
+                ? "bg-sky-500/20 border border-sky-500/40 text-sky-100"
+                : "border border-slate-700 text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            Уже идут
+          </button>
+        </div>
       </div>
 
       <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8 gap-3">

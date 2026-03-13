@@ -229,6 +229,14 @@ export function DashboardSidebar({
               {Icons.check}
               Результаты
             </Link>
+            <Link
+              href="/dashboard/table-tennis/line-no-ml"
+              className={subLinkClasses(isActive("/dashboard/table-tennis/line-no-ml"))}
+              onClick={onNavigate}
+            >
+              {Icons.stats}
+              Аналитика без ML
+            </Link>
           </div>
         )}
 
@@ -292,14 +300,24 @@ export function DashboardSidebar({
           Настройки
         </Link>
         {isSuperadmin ? (
-          <Link
-            href="/dashboard/admin"
-            className={navLinkClasses(pathname?.startsWith("/dashboard/admin") || false)}
-            onClick={onNavigate}
-          >
-            {Icons.shield}
-            Админка
-          </Link>
+          <>
+            <Link
+              href="/dashboard/admin"
+              className={navLinkClasses(pathname?.startsWith("/dashboard/admin") || false)}
+              onClick={onNavigate}
+            >
+              {Icons.shield}
+              Админка
+            </Link>
+            <Link
+              href="/dashboard/admin#admin-ml"
+              className="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-emerald-400 hover:bg-slate-800/80 hover:text-emerald-300 transition"
+              onClick={onNavigate}
+            >
+              <span className="w-5 text-xs text-slate-500">↳</span>
+              ML
+            </Link>
+          </>
         ) : null}
       </nav>
       <div className="p-3 border-t border-slate-800">

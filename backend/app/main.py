@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.api.v1.router import api_router
 from app.db.session import init_db
+from app.db.migrations import run_migrations as run_alembic_migrations
 
 # Путь к корню backend (для alembic.ini)
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -27,17 +28,7 @@ logger = logging.getLogger(__name__)
 def _run_migrations() -> None:
     """Запуск Alembic миграций до старта приложения."""
     try:
-        from alembic import command
-        from alembic.config import Config
-
-        alembic_ini = BACKEND_ROOT / "alembic.ini"
-        if not alembic_ini.is_file():
-            logger.warning("alembic.ini не найден, миграции пропущены")
-            return
-        config = Config(str(alembic_ini))
-        config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
-        # URL берётся из app.config в env.py
-        command.upgrade(config, "head")
+        run_alembic_migrations()
         logger.info("Alembic: миграции применены (upgrade head)")
     except Exception as e:  # noqa: BLE001
         logger.exception("Alembic: ошибка при применении миграций: %s", e)
@@ -83,16 +74,19 @@ async def startup():
             settings.smtp_from_email or "(пусто)",
         )
 
-    # Запускаем фоновый опрос линии настольного тенниса (BetsAPI) с очередью и воркерами.
-    try:
-        from app.worker.table_tennis_line import start_pipeline
+    # Запускаем фоновые воркеры только если run_background_workers=True (отдельный tt_workers при масштабировании).
+    if not settings.run_background_workers:
+        logger.info("API-only режим: фоновые воркеры отключены (run_background_workers=false)")
+    else:
+        try:
+            from app.worker.table_tennis_line import start_pipeline
 
-        if (settings.betsapi_token or "").strip():
-            await start_pipeline()
-        else:
-            logger.info("BetsAPI: betsapi_token пуст — опрос линии не запускаем.")
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Не удалось запустить фоновый опрос BetsAPI: %s", e)
+            if (settings.betsapi_token or "").strip():
+                await start_pipeline()
+            else:
+                logger.info("BetsAPI: betsapi_token пуст — опрос линии не запускаем.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Не удалось запустить фоновый опрос BetsAPI: %s", e)
 
 
 @app.exception_handler(Exception)

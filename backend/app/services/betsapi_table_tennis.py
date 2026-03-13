@@ -1678,6 +1678,135 @@ async def sync_results_from_archive_range_once(
     return {"targets": len(events_map), "matched": len(matched_ids), "resolved": resolved}
 
 
+async def load_archive_to_main(
+    days_back: int = 90,
+    max_pages_per_day: int = 10,
+) -> dict[str, int]:
+    """Загружает завершённые матчи из архива BetsAPI в main DB (table_tennis_line_events).
+
+    Используется для первичного наполнения: линия даёт только upcoming, архив — finished.
+    Без этого ML-таблицы остаются пустыми (sync читает только finished с live_sets_score).
+    """
+    token = (settings.betsapi_token or "").strip()
+    if not token:
+        logger.warning("BetsAPI: BETSAPI_TOKEN не задан — load_archive_to_main пропущен")
+        return {"inserted": 0, "updated": 0, "skipped": 0}
+
+    today = datetime.now(timezone.utc).date()
+    date_from = today - timedelta(days=max(1, days_back))
+    date_to = today
+
+    all_events: list[Dict[str, Any]] = []
+    async with httpx.AsyncClient() as client:
+        day = date_from
+        while day <= date_to:
+            day_key = day.strftime("%Y%m%d")
+            rows = await _fetch_ended_events_day(
+                client,
+                day_key,
+                max_pages=max(1, int(max_pages_per_day)),
+            )
+            all_events.extend(rows)
+            day = day + timedelta(days=1)
+            await asyncio.sleep(0.3)
+
+    if not all_events:
+        return {"inserted": 0, "updated": 0, "skipped": 0}
+
+    now = datetime.now(timezone.utc)
+    rows_to_save: list[Dict[str, Any]] = []
+    for ev in all_events:
+        row = _parse_event_for_db(ev)
+        if not row:
+            continue
+        scores = _build_live_scores_from_event(ev)
+        sets_score = _derive_live_sets_score(scores or {}, ev.get("ss"))
+        row["status"] = LINE_EVENT_STATUS_FINISHED
+        row["live_score"] = scores if scores else {}
+        row["live_sets_score"] = sets_score if sets_score else "0-0"
+        row["finished_at"] = now
+        row["last_score_changed_at"] = now
+        if not row.get("live_sets_score") or row["live_sets_score"] == "0-0":
+            continue
+        rows_to_save.append(row)
+
+    if not rows_to_save:
+        return {"inserted": 0, "updated": 0, "skipped": len(all_events)}
+
+    leagues_seen: Dict[str, str] = {}
+    players_seen: Dict[str, str] = {}
+    for r in rows_to_save:
+        if r.get("league_id"):
+            leagues_seen[r["league_id"]] = r.get("league_name", "—")
+        if r.get("home_id"):
+            players_seen[r["home_id"]] = r.get("home_name", "—")
+        if r.get("away_id"):
+            players_seen[r["away_id"]] = r.get("away_name", "—")
+
+    inserted = 0
+    updated = 0
+    async with async_session_maker() as session:
+        if leagues_seen:
+            league_rows = [
+                {"id": lid, "name": name, "updated_at": now}
+                for lid, name in leagues_seen.items()
+            ]
+            stmt_league = insert(TableTennisLeague).values(league_rows)
+            stmt_league = stmt_league.on_conflict_do_nothing(index_elements=["id"])
+            await session.execute(stmt_league)
+        if players_seen:
+            player_rows = [
+                {"id": pid, "name": name, "updated_at": now}
+                for pid, name in players_seen.items()
+            ]
+            stmt_player = insert(TableTennisPlayer).values(player_rows)
+            stmt_player = stmt_player.on_conflict_do_nothing(index_elements=["id"])
+            await session.execute(stmt_player)
+
+        existing_result = await session.execute(
+            select(TableTennisLineEvent.id, TableTennisLineEvent.live_sets_score).where(
+                TableTennisLineEvent.id.in_([r["id"] for r in rows_to_save])
+            )
+        )
+        existing_map = {str(r[0]): r[1] for r in existing_result.all()}
+
+        for r in rows_to_save:
+            eid = r["id"]
+            has_sets = bool(r.get("live_sets_score") and r["live_sets_score"] != "0-0")
+            if not has_sets:
+                continue
+            if eid in existing_map:
+                if existing_map[eid]:
+                    continue
+                await session.execute(
+                    TableTennisLineEvent.__table__.update()
+                    .where(TableTennisLineEvent.id == eid)
+                    .values(
+                        status=LINE_EVENT_STATUS_FINISHED,
+                        live_score=r.get("live_score") or {},
+                        live_sets_score=r["live_sets_score"],
+                        finished_at=now,
+                        last_score_changed_at=now,
+                        updated_at=now,
+                    )
+                )
+                updated += 1
+            else:
+                stmt = insert(TableTennisLineEvent).values(r)
+                stmt = stmt.on_conflict_do_nothing(index_elements=["id"])
+                await session.execute(stmt)
+                inserted += 1
+
+        await session.commit()
+    logger.info(
+        "BetsAPI load_archive_to_main: inserted=%s, updated=%s, total_events=%s",
+        inserted,
+        updated,
+        len(rows_to_save),
+    )
+    return {"inserted": inserted, "updated": updated, "skipped": len(all_events) - inserted - updated}
+
+
 def get_cached_line() -> Dict[str, Any]:
     """Возвращает кэшированную линию и агрегаты: события, лиги, игроки по лигам.
     Формат: { "events": [...], "leagues": [{"id", "name"}], "players_by_league": [{"league_id", "league_name", "players": [{"id", "name"}]}], "updated_at": unix? }

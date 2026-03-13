@@ -37,7 +37,7 @@ function buildWsCandidates(): string[] {
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     out.push(`${proto}://${window.location.host}/ws`);
   } else {
-    out.push("ws://localhost:11001/ws");
+    out.push("ws://localhost:12000/ws");
   }
   return Array.from(new Set(out.filter(Boolean)));
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { fetchMatchesLive, fetchSignals, fetchMatchRecommendations, type Match } from "@/lib/api";
+import { fetchMatchesOverview, fetchSignals, fetchMatchRecommendations, type Match } from "@/lib/api";
 import { LiveMatchRow } from "@/components/LiveMatchRow";
 import { formatSignalRecommendation } from "@/components/LineMatchRow";
 import { useWebSocket } from "@/hooks/useWebSocket";
@@ -75,8 +75,7 @@ export default function LivePage() {
   const matchesRef = useRef<Match[]>([]);
   const { hasFullAccess } = useSubscription();
 
-  // Показываем только реально лайвовые матчи (status === "live"), без «недавно завершённых».
-  const displayMatches = matches.filter((m) => (m.status || "").toLowerCase() === "live");
+  const displayMatches = matches;
   matchesRef.current = matches;
 
   const recommendationByMatch = useMemo(() => buildRecommendationByMatch(signals), [signals]);
@@ -100,7 +99,7 @@ export default function LivePage() {
     }
     isFetchingMatchesRef.current = true;
     try {
-      const { live } = await fetchMatchesLive(200);
+      const { live } = await fetchMatchesOverview({ limit_live: 200, limit_upcoming: 0 });
       const prev = matchesRef.current;
       const byId = new Map(prev.map((x) => [x.id, x]));
       const merged = live.map((m) => {
@@ -184,7 +183,7 @@ export default function LivePage() {
       }
     }
     void boot();
-    const matchesTimer = setInterval(() => void loadMatchesOnly(), 3000);
+    const matchesTimer = setInterval(() => void loadMatchesOnly(), 5000);
     const signalsTimer = setInterval(() => void loadSignalsOnly(), 30000);
     return () => {
       cancelled = true;

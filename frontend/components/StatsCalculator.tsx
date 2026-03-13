@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { getTableTennisForecasts, type TableTennisForecastItem } from "@/lib/api";
 
-type CalcChannel = "free" | "paid" | "vip" | "bot_signals";
+type CalcChannel = "free" | "paid" | "vip" | "bot_signals" | "no_ml";
 type CalcItem = TableTennisForecastItem & { selected: boolean };
 
 const PER_PAGE_OPTIONS = [20, 50, 100];
@@ -45,6 +45,7 @@ const CALC_TABS: Array<{ id: CalcChannel; label: string }> = [
   { id: "paid", label: "Платная подписка" },
   { id: "bot_signals", label: "Сигналы из бота" },
   { id: "vip", label: "Вип канал" },
+  { id: "no_ml", label: "Расчёт без ML" },
 ];
 
 function formatDateTime(ts: number | null | undefined): string {

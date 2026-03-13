@@ -5,8 +5,8 @@ import { useRouter } from "next/navigation";
 import type { Match, OddsSnapshot } from "@/lib/api";
 import { formatHoursUntil, formatDateTimeWithYear } from "@/lib/format";
 
-/** Рынок «победитель матча»: winner/win (общие), 92_1 (BetsAPI НТ), 1_1 (v4 prematch / футбол). */
-const WINNER_MARKETS = ["winner", "win", "92_1", "1_1"];
+/** Рынок «победитель матча»: winner/win (общие) или 92_1 (BetsAPI Match Winner 2-Way). */
+const WINNER_MARKETS = ["winner", "win", "92_1"];
 
 function getWinnerOdds(odds: OddsSnapshot[] | undefined): { home: string; away: string; impliedHome: number | null; impliedAway: number | null } {
   if (!odds?.length) return { home: "–", away: "–", impliedHome: null, impliedAway: null };

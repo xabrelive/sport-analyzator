@@ -9,6 +9,7 @@ from sqlalchemy import and_, delete, func, or_, select
 
 from app.config import settings
 from app.db.session import async_session_maker
+from app.models.table_tennis_forecast_early_scan import TableTennisForecastEarlyScan
 from app.models.table_tennis_forecast_explanation import TableTennisForecastExplanation
 from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
 from app.models.table_tennis_line_event import (
@@ -19,21 +20,17 @@ from app.models.table_tennis_line_event import (
     TableTennisLineEvent,
 )
 from app.models.table_tennis_model_run import TableTennisModelRun
-from app.services.feature_builder import (
-    build_match_feature_snapshot,
-    rebuild_player_daily_features_once,
-    upsert_match_feature,
-)
-from app.services.model_scorer_v2 import score_match_features
+from app.services.ml_scorer import score_match_for_forecast
 from app.services.outcome_resolver_v2 import resolve_forecast_outcomes_once
 from app.services.pick_selector import select_pick
+from app.services.table_tennis_analytics import compute_forecast_for_event
 
 logger = logging.getLogger(__name__)
 
 _kpi_runtime_state: dict[str, float] = {
     "dynamic_min_confidence_pct": 74.0,
     "dynamic_min_edge_pct": 3.0,
-    "dynamic_min_odds": 1.4,
+    "dynamic_min_odds": 1.6,
     "last_hit_rate": 0.0,
     "last_picks_per_day": 0.0,
     "last_updated_at": 0.0,
@@ -72,8 +69,8 @@ async def _ensure_active_model_run() -> int:
             return active.id
 
         row = TableTennisModelRun(
-            model_name="tt_local_blended_v2",
-            model_version="v2.0.0",
+            model_name="tt_ml_xgboost",
+            model_version="v1.0.0",
             params_json={
                 "weights": {
                     "form_delta": 1.9,
@@ -90,17 +87,17 @@ async def _ensure_active_model_run() -> int:
         return row.id
 
 
-async def rebuild_features_once() -> int:
-    async with async_session_maker() as session:
-        return await rebuild_player_daily_features_once(session)
-
-
 async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
+    """Создаёт прогнозы только для матчей в окне 1–3 часа до начала (Stage 2)."""
     _init_kpi_runtime_defaults()
     model_run_id = await _ensure_active_model_run()
     now = _utc_now()
     delay_minutes = max(0, settings.betsapi_table_tennis_forecast_delay_minutes)
     earliest_created_at = now - timedelta(minutes=delay_minutes)
+    min_min = getattr(settings, "betsapi_table_tennis_forecast_min_minutes_before", 60)
+    max_min = getattr(settings, "betsapi_table_tennis_forecast_max_minutes_before", 180)
+    window_start = now + timedelta(minutes=min_min)
+    window_end = now + timedelta(minutes=max_min)
 
     async with async_session_maker() as session:
         events = (
@@ -109,6 +106,9 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
                     and_(
                         TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
                         TableTennisLineEvent.starts_at > now,
+                        TableTennisLineEvent.starts_at <= now + timedelta(hours=3),
+                        TableTennisLineEvent.starts_at >= window_start,
+                        TableTennisLineEvent.starts_at <= window_end,
                         TableTennisLineEvent.created_at <= earliest_created_at,
                         TableTennisLineEvent.odds_1.is_not(None),
                         TableTennisLineEvent.odds_2.is_not(None),
@@ -133,12 +133,14 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
                     .limit(1)
                 )
             ).scalar_one_or_none()
-            if existing and existing.status in {"pending", "hit", "miss"}:
+            # Где уже дали прогноз — не пересчитываем
+            if existing and existing.status in {"pending", "hit", "miss", "cancelled", "no_result"}:
                 continue
 
-            snapshot = await build_match_feature_snapshot(session, event)
-            await upsert_match_feature(session, snapshot, model_run_id=model_run_id)
-            scored = score_match_features(snapshot.features)
+            scored_result = score_match_for_forecast(event)
+            if scored_result is None:
+                continue
+            scored, use_ml = scored_result
 
             selected = select_pick(
                 scored=scored,
@@ -166,8 +168,9 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
             row.status = "pending"
             row.final_status = None
             row.final_sets_score = None
+            ml_tag = " [ML]" if use_ml else ""
             row.explanation_summary = (
-                f"Tier {selected.quality_tier}: edge {selected.edge_pct:.2f}%, conf {selected.confidence_score:.2f}%"
+                f"Tier {selected.quality_tier}{ml_tag}: edge {selected.edge_pct:.2f}%, conf {selected.confidence_score:.2f}%"
             )
             if not existing:
                 session.add(row)
@@ -199,6 +202,178 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
         return created
 
 
+async def run_no_ml_forecast_once(limit: int = 400, channel: str = "no_ml") -> int:
+    """Создаёт прематч‑прогнозы «без ML» на основе статистики игроков.
+
+    Логика максимально повторяет старый backend_prematch: считаем по истории матчей
+    и сетов, формируем текст вида «П1 победа в матче ...» или «П2 выиграет 1-й сет ...».
+    """
+    now = _utc_now()
+    # Для аналитики без ML берём широкий прематч-интервал: от текущего момента до 8 часов вперёд.
+    window_start = now
+    window_end = now + timedelta(hours=8)
+
+    min_odds = float(getattr(settings, "betsapi_table_tennis_min_odds_for_forecast", 1.4))
+
+    async with async_session_maker() as session:
+        events = (
+            await session.execute(
+                select(TableTennisLineEvent)
+                .where(
+                    and_(
+                        TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
+                        TableTennisLineEvent.starts_at >= window_start,
+                        TableTennisLineEvent.starts_at <= window_end,
+                        TableTennisLineEvent.odds_1.is_not(None),
+                        TableTennisLineEvent.odds_2.is_not(None),
+                    )
+                )
+                .order_by(TableTennisLineEvent.starts_at.asc())
+                .limit(limit)
+            )
+        ).scalars().all()
+
+        created = 0
+        for event in events:
+            # Прогноз уже есть для этого рынка и канала — не пересчитываем.
+            # Рынок определяем позже, поэтому сначала считаем текст.
+            text, conf = await compute_forecast_for_event(session, event)
+            if not text:
+                continue
+
+            t = text.lower()
+            if "п1" in t:
+                side = "home"
+            elif "п2" in t:
+                side = "away"
+            else:
+                # Неподдерживаемый формат текста.
+                continue
+
+            if "1-й сет" in t:
+                market = "set1"
+            elif "2-й сет" in t:
+                market = "set2"
+            else:
+                market = "match"
+
+            existing = (
+                await session.execute(
+                    select(TableTennisForecastV2)
+                    .where(
+                        and_(
+                            TableTennisForecastV2.event_id == event.id,
+                            TableTennisForecastV2.channel == channel,
+                            TableTennisForecastV2.market == market,
+                        )
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing and existing.status in {"pending", "hit", "miss", "cancelled", "no_result"}:
+                continue
+
+            odds_val: float | None
+            if side == "home":
+                odds_val = float(event.odds_1 or 0.0)
+            else:
+                odds_val = float(event.odds_2 or 0.0)
+            if odds_val and odds_val < min_odds:
+                # Слишком маленький коэффициент — пропускаем.
+                continue
+
+            row = existing or TableTennisForecastV2(
+                event_id=event.id,
+                channel=channel,
+            )
+            row.market = market
+            row.pick_side = side
+            row.forecast_text = text
+            row.probability_pct = conf  # 0–100
+            row.edge_pct = None
+            row.confidence_score = conf
+            row.odds_used = odds_val or None
+            row.status = "pending"
+            row.final_status = None
+            row.final_sets_score = None
+            row.explanation_summary = f"Pre-match stats: conf {conf:.1f}% (no ML)"
+
+            if not existing:
+                session.add(row)
+                await session.flush()
+            else:
+                await session.flush()
+
+            created += 1
+
+        if created:
+            await session.commit()
+        return created
+
+
+async def run_early_scan_once(limit: int = 200) -> int:
+    """Stage 1: скрининг за 6-12h. Находим потенциальные value-матчи, не публикуем."""
+    from app.services.ml_scorer import score_match_for_forecast
+
+    now = _utc_now()
+    min_h = 6
+    max_h = 12
+    window_start = now + timedelta(hours=min_h)
+    window_end = now + timedelta(hours=max_h)
+
+    async with async_session_maker() as session:
+        events = (
+            await session.execute(
+                select(TableTennisLineEvent).where(
+                    and_(
+                        TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
+                        TableTennisLineEvent.starts_at > window_start,
+                        TableTennisLineEvent.starts_at <= window_end,
+                        TableTennisLineEvent.odds_1.is_not(None),
+                        TableTennisLineEvent.odds_2.is_not(None),
+                    )
+                )
+                .order_by(TableTennisLineEvent.starts_at.asc())
+                .limit(limit)
+            )
+        ).scalars().all()
+
+        created = 0
+        for event in events:
+            existing = (
+                await session.execute(
+                    select(TableTennisForecastEarlyScan).where(
+                        TableTennisForecastEarlyScan.event_id == event.id
+                    ).limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing:
+                continue
+
+            scored_result = score_match_for_forecast(event)
+            if scored_result is None:
+                continue
+            scored, _ = scored_result
+            oh, oa = float(event.odds_1 or 1.9), float(event.odds_2 or 1.9)
+            ev_h = scored.p_home_match * oh - 1.0 if oh > 0 else 0
+            ev_a = scored.p_away_match * oa - 1.0 if oa > 0 else 0
+            has_value = (
+                (ev_h >= 0.08 and 1.6 <= oh <= 2.6) or (ev_a >= 0.08 and 1.6 <= oa <= 2.6)
+            )
+            minutes_to_match = int((event.starts_at - now).total_seconds() / 60) if event.starts_at else None
+            row = TableTennisForecastEarlyScan(
+                event_id=event.id,
+                minutes_to_match=minutes_to_match,
+                p_match=scored.p_home_match,
+                has_value=has_value,
+            )
+            session.add(row)
+            created += 1
+        if created:
+            await session.commit()
+        return created
+
+
 async def run_result_priority_once() -> int:
     async with async_session_maker() as session:
         return await resolve_forecast_outcomes_once(session, limit=2000)
@@ -212,7 +387,12 @@ async def run_kpi_guard_once() -> dict:
     async with async_session_maker() as session:
         rows = (
             await session.execute(
-                select(TableTennisForecastV2).where(TableTennisForecastV2.created_at >= day_ago)
+                select(TableTennisForecastV2).where(
+                    and_(
+                        TableTennisForecastV2.created_at >= day_ago,
+                        TableTennisForecastV2.channel == "paid",
+                    )
+                )
             )
         ).scalars().all()
 
@@ -283,7 +463,10 @@ async def run_validation_checks_once() -> dict:
             (
                 await session.execute(
                     select(func.count(TableTennisForecastV2.id)).where(
-                        TableTennisForecastV2.created_at >= day_ago
+                        and_(
+                            TableTennisForecastV2.created_at >= day_ago,
+                            TableTennisForecastV2.channel == "paid",
+                        )
                     )
                 )
             ).scalar_one()
@@ -337,14 +520,16 @@ def get_kpi_runtime_state() -> dict:
     return dict(_kpi_runtime_state)
 
 
-async def features_loop() -> None:
+async def early_scan_loop() -> None:
+    """Stage 1: скрининг за 6-12h. Раз в 10 мин."""
     while True:
         try:
-            cnt = await rebuild_features_once()
-            logger.info("V2 features_loop rebuilt rows=%s", cnt)
+            cnt = await run_early_scan_once(limit=200)
+            if cnt:
+                logger.info("Early scan created=%s", cnt)
         except Exception:
-            logger.exception("V2 features_loop failed")
-        await asyncio.sleep(max(30, settings.betsapi_table_tennis_v2_features_interval_sec))
+            logger.exception("Early scan failed")
+        await asyncio.sleep(max(600, getattr(settings, "betsapi_table_tennis_early_scan_interval_sec", 600)))
 
 
 async def forecast_v2_loop() -> None:
@@ -355,6 +540,20 @@ async def forecast_v2_loop() -> None:
         except Exception:
             logger.exception("V2 forecast loop failed")
         await asyncio.sleep(max(10, settings.betsapi_table_tennis_v2_forecast_interval_sec))
+
+
+async def no_ml_forecast_loop() -> None:
+    """Форкастинг канала no_ml по тем же окнам, но без ML."""
+    while True:
+        try:
+            cnt = await run_no_ml_forecast_once(
+                limit=settings.betsapi_table_tennis_v2_forecast_batch_size,
+                channel="no_ml",
+            )
+            logger.info("No-ML forecast loop created/updated=%s", cnt)
+        except Exception:
+            logger.exception("No-ML forecast loop failed")
+        await asyncio.sleep(max(30, settings.betsapi_table_tennis_v2_forecast_interval_sec))
 
 
 async def result_priority_loop() -> None:

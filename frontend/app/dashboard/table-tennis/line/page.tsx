@@ -61,7 +61,7 @@ function hasVisibleForecast(value: string | null | undefined): boolean {
   return cleaned !== "" && cleaned !== "—" && cleaned !== "Недостаточно данных для расчёта";
 }
 
-type StartFilter = "all" | "under_hour" | "over_hour";
+type StartFilter = "all" | "upcoming" | "live";
 type SortKey =
   | "time"
   | "league_name"
@@ -180,13 +180,11 @@ export default function TableTennisLinePage() {
       return { filteredAndSortedEvents: [], leaguesForFilter: [], playersForFilter: [] };
     }
     const events = [...data.events];
-    const oneHourSec = 3600;
     const minOddsNum = filterMinOdds.trim() === "" ? null : parseFloat(filterMinOdds);
 
     let filtered = events.filter((ev) => {
-      const secs = secondsUntilStart(ev.time);
-      if (filterStart === "under_hour" && (secs == null || secs >= oneHourSec)) return false;
-      if (filterStart === "over_hour" && (secs == null || secs < oneHourSec)) return false;
+      if (filterStart === "upcoming" && ev.status !== "scheduled") return false;
+      if (filterStart === "live" && ev.status !== "live") return false;
       if (filterLeagueId && ev.league_id !== filterLeagueId) return false;
       if (filterPlayerId && ev.home_id !== filterPlayerId && ev.away_id !== filterPlayerId)
         return false;
@@ -309,15 +307,15 @@ export default function TableTennisLinePage() {
         <div className={`${mobileFiltersOpen ? "flex" : "hidden"} md:flex flex-wrap items-center gap-3 mt-2 md:mt-0`}>
           <span className="hidden md:inline text-slate-500">Фильтры:</span>
           <label className="flex items-center gap-2 text-slate-300">
-            <span className="text-slate-500">Начало:</span>
+            <span className="text-slate-500">Матчи:</span>
             <select
               value={filterStart}
               onChange={(e) => setFilterStart(e.target.value as StartFilter)}
               className="rounded bg-slate-700 border border-slate-600 text-slate-200 px-2 py-1"
             >
               <option value="all">Все</option>
-              <option value="under_hour">Менее часа</option>
-              <option value="over_hour">Более часа</option>
+              <option value="upcoming">Ещё не начались</option>
+              <option value="live">Уже идут</option>
             </select>
           </label>
           <label className="flex items-center gap-2 text-slate-300">

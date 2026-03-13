@@ -25,7 +25,7 @@ from app.services.vip_channel_access import send_vip_invite_to_user
 
 router = APIRouter()
 
-ALLOWED_SERVICE_KEYS = {"analytics", "vip_channel"}
+ALLOWED_SERVICE_KEYS = {"analytics", "analytics_no_ml", "vip_channel"}
 ALLOWED_MESSAGE_TARGETS = {"free_channel", "vip_channel", "telegram_user", "email"}
 
 
@@ -634,3 +634,406 @@ async def put_telegram_bot_info(
         session.add(AppSetting(key=BOT_INFO_KEY, value=val))
     await session.commit()
     return {"ok": True, "message": val or ""}
+
+
+@router.post("/ml/sync-leagues")
+async def admin_ml_sync_leagues(
+    _: User = Depends(require_superadmin),
+):
+    """Синхронизация лиг из main DB в ML-базу."""
+    from app.ml.pipeline import sync_leagues_to_ml
+
+    result = await sync_leagues_to_ml()
+    return {"ok": True, **result}
+
+
+@router.post("/ml/sync-players")
+async def admin_ml_sync_players(
+    _: User = Depends(require_superadmin),
+):
+    """Синхронизация всех игроков из main DB в ML-базу (линия, лайв, архив)."""
+    from app.ml.pipeline import sync_players_to_ml
+
+    result = await sync_players_to_ml()
+    return {"ok": True, **result}
+
+
+@router.post("/ml/load-archive")
+async def admin_ml_load_archive(
+    _: User = Depends(require_superadmin),
+    days: int = Query(default=90, ge=1, le=365),
+):
+    """Загрузка завершённых матчей из архива BetsAPI в main DB. Нужно для первичного наполнения."""
+    from app.services.betsapi_table_tennis import load_archive_to_main
+
+    result = await load_archive_to_main(days_back=days, max_pages_per_day=10)
+    return {"ok": True, **result}
+
+
+@router.get("/ml/verify")
+async def admin_ml_verify(
+    _: User = Depends(require_superadmin),
+):
+    """Проверка: все ли данные из main DB есть в ML. Сравнение main vs ML."""
+    from sqlalchemy import text
+    from app.ml.db import get_ml_session
+
+    from app.db.session import async_session_maker
+
+    main = {}
+    async with async_session_maker() as session:
+        # Main: finished матчи со счётом (то, что должно быть в ML)
+        r = await session.execute(
+            text("""
+                SELECT COUNT(*) FROM table_tennis_line_events
+                WHERE status = 'finished' AND live_sets_score IS NOT NULL
+                  AND live_sets_score LIKE '%-%'
+            """)
+        )
+        main["matches"] = int(r.scalar_one() or 0)
+
+        # Main: уникальные игроки (home + away)
+        r = await session.execute(
+            text("""
+                SELECT COUNT(*) FROM (
+                    SELECT home_id FROM table_tennis_line_events WHERE home_id IS NOT NULL AND TRIM(home_id) != ''
+                    UNION
+                    SELECT away_id FROM table_tennis_line_events WHERE away_id IS NOT NULL AND TRIM(away_id) != ''
+                ) t
+            """)
+        )
+        main["players"] = int(r.scalar_one() or 0)
+
+        # Main: уникальные лиги
+        try:
+            r = await session.execute(
+                text("""
+                    SELECT COUNT(*) FROM (
+                        SELECT DISTINCT league_id FROM table_tennis_line_events
+                        WHERE league_id IS NOT NULL AND TRIM(league_id) != ''
+                        UNION
+                        SELECT id FROM table_tennis_leagues WHERE id IS NOT NULL AND TRIM(id) != ''
+                    ) t
+                """)
+            )
+        except Exception:
+            r = await session.execute(
+                text("""
+                    SELECT COUNT(DISTINCT league_id) FROM table_tennis_line_events
+                    WHERE league_id IS NOT NULL AND TRIM(league_id) != ''
+                """)
+            )
+        main["leagues"] = int(r.scalar_one() or 0)
+
+    ml_session = get_ml_session()
+    ml = {}
+    try:
+        ml["matches"] = int(ml_session.execute(text("SELECT COUNT(*) FROM matches")).scalar_one() or 0)
+        ml["players"] = int(ml_session.execute(text("SELECT COUNT(*) FROM players")).scalar_one() or 0)
+        try:
+            ml["leagues"] = int(ml_session.execute(text("SELECT COUNT(*) FROM leagues")).scalar_one() or 0)
+        except Exception:
+            ml["leagues"] = 0
+    finally:
+        ml_session.close()
+
+    diff = {
+        "matches": main["matches"] - ml["matches"],
+        "players": main["players"] - ml["players"],
+        "leagues": main["leagues"] - ml["leagues"],
+    }
+    ok = all(v <= 0 for v in diff.values())
+    return {
+        "main": main,
+        "ml": ml,
+        "diff": diff,
+        "ok": ok,
+        "message": "Все данные в ML" if ok else f"Не хватает в ML: матчей {max(0, diff['matches'])}, игроков {max(0, diff['players'])}, лиг {max(0, diff['leagues'])}",
+    }
+
+
+def _ml_table_count(s, table: str) -> int:
+    try:
+        r = s.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+        return int(r or 0)
+    except Exception:
+        return 0
+
+
+@router.get("/ml/stats")
+async def admin_ml_stats(
+    _: User = Depends(require_superadmin),
+):
+    """Статистика ML-базы: matches, match_features, players, leagues."""
+    from app.ml.db import get_ml_session
+
+    s = get_ml_session()
+    try:
+        matches = _ml_table_count(s, "matches")
+        features = _ml_table_count(s, "match_features")
+        players = _ml_table_count(s, "players")
+        leagues = _ml_table_count(s, "leagues")
+        return {"matches": matches, "match_features": features, "players": players, "leagues": leagues}
+    finally:
+        s.close()
+
+
+@router.get("/ml/dashboard")
+async def admin_ml_dashboard(
+    _: User = Depends(require_superadmin),
+):
+    """Дашборд ML: наполнение таблиц, сравнение main→ML, прогресс операций."""
+    from sqlalchemy import text
+    from app.ml.db import get_ml_session
+    from app.services.ml_progress import get_progress
+    from app.services.ml_queue import queue_size
+
+    s = get_ml_session()
+    tables: dict[str, int] = {}
+    try:
+        for t in (
+            "matches", "match_sets", "match_features", "odds",
+            "players", "leagues", "player_ratings",
+            "player_daily_stats", "player_style", "player_elo_history",
+            "suspicious_matches", "league_performance", "signals",
+        ):
+            tables[t] = _ml_table_count(s, t)
+    finally:
+        s.close()
+
+    matches = tables.get("matches", 0) or 1
+    players = tables.get("players", 0) or 1
+    fill = {
+        "match_features": round(100 * tables.get("match_features", 0) / matches, 1) if matches else 0,
+        "odds": round(100 * tables.get("odds", 0) / matches, 1) if matches else 0,
+        "player_ratings": round(100 * tables.get("player_ratings", 0) / players, 1) if players else 0,
+        "player_daily_stats": tables.get("player_daily_stats", 0),
+        "player_style": round(100 * tables.get("player_style", 0) / players, 1) if players else 0,
+        "player_elo_history": tables.get("player_elo_history", 0),
+    }
+
+    main_counts = {"matches": 0, "players": 0, "leagues": 0}
+    try:
+        from app.db.session import async_session_maker
+        async with async_session_maker() as session:
+            r = await session.execute(
+                text("""
+                    SELECT COUNT(*) FROM table_tennis_line_events
+                    WHERE status = 'finished' AND live_sets_score IS NOT NULL AND live_sets_score LIKE '%-%'
+                """)
+            )
+            main_counts["matches"] = int(r.scalar_one() or 0)
+            r = await session.execute(
+                text("""
+                    SELECT COUNT(*) FROM (
+                        SELECT home_id FROM table_tennis_line_events WHERE home_id IS NOT NULL AND TRIM(home_id) != ''
+                        UNION SELECT away_id FROM table_tennis_line_events WHERE away_id IS NOT NULL AND TRIM(away_id) != ''
+                    ) t
+                """)
+            )
+            main_counts["players"] = int(r.scalar_one() or 0)
+            try:
+                r = await session.execute(
+                    text("SELECT COUNT(DISTINCT league_id) FROM table_tennis_line_events WHERE league_id IS NOT NULL")
+                )
+                main_counts["leagues"] = int(r.scalar_one() or 0)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    diff = {
+        "matches": main_counts["matches"] - tables.get("matches", 0),
+        "players": main_counts["players"] - tables.get("players", 0),
+        "leagues": main_counts["leagues"] - tables.get("leagues", 0),
+    }
+    sync_ok = diff["matches"] <= 0 and diff["players"] <= 0 and diff["leagues"] <= 0
+
+    return {
+        "tables": tables,
+        "fill_pct": fill,
+        "main": main_counts,
+        "diff": diff,
+        "sync_ok": sync_ok,
+        "progress": get_progress(),
+        "queue_size": queue_size(),
+    }
+
+
+@router.get("/ml/progress")
+async def admin_ml_progress(_: User = Depends(require_superadmin)):
+    """Прогресс ML-операций: sync, backfill, retrain."""
+    from app.services.ml_progress import get_progress
+    return get_progress()
+
+
+@router.post("/ml/reset-progress")
+async def admin_ml_reset_progress(
+    _: User = Depends(require_superadmin),
+    op: str | None = Query(default=None, description="sync|backfill|retrain|full_rebuild или пусто=все"),
+):
+    """Сброс зависшего прогресса. Используйте если retrain/sync «застрял» в статусе running."""
+    from app.services.ml_progress import reset_progress
+    reset_progress(op)
+    return {"ok": True, "message": f"Прогресс сброшен: {op or 'все'}"}
+
+
+@router.post("/ml/sync")
+async def admin_ml_sync(
+    _: User = Depends(require_superadmin),
+    limit: int = Query(default=500, ge=1, le=50000),
+    days_back: int = Query(default=0, ge=0, le=36500, description="0 = весь архив"),
+    full: bool = Query(default=False, description="Полная загрузка всей основной БД"),
+):
+    """Синхронизация finished матчей в ML-базу. Задача идёт в очередь, воркер выполняет отдельно."""
+    from app.services.ml_progress import is_running
+    from app.services.ml_queue import enqueue
+
+    if is_running("sync"):
+        return {"ok": False, "error": "Синхронизация уже выполняется"}
+    if not enqueue("sync", {"limit": limit, "days_back": days_back, "full": full}):
+        return {"ok": False, "error": "Не удалось добавить в очередь"}
+    return {"ok": True, "message": "Задача добавлена в очередь"}
+
+
+@router.post("/ml/backfill-features")
+async def admin_ml_backfill_features(
+    _: User = Depends(require_superadmin),
+    limit: int = Query(default=50000, ge=1, le=600000),
+    workers: int = Query(default=0, ge=0, le=16, description="0 = из ML_BACKFILL_WORKERS"),
+):
+    """Расчёт фичей (параллельно, workers потоков). Задача идёт в очередь."""
+    from app.services.ml_progress import is_running
+    from app.services.ml_queue import enqueue
+
+    if is_running("backfill"):
+        return {"ok": False, "error": "Backfill уже выполняется"}
+    params = {"limit": limit}
+    if workers:
+        params["workers"] = workers
+    if not enqueue("backfill", params):
+        return {"ok": False, "error": "Не удалось добавить в очередь"}
+    return {"ok": True, "message": "Задача добавлена в очередь"}
+
+
+@router.post("/ml/retrain")
+async def admin_ml_retrain(
+    _: User = Depends(require_superadmin),
+    min_rows: int = Query(default=100, ge=50, le=10000),
+):
+    """Переобучение ML-моделей. Задача идёт в очередь."""
+    from app.services.ml_progress import is_running
+    from app.services.ml_queue import enqueue
+
+    if is_running("retrain"):
+        return {"ok": False, "error": "Переобучение уже выполняется"}
+    if not enqueue("retrain", {"min_rows": min_rows}):
+        return {"ok": False, "error": "Не удалось добавить в очередь"}
+    return {"ok": True, "message": "Задача добавлена в очередь"}
+
+
+@router.get("/ml/league-performance")
+async def admin_ml_league_performance(
+    _: User = Depends(require_superadmin),
+):
+    """Прибыльные лиги: ROI, upset_rate. Сигналы только если roi>5%, matches>300, upset<40%."""
+    from sqlalchemy import text
+    from app.ml.db import get_ml_session
+
+    s = get_ml_session()
+    try:
+        rows = s.execute(
+            text("""
+                SELECT lp.league_id, l.name, lp.matches, lp.wins, lp.losses,
+                       lp.roi_pct, lp.avg_ev, lp.avg_odds, lp.upset_rate, lp.underdog_wins
+                FROM league_performance lp
+                LEFT JOIN leagues l ON l.id = lp.league_id
+                ORDER BY lp.roi_pct DESC NULLS LAST
+            """)
+        ).fetchall()
+        return {
+            "leagues": [
+                {
+                    "league_id": r[0],
+                    "league_name": r[1] or r[0],
+                    "matches": r[2],
+                    "wins": r[3],
+                    "losses": r[4],
+                    "roi_pct": round(float(r[5] or 0), 2),
+                    "avg_ev": round(float(r[6] or 0), 4),
+                    "avg_odds": round(float(r[7] or 0), 2),
+                    "upset_rate": round(float(r[8] or 0) * 100, 1),
+                    "underdog_wins": r[9],
+                    "passes_filter": (
+                        r[2] and r[2] >= 300
+                        and (r[5] or 0) >= 5
+                        and (r[8] or 0) <= 0.4
+                    ),
+                }
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        if "does not exist" in str(e).lower() or "relation" in str(e).lower():
+            return {"leagues": [], "message": "Запустите миграцию 05_league_performance.sql"}
+        return {"leagues": [], "error": str(e)}
+    finally:
+        s.close()
+
+
+@router.post("/ml/player-stats")
+async def admin_ml_player_stats(
+    _: User = Depends(require_superadmin),
+    limit: int = Query(default=10000, ge=100, le=100000),
+):
+    """Backfill player_daily_stats, player_style, player_elo_history. Задача в очередь."""
+    from app.services.ml_progress import is_running
+    from app.services.ml_queue import enqueue
+
+    if is_running("player_stats"):
+        return {"ok": False, "error": "Player stats backfill уже выполняется"}
+    if not enqueue("player_stats", {"limit": limit}):
+        return {"ok": False, "error": "Не удалось добавить в очередь"}
+    return {"ok": True, "message": "Задача добавлена в очередь"}
+
+
+@router.post("/ml/league-performance")
+async def admin_ml_league_performance_update(
+    _: User = Depends(require_superadmin),
+    limit: int = Query(default=10000, ge=100, le=200000),
+):
+    """Пересчёт league_performance. Задача идёт в очередь."""
+    from app.services.ml_progress import is_running
+    from app.services.ml_queue import enqueue
+
+    if is_running("league_performance"):
+        return {"ok": False, "error": "Обновление уже выполняется"}
+    if not enqueue("league_performance", {"limit": limit}):
+        return {"ok": False, "error": "Не удалось добавить в очередь"}
+    return {"ok": True, "message": "Задача добавлена в очередь"}
+
+
+@router.post("/ml/full-rebuild")
+async def admin_ml_full_rebuild(
+    _: User = Depends(require_superadmin),
+    sync_limit: int = Query(default=50000, ge=1000, le=200000),
+    backfill_limit: int = Query(default=100000, ge=1000, le=200000),
+    player_stats_limit: int = Query(default=50000, ge=1000, le=150000),
+    league_limit: int = Query(default=50000, ge=1000, le=150000),
+    min_rows: int = Query(default=500, ge=100, le=5000),
+):
+    """Полный цикл: sync → backfill → player_stats → league_performance → retrain. Задача в очередь."""
+    from app.services.ml_progress import is_running
+    from app.services.ml_queue import enqueue
+
+    if is_running("full_rebuild") or is_running("sync"):
+        return {"ok": False, "error": "Full rebuild или sync уже выполняется"}
+    if not enqueue("full_rebuild", {
+        "sync_limit": sync_limit,
+        "backfill_limit": backfill_limit,
+        "player_stats_limit": player_stats_limit,
+        "league_limit": league_limit,
+        "min_rows": min_rows,
+    }):
+        return {"ok": False, "error": "Не удалось добавить в очередь"}
+    return {"ok": True, "message": "Full rebuild добавлен в очередь (3–10 мин)"}

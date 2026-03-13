@@ -7,6 +7,10 @@ import {
   deleteAdminPaymentMethod,
   getAdminInvoices,
   getAdminMe,
+  getAdminMlDashboard,
+  getAdminMlProgress,
+  getAdminMlStats,
+  getAdminMlVerify,
   getAdminPaymentMethods,
   getAdminProducts,
   getAdminTelegramBotInfo,
@@ -15,9 +19,21 @@ import {
   patchAdminPaymentMethod,
   patchAdminProduct,
   patchAdminUser,
+  postAdminMlBackfillFeatures,
+  postAdminMlFullRebuild,
+  postAdminMlResetProgress,
+  postAdminMlLoadArchive,
+  postAdminMlPlayerStats,
+  postAdminMlRetrain,
+  postAdminMlSync,
+  postAdminMlSyncLeagues,
+  postAdminMlSyncPlayers,
   putAdminTelegramBotInfo,
   sendAdminMessage,
   type AdminInvoiceItem,
+  type AdminMlDashboard,
+  type AdminMlProgress,
+  type AdminMlStats,
   type AdminPaymentMethod,
   type AdminProduct,
   type AdminUserListItem,
@@ -26,6 +42,59 @@ import {
 function moneyCompact(v: number): string {
   const rounded = Math.round(v * 100) / 100;
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
+}
+
+function MlProgressBar({
+  op,
+  label,
+  progress,
+}: {
+  op: keyof AdminMlProgress;
+  label: string;
+  progress: AdminMlProgress[keyof AdminMlProgress] | null;
+}) {
+  if (!progress || progress.status === "idle") return null;
+  const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+  const isDone = progress.status === "done";
+  const isErr = !!progress.error;
+  return (
+    <div className="mb-3 rounded-lg border border-slate-700 bg-slate-900/60 p-3">
+      <div className="flex items-center justify-between text-sm mb-1">
+        <span className="text-slate-300 font-medium">{label}</span>
+        <span
+          className={
+            isErr
+              ? "text-rose-400"
+              : isDone
+                ? "text-emerald-400"
+                : "text-sky-400"
+          }
+        >
+          {isErr ? progress.error : progress.message}
+        </span>
+      </div>
+      {progress.status === "running" && (
+        <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
+          <div
+            className="h-full bg-sky-500 transition-all duration-300"
+            style={{ width: progress.total > 0 ? `${pct}%` : "30%" }}
+          />
+        </div>
+      )}
+      {isDone && progress.result && (
+        <p className="text-xs text-slate-400 mt-1">
+          {progress.result.synced != null ? `Синхронизировано: ${progress.result.synced}` : null}
+          {progress.result.skipped != null ? `, пропущено: ${progress.result.skipped} (уже в ML)` : null}
+          {progress.result.features_added != null ? `Добавлено фичей: ${progress.result.features_added}` : null}
+          {progress.result.trained && progress.result.rows != null ? `Обучено: ${progress.result.rows} строк` : null}
+          {progress.result.path ? ` → ${String(progress.result.path)}` : null}
+          {progress.result.daily_stats != null ? `daily_stats: ${progress.result.daily_stats}` : null}
+          {progress.result.style != null ? `, style: ${progress.result.style}` : null}
+          {progress.result.elo_history != null ? `, elo_history: ${progress.result.elo_history}` : null}
+        </p>
+      )}
+    </div>
+  );
 }
 
 function LinkifiedText({ text }: { text: string }) {
@@ -116,6 +185,27 @@ export default function AdminPage() {
   const [botInfoMessage, setBotInfoMessage] = useState("");
   const [botInfoSaving, setBotInfoSaving] = useState(false);
 
+  const [mlStats, setMlStats] = useState<AdminMlStats | null>(null);
+  const [mlDashboard, setMlDashboard] = useState<AdminMlDashboard | null>(null);
+  const [mlSyncLimit, setMlSyncLimit] = useState(5000);
+  const [mlSyncDaysBack, setMlSyncDaysBack] = useState(0);
+  const [mlSyncFull, setMlSyncFull] = useState(true);
+  const [mlSyncResult, setMlSyncResult] = useState<string | null>(null);
+  const [mlBackfillLimit, setMlBackfillLimit] = useState(10000);
+  const [mlBackfillResult, setMlBackfillResult] = useState<string | null>(null);
+  const [mlRetrainMinRows, setMlRetrainMinRows] = useState(100);
+  const [mlRetrainResult, setMlRetrainResult] = useState<string | null>(null);
+  const [mlSyncPlayersLoading, setMlSyncPlayersLoading] = useState(false);
+  const [mlSyncPlayersResult, setMlSyncPlayersResult] = useState<string | null>(null);
+  const [mlVerify, setMlVerify] = useState<{
+    main: { matches: number; players: number; leagues: number };
+    ml: { matches: number; players: number; leagues: number };
+    diff: { matches: number; players: number; leagues: number };
+    ok: boolean;
+    message: string;
+  } | null>(null);
+  const [mlProgress, setMlProgress] = useState<AdminMlProgress | null>(null);
+
   const pageSize = 20;
   const totalPages = useMemo(() => Math.max(1, Math.ceil(usersTotal / pageSize)), [usersTotal]);
   const currentPage = useMemo(() => Math.floor(usersOffset / pageSize) + 1, [usersOffset]);
@@ -140,6 +230,8 @@ export default function AdminPage() {
           setInvoicesTotal(r.total);
         }),
         getAdminTelegramBotInfo().then((r) => setBotInfoMessage(r.message || "")),
+        getAdminMlStats().then(setMlStats).catch(() => setMlStats(null)),
+        getAdminMlDashboard().then(setMlDashboard).catch(() => setMlDashboard(null)),
       ]);
     } catch (e) {
       setAllowed(false);
@@ -165,6 +257,30 @@ export default function AdminPage() {
     });
   }, [allowed, invoicesStatus]);
 
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.location.hash === "#admin-ml") {
+      document.getElementById("admin-ml")?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [allowed]);
+
+  useEffect(() => {
+    if (!allowed) return;
+    const poll = async () => {
+      const [dashboard, stats] = await Promise.all([
+        getAdminMlDashboard().catch(() => null),
+        getAdminMlStats().catch(() => null),
+      ]);
+      if (dashboard) {
+        setMlDashboard(dashboard);
+        setMlProgress(dashboard.progress);
+      }
+      if (stats) setMlStats(stats);
+    };
+    poll();
+    const id = setInterval(poll, 2500);
+    return () => clearInterval(id);
+  }, [allowed]);
+
   if (allowed === null) {
     return <div className="p-6 text-slate-400">Загрузка админки…</div>;
   }
@@ -177,9 +293,20 @@ export default function AdminPage() {
       <div>
         <h1 className="text-2xl font-semibold text-white">Админка</h1>
         <p className="text-slate-400 mt-1">Управление пользователями, подписками, тарифами, платёжками и рассылками.</p>
+        <nav className="flex flex-wrap gap-2 mt-3">
+          <a href="#admin-users" className="text-sm text-sky-400 hover:text-sky-300">Пользователи</a>
+          <span className="text-slate-600">·</span>
+          <a href="#admin-products" className="text-sm text-sky-400 hover:text-sky-300">Тарифы</a>
+          <span className="text-slate-600">·</span>
+          <a href="#admin-methods" className="text-sm text-sky-400 hover:text-sky-300">Платёжки</a>
+          <span className="text-slate-600">·</span>
+          <a href="#admin-invoices" className="text-sm text-sky-400 hover:text-sky-300">Инвойсы</a>
+          <span className="text-slate-600">·</span>
+          <a href="#admin-ml" className="text-sm text-emerald-400 hover:text-emerald-300 font-medium">ML (модели, синхронизация)</a>
+        </nav>
       </div>
 
-      <section className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section id="admin-users" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
         <h2 className="text-lg text-white mb-3">Пользователи</h2>
         <div className="flex flex-wrap gap-2 mb-3">
           <input
@@ -262,7 +389,7 @@ export default function AdminPage() {
         </div>
       </section>
 
-      <section className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section id="admin-products" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
         <h2 className="text-lg text-white mb-3">Тарифы (биллинг)</h2>
         <div className="space-y-2">
           {products.map((p) => (
@@ -315,7 +442,7 @@ export default function AdminPage() {
         </div>
       </section>
 
-      <section className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section id="admin-methods" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
         <h2 className="text-lg text-white mb-3">Платёжки</h2>
         <div className="grid gap-2 md:grid-cols-[1fr_140px_1fr_auto] mb-4">
           <input value={newMethodName} onChange={(e) => setNewMethodName(e.target.value)} placeholder="Название (например: Безналичная оплата)" className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
@@ -406,7 +533,7 @@ export default function AdminPage() {
         </div>
       </section>
 
-      <section className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+      <section id="admin-invoices" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
         <h2 className="text-lg text-white mb-3">Инвойсы</h2>
         <div className="flex flex-wrap items-center gap-2 mb-3">
           {[
@@ -485,6 +612,408 @@ export default function AdminPage() {
             </tbody>
           </table>
         </div>
+      </section>
+
+      <section id="admin-ml" className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+        <h2 className="text-lg text-white mb-3">ML-база (pingwin_ml)</h2>
+        <div className="rounded-lg border border-slate-700 bg-slate-900/80 p-3 mb-4 text-sm text-slate-300 space-y-2">
+          <p className="font-medium text-slate-200">Два источника заполнения:</p>
+          <ol className="list-decimal list-inside space-y-1 text-xs">
+            <li><strong>ml_sync_loop</strong> (в tt_workers, каждые ~60 сек) — лиги, игроки, матчи main→ML, duration, features, player_daily_stats, player_style, player_elo_history, league_performance.</li>
+            <li><strong>ml_worker</strong> (отдельный контейнер) — обрабатывает очередь задач. Убедитесь, что <code className="text-slate-400">docker compose up ml_worker</code> запущен.</li>
+          </ol>
+          <p className="font-medium text-slate-200 mt-2">Ручные действия:</p>
+          <ol className="list-decimal list-inside space-y-1 text-xs">
+            <li><strong>Синхр. лиг / игроков</strong> — выполняется сразу (не в очереди).</li>
+            <li><strong>«Все матчи»</strong> — полная синхронизация main→ML (идёт в очередь ml_worker). После reset — обязательно запустите.</li>
+            <li><strong>Backfill фичей</strong> — Elo, форма, H2H для матчей без фичей.</li>
+            <li><strong>Player stats</strong> — player_daily_stats, player_style, player_elo_history.</li>
+            <li><strong>Переобучить</strong> — XGBoost (min_rows 500).</li>
+          </ol>
+          <p className="text-xs text-slate-500 mt-2">Очередь ml_worker: {mlDashboard?.queue_size ?? 0} задач</p>
+        </div>
+        {mlDashboard && !mlDashboard.sync_ok && mlDashboard.diff.matches > 0 && (
+          <div className="rounded-lg border border-amber-600/60 bg-amber-950/40 px-3 py-2 text-sm text-amber-200 mb-4">
+            <strong>ML-база не синхронизирована.</strong> Нажмите «Все матчи» для полной загрузки main→ML. Убедитесь, что ml_worker запущен.
+          </div>
+        )}
+        {mlDashboard && (
+          <div className="grid gap-4 mb-4 md:grid-cols-2">
+            <div className={`rounded-lg border px-3 py-2 text-sm ${mlDashboard.sync_ok ? "border-emerald-700/50 bg-emerald-950/30" : "border-amber-700/50 bg-amber-950/30"}`}>
+              <p className="font-medium text-slate-200 mb-2">Сравнение main → ML</p>
+              <table className="text-xs w-full">
+                <thead>
+                  <tr className="text-slate-400">
+                    <th className="text-left">Таблица</th>
+                    <th className="text-right">Main</th>
+                    <th className="text-right">ML</th>
+                    <th className="text-right">Разница</th>
+                  </tr>
+                </thead>
+                <tbody className="text-slate-300">
+                  <tr><td className="py-0.5">Матчи</td><td className="text-right">{mlDashboard.main.matches.toLocaleString()}</td><td className="text-right">{mlDashboard.tables.matches?.toLocaleString() ?? 0}</td><td className={`text-right ${mlDashboard.diff.matches > 0 ? "text-amber-400" : ""}`}>{mlDashboard.diff.matches >= 0 ? `+${mlDashboard.diff.matches}` : mlDashboard.diff.matches}</td></tr>
+                  <tr><td className="py-0.5">Игроки</td><td className="text-right">{mlDashboard.main.players.toLocaleString()}</td><td className="text-right">{mlDashboard.tables.players?.toLocaleString() ?? 0}</td><td className={`text-right ${mlDashboard.diff.players > 0 ? "text-amber-400" : ""}`}>{mlDashboard.diff.players >= 0 ? `+${mlDashboard.diff.players}` : mlDashboard.diff.players}</td></tr>
+                  <tr><td className="py-0.5">Лиги</td><td className="text-right">{mlDashboard.main.leagues.toLocaleString()}</td><td className="text-right">{mlDashboard.tables.leagues?.toLocaleString() ?? 0}</td><td className={`text-right ${mlDashboard.diff.leagues > 0 ? "text-amber-400" : ""}`}>{mlDashboard.diff.leagues >= 0 ? `+${mlDashboard.diff.leagues}` : mlDashboard.diff.leagues}</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div className="rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-2 text-sm">
+              <p className="font-medium text-slate-200 mb-2">Наполнение таблиц</p>
+              <table className="text-xs w-full">
+                <thead>
+                  <tr className="text-slate-400">
+                    <th className="text-left">Таблица</th>
+                    <th className="text-right">Записей</th>
+                    <th className="text-right">Заполнено</th>
+                  </tr>
+                </thead>
+                <tbody className="text-slate-300">
+                  {["matches", "match_features", "match_sets", "odds", "players", "player_ratings", "player_daily_stats", "player_style", "player_elo_history", "suspicious_matches", "league_performance"].map((t) => (
+                    <tr key={t}>
+                      <td className="py-0.5">{t}</td>
+                      <td className="text-right">{(mlDashboard.tables[t] ?? 0).toLocaleString()}</td>
+                      <td className="text-right">
+                        {t === "match_features" || t === "odds" || t === "player_ratings" || t === "player_style"
+                          ? `${mlDashboard.fill_pct[t] ?? 0}%`
+                          : t === "player_daily_stats" || t === "player_elo_history"
+                            ? (mlDashboard.fill_pct[t] ?? 0).toLocaleString()
+                            : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          {mlStats && (
+            <span className="text-slate-300 text-sm">
+              Матчей: {mlStats.matches.toLocaleString()}, с фичами: {mlStats.match_features.toLocaleString()}
+              {mlStats.players != null ? `, игроков: ${mlStats.players.toLocaleString()}` : ""}
+              {mlStats.leagues != null ? `, лиг: ${mlStats.leagues.toLocaleString()}` : ""}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={async () => {
+              try {
+                setMlSyncPlayersResult(null);
+                const r = await postAdminMlSyncLeagues();
+                setMlSyncPlayersResult(`Лиги: ${r.total}, добавлено: ${r.added}`);
+              } catch (e) {
+                setMlSyncPlayersResult(e instanceof Error ? e.message : "Ошибка");
+              }
+            }}
+            className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-400 hover:bg-slate-800"
+            title="Скопировать справочник лиг из основной БД в ML. Выполняется сразу (не в очереди)."
+          >
+            Синхр. лиг
+          </button>
+          <button
+            type="button"
+            disabled={mlSyncPlayersLoading}
+            onClick={async () => {
+              try {
+                setMlSyncPlayersLoading(true);
+                setMlSyncPlayersResult(null);
+                const r = await postAdminMlSyncPlayers();
+                setMlSyncPlayersResult(`Игроков: ${r.total}, добавлено: ${r.added}`);
+              } catch (e) {
+                setMlSyncPlayersResult(e instanceof Error ? e.message : "Ошибка");
+              } finally {
+                setMlSyncPlayersLoading(false);
+              }
+            }}
+            className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-400 hover:bg-slate-800 disabled:opacity-50"
+            title="Скопировать всех игроков из основной БД в ML. Выполняется сразу."
+          >
+            {mlSyncPlayersLoading ? "Синхр. игроков…" : "Синхр. игроков"}
+          </button>
+          <button
+            type="button"
+            onClick={async () => {
+              try {
+                const [stats, dashboard] = await Promise.all([
+                  getAdminMlStats().catch(() => null),
+                  getAdminMlDashboard().catch(() => null),
+                ]);
+                if (stats) setMlStats(stats);
+                if (dashboard) {
+                  setMlDashboard(dashboard);
+                  setMlProgress(dashboard.progress);
+                }
+                setMlVerify(await getAdminMlVerify().catch(() => null));
+              } catch {
+                // ignore
+              }
+            }}
+            className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-400 hover:bg-slate-800"
+            title="Обновить счётчики, таблицы и сравнение main→ML."
+          >
+            Обновить
+          </button>
+          <button
+            type="button"
+            onClick={() => getAdminMlVerify().then(setMlVerify).catch(() => setMlVerify(null))}
+            className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-400 hover:bg-slate-800"
+            title="Сравнить main и ML: сколько матчей/игроков/лиг не хватает в ML."
+          >
+            Проверить main→ML
+          </button>
+          <button
+            type="button"
+            onClick={async () => {
+              try {
+                await postAdminMlResetProgress();
+                const d = await getAdminMlDashboard().catch(() => null);
+                if (d) {
+                  setMlDashboard(d);
+                  setMlProgress(d.progress);
+                }
+              } catch {
+                // ignore
+              }
+            }}
+            className="rounded border border-amber-600/60 px-2 py-1 text-xs text-amber-300 hover:bg-amber-950/40"
+            title="Сбросить зависший прогресс (retrain/sync в статусе running)."
+          >
+            Сбросить прогресс
+          </button>
+          {mlSyncPlayersResult && <span className="text-xs text-slate-400">{mlSyncPlayersResult}</span>}
+        </div>
+        {mlVerify && (
+        <div className={`rounded-lg border px-3 py-2 text-sm mb-3 ${mlVerify.ok ? "border-emerald-700/50 bg-emerald-950/30 text-emerald-200" : "border-amber-700/50 bg-amber-950/30 text-amber-200"}`}>
+          <p className="font-medium">{mlVerify.message}</p>
+          <table className="text-xs mt-1 text-slate-300">
+            <thead>
+              <tr>
+                <th className="text-left pr-4">Сущность</th>
+                <th className="text-left pr-4">Main DB</th>
+                <th className="text-left pr-4">ML DB</th>
+                <th className="text-left">Разница</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td className="pr-4">Матчи</td><td className="pr-4">{mlVerify.main.matches.toLocaleString()}</td><td className="pr-4">{mlVerify.ml.matches.toLocaleString()}</td><td>{mlVerify.diff.matches >= 0 ? `+${mlVerify.diff.matches}` : mlVerify.diff.matches}</td></tr>
+              <tr><td className="pr-4">Игроки</td><td className="pr-4">{mlVerify.main.players.toLocaleString()}</td><td className="pr-4">{mlVerify.ml.players.toLocaleString()}</td><td>{mlVerify.diff.players >= 0 ? `+${mlVerify.diff.players}` : mlVerify.diff.players}</td></tr>
+              <tr><td className="pr-4">Лиги</td><td className="pr-4">{mlVerify.main.leagues.toLocaleString()}</td><td className="pr-4">{mlVerify.ml.leagues.toLocaleString()}</td><td>{mlVerify.diff.leagues >= 0 ? `+${mlVerify.diff.leagues}` : mlVerify.diff.leagues}</td></tr>
+            </tbody>
+          </table>
+        </div>
+        )}
+        <MlProgressBar op="full_rebuild" label="Full rebuild (всё за раз)" progress={mlProgress?.full_rebuild ?? null} />
+        <MlProgressBar op="sync" label="Синхронизация" progress={mlProgress?.sync ?? null} />
+        <MlProgressBar op="backfill" label="Backfill фичей" progress={mlProgress?.backfill ?? null} />
+        <MlProgressBar op="player_stats" label="Player stats (daily, style, elo_history)" progress={mlProgress?.player_stats ?? null} />
+        <MlProgressBar op="league_performance" label="League performance" progress={mlProgress?.league_performance ?? null} />
+        <MlProgressBar op="retrain" label="Переобучение моделей" progress={mlProgress?.retrain ?? null} />
+        <div className="flex flex-wrap gap-4 mb-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  setMlSyncResult(null);
+                  const r = await postAdminMlLoadArchive({ days: 90 });
+                  if (!r.ok) setMlSyncResult("Ошибка");
+                  else {
+                    setMlSyncResult(`Архив: добавлено ${r.inserted ?? 0}, обновлено ${r.updated ?? 0}`);
+                    await getAdminMlVerify().then(setMlVerify).catch(() => {});
+                  }
+                } catch (e) {
+                  setMlSyncResult(e instanceof Error ? e.message : "Ошибка");
+                }
+              }}
+              className="rounded bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-500"
+              title="Загрузить завершённые матчи из архива BetsAPI в main DB. Нужно при пустых таблицах."
+            >
+              Load archive
+            </button>
+            <button
+              type="button"
+              disabled={(mlProgress?.full_rebuild?.status ?? mlProgress?.sync?.status) === "running"}
+              onClick={async () => {
+                try {
+                  setMlSyncResult(null);
+                  const r = await postAdminMlFullRebuild({
+                    sync_limit: 100000,
+                    backfill_limit: 150000,
+                    player_stats_limit: 100000,
+                    league_limit: 100000,
+                    min_rows: 500,
+                  });
+                  if (!r.ok) setMlSyncResult(r.error ?? "Ошибка");
+                  else {
+                    setMlSyncResult("Full rebuild в очереди (3–10 мин)");
+                    await getAdminMlStats().then(setMlStats).catch(() => {});
+                    await getAdminMlDashboard().then(setMlDashboard).catch(() => {});
+                  }
+                } catch (e) {
+                  setMlSyncResult(e instanceof Error ? e.message : "Ошибка");
+                }
+              }}
+              className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+              title="Полный цикл: sync → backfill → player_stats → league_performance → retrain. Рекомендуется после reset."
+            >
+              {(mlProgress?.full_rebuild?.status ?? "") === "running" ? "Full rebuild…" : "Full rebuild"}
+            </button>
+            <button
+              type="button"
+              disabled={mlProgress?.sync?.status === "running"}
+              onClick={async () => {
+                try {
+                  setMlSyncResult(null);
+                  const r = await postAdminMlSync({ limit: 50000, days_back: 0, full: true });
+                  if (!r.ok) setMlSyncResult(r.error ?? "Ошибка");
+                  else {
+                    setMlSyncResult("Задача добавлена в очередь");
+                    await getAdminMlStats().then(setMlStats).catch(() => {});
+                  }
+                } catch (e) {
+                  setMlSyncResult(e instanceof Error ? e.message : "Ошибка");
+                }
+              }}
+              className="rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+              title="Синхронизировать весь архив матчей из основной БД в ML. Используйте при первом запуске или после долгого простоя."
+            >
+              {mlProgress?.sync?.status === "running" ? "Синхронизация…" : "Все матчи"}
+            </button>
+            <span className="text-xs text-slate-500">или настройте параметры ниже:</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 w-full">
+            <label className="text-sm text-slate-300" title="Максимум матчей за один запуск. При полной синхронизации — размер батча.">
+              limit
+              <input
+                type="number"
+                value={mlSyncLimit}
+                onChange={(e) => setMlSyncLimit(Number(e.target.value) || 5000)}
+                min={100}
+                max={50000}
+                className="ml-1 w-24 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-white"
+              />
+            </label>
+            <label className="text-sm text-slate-300" title="Брать матчи за последние N дней. 0 = весь архив без ограничения.">
+              days_back (0=весь архив)
+              <input
+                type="number"
+                value={mlSyncDaysBack}
+                onChange={(e) => setMlSyncDaysBack(Number(e.target.value) || 0)}
+                min={0}
+                max={36500}
+                className="ml-1 w-24 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-white"
+              />
+            </label>
+            <label className="flex items-center gap-1 text-sm text-slate-300" title="Полная синхронизация: батчами до исчерпания. Без галочки — один батч (limit матчей).">
+              <input type="checkbox" checked={mlSyncFull} onChange={(e) => setMlSyncFull(e.target.checked)} />
+              полная синхронизация
+            </label>
+            <button
+              type="button"
+              disabled={mlProgress?.sync?.status === "running"}
+              onClick={async () => {
+                try {
+                  setMlSyncResult(null);
+                  const r = await postAdminMlSync({
+                    limit: mlSyncLimit,
+                    days_back: mlSyncDaysBack,
+                    full: mlSyncFull,
+                  });
+                  if (!r.ok) setMlSyncResult(r.error ?? "Ошибка");
+                  else {
+                    setMlSyncResult("Задача добавлена в очередь");
+                    await getAdminMlStats().then(setMlStats).catch(() => {});
+                  }
+                } catch (e) {
+                  setMlSyncResult(e instanceof Error ? e.message : "Ошибка");
+                }
+              }}
+              className="rounded bg-sky-600/80 px-3 py-2 text-sm text-white hover:bg-sky-500 disabled:opacity-50"
+            >
+              {mlProgress?.sync?.status === "running" ? "Синхронизация…" : "Синхронизировать"}
+            </button>
+          </div>
+        </div>
+        {mlSyncResult && <p className="text-sm text-slate-300 mb-3">{mlSyncResult}</p>}
+        <div className="flex flex-wrap items-center gap-3 mb-3">
+          <label className="text-sm text-slate-300" title="Рассчитать фичи (Elo, форма, усталость, H2H) для матчей, у которых их ещё нет. Limit — макс. матчей за запуск.">
+            Backfill фичей limit
+            <input
+              type="number"
+              value={mlBackfillLimit}
+              onChange={(e) => setMlBackfillLimit(Number(e.target.value) || 5000)}
+              min={100}
+              max={50000}
+              className="ml-1 w-24 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-white"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={mlProgress?.backfill?.status === "running"}
+            onClick={async () => {
+              try {
+                setMlBackfillResult(null);
+                const r = await postAdminMlBackfillFeatures({ limit: mlBackfillLimit });
+                if (!r.ok) setMlBackfillResult(r.error ?? "Ошибка");
+                else await getAdminMlStats().then(setMlStats).catch(() => {});
+              } catch (e) {
+                setMlBackfillResult(e instanceof Error ? e.message : "Ошибка");
+              }
+            }}
+            className="rounded bg-emerald-600 px-3 py-2 text-sm text-white hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {mlProgress?.backfill?.status === "running" ? "Расчёт…" : "Backfill фичей"}
+          </button>
+        </div>
+        {mlBackfillResult && <p className="text-sm text-slate-300 mb-3">{mlBackfillResult}</p>}
+        <div className="flex flex-wrap items-center gap-3 mb-3">
+          <button
+            type="button"
+            disabled={mlProgress?.player_stats?.status === "running"}
+            onClick={async () => {
+              try {
+                const r = await postAdminMlPlayerStats({ limit: 10000 });
+                if (!r.ok) setMlBackfillResult(r.error ?? "Ошибка");
+                else await getAdminMlDashboard().then(setMlDashboard).catch(() => {});
+              } catch (e) {
+                setMlBackfillResult(e instanceof Error ? e.message : "Ошибка");
+              }
+            }}
+            className="rounded bg-violet-600 px-3 py-2 text-sm text-white hover:bg-violet-500 disabled:opacity-50"
+          >
+            {mlProgress?.player_stats?.status === "running" ? "Player stats…" : "Backfill player stats"}
+          </button>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="text-sm text-slate-300" title="Минимум строк в обучающей выборке. Если данных меньше — модели не переобучатся.">
+            min_rows
+            <input
+              type="number"
+              value={mlRetrainMinRows}
+              onChange={(e) => setMlRetrainMinRows(Number(e.target.value) || 100)}
+              min={50}
+              max={10000}
+              className="ml-1 w-24 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-white"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={mlProgress?.retrain?.status === "running"}
+            onClick={async () => {
+              try {
+                setMlRetrainResult(null);
+                const r = await postAdminMlRetrain({ min_rows: mlRetrainMinRows });
+                if (!r.ok) setMlRetrainResult(r.error ?? "Ошибка");
+              } catch (e) {
+                setMlRetrainResult(e instanceof Error ? e.message : "Ошибка");
+              }
+            }}
+            className="rounded bg-amber-600 px-3 py-2 text-sm text-white hover:bg-amber-500 disabled:opacity-50"
+          >
+            {mlProgress?.retrain?.status === "running" ? "Обучение…" : "Переобучить модели"}
+          </button>
+        </div>
+        {mlRetrainResult && <p className="text-sm text-slate-300 mt-2">{mlRetrainResult}</p>}
       </section>
 
       <section className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">

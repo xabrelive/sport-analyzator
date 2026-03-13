@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -28,12 +28,17 @@ from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
 from app.config import settings
 
 
-# Пороги и требования — как в старом проекте, но чуть мягче по матчам.
-CONFIDENCE_THRESHOLD = 0.78           # для сетов (П1/П2 выиграет сет)
-CONFIDENCE_THRESHOLD_MATCH = 0.80     # для победы в матче (чуть мягче 0.82)
+# Пороги и требования — как в старом проекте (analytics_service).
+CONFIDENCE_THRESHOLD = 0.72           # для сетов (П1/П2 выиграет сет)
+CONFIDENCE_THRESHOLD_MATCH = 0.75     # для победы в матче
 MIN_MATCHES_FOR_RECOMMENDATION = 3    # минимум матчей у каждого для любых выводов
-MIN_MATCHES_FOR_MATCH_RECOMMENDATION = 5  # для матча — требуем побольше истории, но меньше 7
-MIN_CONFIDENCE_MARGIN = 0.07          # минимальный отрыв лучшего исхода
+MIN_MATCHES_FOR_MATCH_RECOMMENDATION = 6  # для матча — требуем побольше истории
+MIN_CONFIDENCE_MARGIN = 0.05          # минимальный отрыв лучшего исхода
+
+# Окна для статистики как в старом recommendations/engine.py + player_stats_service.py.
+RECOMMENDATION_LOOKBACK_DAYS = 180
+RECOMMENDATION_PREFER_RECENT_DAYS: int | None = 30
+RECOMMENDATION_MIN_MATCHES_IN_LEAGUE = 3
 
 
 @dataclass
@@ -152,6 +157,186 @@ async def load_player_stats(
         wins_second_set=wins_second,
         win_second_set_pct=win_second_set_pct,
     )
+
+
+async def _compute_player_stats_for_window(
+    session: AsyncSession,
+    player_id: str,
+    *,
+    last_days: int | None = None,
+    league_id: str | None = None,
+) -> PlayerStats | None:
+    """
+    Аналог compute_player_stats из старого player_stats_service, но по table_tennis_line_events.
+    Используется только для выбора окна статистики под рекомендацию (no-ML).
+    """
+    stmt = select(TableTennisLineEvent).where(
+        and_(
+            TableTennisLineEvent.status == LINE_EVENT_STATUS_FINISHED,
+            (TableTennisLineEvent.home_id == player_id)
+            | (TableTennisLineEvent.away_id == player_id),
+        )
+    )
+    if last_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=last_days)
+        stmt = stmt.where(TableTennisLineEvent.starts_at >= cutoff)
+    if league_id is not None:
+        stmt = stmt.where(TableTennisLineEvent.league_id == league_id)
+
+    result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    if not rows:
+        return None
+
+    total = 0
+    wins = 0
+    losses = 0
+    matches_with_first = 0
+    wins_first = 0
+    matches_with_second = 0
+    wins_second = 0
+
+    for r in rows:
+        total += 1
+        # Победа в матче по сетовому счёту
+        hs, as_ = _parse_sets_score(r.live_sets_score)
+        if hs is not None and as_ is not None and (hs != as_):
+            is_home = r.home_id == player_id
+            home_win = hs > as_
+            if (is_home and home_win) or ((not is_home) and (not home_win)):
+                wins += 1
+            else:
+                losses += 1
+
+        # Статистика по 1 и 2 сету из live_score
+        if isinstance(r.live_score, dict):
+            # 1-й сет
+            s1 = r.live_score.get("1")
+            if isinstance(s1, dict):
+                try:
+                    h1 = int(str(s1.get("home") or "0"))
+                    a1 = int(str(s1.get("away") or "0"))
+                except ValueError:
+                    h1 = a1 = 0
+                if h1 or a1:
+                    matches_with_first += 1
+                    is_home = r.home_id == player_id
+                    home_win = h1 > a1
+                    if (is_home and home_win) or ((not is_home) and (not home_win)):
+                        wins_first += 1
+
+            # 2-й сет
+            s2 = r.live_score.get("2")
+            if isinstance(s2, dict):
+                try:
+                    h2 = int(str(s2.get("home") or "0"))
+                    a2 = int(str(s2.get("away") or "0"))
+                except ValueError:
+                    h2 = a2 = 0
+                if h2 or a2:
+                    matches_with_second += 1
+                    is_home = r.home_id == player_id
+                    home_win = h2 > a2
+                    if (is_home and home_win) or ((not is_home) and (not home_win)):
+                        wins_second += 1
+
+    if total == 0:
+        return None
+
+    win_rate = wins / total if total > 0 else None
+    win_first_set_pct = (
+        wins_first / matches_with_first if matches_with_first > 0 else None
+    )
+    win_second_set_pct = (
+        wins_second / matches_with_second if matches_with_second > 0 else None
+    )
+
+    return PlayerStats(
+        total_matches=total,
+        wins=wins,
+        losses=losses,
+        win_rate=win_rate,
+        matches_with_first_set=matches_with_first,
+        wins_first_set=wins_first,
+        win_first_set_pct=win_first_set_pct,
+        matches_with_second_set=matches_with_second,
+        wins_second_set=wins_second,
+        win_second_set_pct=win_second_set_pct,
+    )
+
+
+async def get_stats_for_recommendation_from_line_events(
+    session: AsyncSession,
+    home_player_id: str,
+    away_player_id: str,
+    league_id: str | None,
+    *,
+    lookback_days: int = RECOMMENDATION_LOOKBACK_DAYS,
+    prefer_recent_days: int | None = RECOMMENDATION_PREFER_RECENT_DAYS,
+    min_matches_in_league: int = RECOMMENDATION_MIN_MATCHES_IN_LEAGUE,
+) -> tuple[PlayerStats | None, PlayerStats | None]:
+    """
+    Статистика для рекомендации: приоритет — лига и короткое окно (неделя/месяц),
+    как в старом get_stats_for_recommendation.
+    """
+
+    def enough_in_league(sh: PlayerStats | None, sa: PlayerStats | None) -> bool:
+        if league_id is None:
+            return True
+        return (
+            sh is not None
+            and sa is not None
+            and (sh.total_matches or 0) >= min_matches_in_league
+            and (sa.total_matches or 0) >= min_matches_in_league
+        )
+
+    # 1) prefer_recent_days + лига
+    if prefer_recent_days is not None:
+        sh = await _compute_player_stats_for_window(
+            session,
+            home_player_id,
+            last_days=prefer_recent_days,
+            league_id=league_id,
+        )
+        sa = await _compute_player_stats_for_window(
+            session,
+            away_player_id,
+            last_days=prefer_recent_days,
+            league_id=league_id,
+        )
+        if enough_in_league(sh, sa):
+            return sh, sa
+
+    # 2) lookback_days + лига
+    sh = await _compute_player_stats_for_window(
+        session,
+        home_player_id,
+        last_days=lookback_days,
+        league_id=league_id,
+    )
+    sa = await _compute_player_stats_for_window(
+        session,
+        away_player_id,
+        last_days=lookback_days,
+        league_id=league_id,
+    )
+    if enough_in_league(sh, sa):
+        return sh, sa
+
+    # 3) Fallback: lookback_days по всем лигам
+    sh = await _compute_player_stats_for_window(
+        session,
+        home_player_id,
+        last_days=lookback_days,
+        league_id=None,
+    )
+    sa = await _compute_player_stats_for_window(
+        session,
+        away_player_id,
+        last_days=lookback_days,
+        league_id=None,
+    )
+    return sh, sa
 
 
 def _pre_match_probs(
@@ -285,8 +470,11 @@ def _first_recommendation_text_and_confidence(
     min_matches_for_match: int | None = None,
 ) -> tuple[str | None, float]:
     """
-    Выбирает приоритетную рекомендацию по матчу только при высокой уверенности.
-    Возвращает (текст, confidence_pct) или (None, 0.0).
+    Логика максимально совпадает со старым first_recommendation_text_and_confidence:
+    - требуем минимум матчей у обоих игроков;
+    - строим рекомендации по матчу и сетам;
+    - при недостаточной истории отбрасываем прогнозы «победа в матче»;
+    - выбираем исход с максимальной уверенностью без дополнительного приоритета матча/сетов.
     """
     n_home = (stats_home.total_matches if stats_home else 0)
     n_away = (stats_away.total_matches if stats_away else 0)
@@ -322,27 +510,8 @@ def _first_recommendation_text_and_confidence(
     if not recs:
         return None, 0.0
 
-    # Выбираем между рекомендацией на матч и на сет:
-    # - если уверенность по матчу существенно выше (>=5 п.п.) — берём матч,
-    # - иначе даём рекомендацию по сету (чтобы чаще видеть прогнозы на конкретный сет).
-    match_recs = [r for r in recs if _is_match_win_rec(r.text)]
-    set_recs = [r for r in recs if not _is_match_win_rec(r.text)]
-
-    if not match_recs and not set_recs:
-        return None, 0.0
-    if not match_recs:
-        best_set = max(set_recs, key=lambda r: r.confidence_pct)
-        return best_set.text, best_set.confidence_pct
-    if not set_recs:
-        best_match = max(match_recs, key=lambda r: r.confidence_pct)
-        return best_match.text, best_match.confidence_pct
-
-    best_match = max(match_recs, key=lambda r: r.confidence_pct)
-    best_set = max(set_recs, key=lambda r: r.confidence_pct)
-
-    if best_match.confidence_pct - best_set.confidence_pct >= 5.0:
-        return best_match.text, best_match.confidence_pct
-    return best_set.text, best_set.confidence_pct
+    best = max(recs, key=lambda r: r.confidence_pct)
+    return best.text, best.confidence_pct
 
 
 async def compute_forecast_for_event(
@@ -355,8 +524,14 @@ async def compute_forecast_for_event(
     if not home_id or not away_id:
         return None, 0.0
 
-    stats_home = await load_player_stats(session, home_id)
-    stats_away = await load_player_stats(session, away_id)
+    # Для no-ML прогноза используем «умную» статистику:
+    # та же лига + последние N дней, как в старом backend_prematch.
+    stats_home, stats_away = await get_stats_for_recommendation_from_line_events(
+        session,
+        home_id,
+        away_id,
+        getattr(event, "league_id", None),
+    )
     if not stats_home or not stats_away:
         return None, 0.0
 

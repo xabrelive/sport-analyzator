@@ -21,7 +21,7 @@ import {
   type TableTennisForecastStats,
 } from "@/lib/api";
 
-type ChannelTab = "free" | "paid" | "vip" | "bot_signals";
+type ChannelTab = "free" | "paid" | "vip" | "bot_signals" | "no_ml";
 type PeriodFilter = "today" | "1d" | "7d" | "30d";
 
 const CHANNELS: Array<{ id: ChannelTab; label: string }> = [
@@ -29,6 +29,7 @@ const CHANNELS: Array<{ id: ChannelTab; label: string }> = [
   { id: "paid", label: "Платная аналитика" },
   { id: "vip", label: "VIP чат" },
   { id: "bot_signals", label: "Сигналы от бота" },
+  { id: "no_ml", label: "Аналитика без ML" },
 ];
 
 const PERIODS: Array<{ id: PeriodFilter; label: string }> = [
@@ -255,6 +256,7 @@ export default function DashboardPage() {
   }, [me]);
 
   const analyticsSub = subs?.analytics;
+  const analyticsNoMlSub = subs?.analytics_no_ml;
   const vipSub = subs?.vip_channel;
   const invoiceBadge = invoiceStatusLabel(lastInvoice?.status || "pending");
   const buyProduct = useMemo(
@@ -307,6 +309,14 @@ export default function DashboardPage() {
                 <p className="text-slate-400 mt-1">
                   {analyticsSub?.is_active
                     ? `Активна до ${analyticsSub.valid_until} · осталось ${analyticsSub.days_left} дн`
+                    : "Не активна"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-slate-700/70 bg-slate-900/40 p-3">
+                <p className="text-slate-300">Аналитика без ML</p>
+                <p className="text-slate-400 mt-1">
+                  {analyticsNoMlSub?.is_active
+                    ? `Активна до ${analyticsNoMlSub.valid_until} · осталось ${analyticsNoMlSub.days_left} дн`
                     : "Не активна"}
                 </p>
               </div>
@@ -486,7 +496,12 @@ export default function DashboardPage() {
               <div key={p.id} className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
                 <p className="text-slate-200 font-medium">{tariffTitle(p.name, p.price_rub, p.price_usd)}</p>
                 <p className="text-slate-400 text-sm mt-1">
-                  {p.service_key === "analytics" ? "Аналитика" : "VIP канал"} · {p.duration_days} дн
+                  {p.service_key === "analytics"
+                    ? "Аналитика (ML)"
+                    : p.service_key === "analytics_no_ml"
+                    ? "Аналитика без ML"
+                    : "VIP канал"}{" "}
+                  · {p.duration_days} дн
                 </p>
                 <p className="text-white text-lg font-semibold mt-2">
                   {moneyCompact(p.price_rub)} RUB / {moneyCompact(p.price_usd)} USD

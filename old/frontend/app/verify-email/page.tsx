@@ -3,7 +3,7 @@
 import { Suspense, useEffect } from "react";
 import { useSearchParams } from "next/navigation";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:11001";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:12000";
 
 function VerifyEmailContent() {
   const searchParams = useSearchParams();

@@ -290,6 +290,52 @@ export default function TableTennisMatchCardPage() {
         </div>
       </section>
       )}
+
+      {!analyticsLocked && card.ml_analytics && (
+      <section>
+        <h2 className="text-lg font-semibold text-white mb-3 border-b border-slate-700 pb-2">
+          ML‑аналитика
+        </h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
+            <span className="text-slate-400 text-sm">Вероятности (П1)</span>
+            <p className="text-white font-semibold tabular-nums mt-0.5">
+              Матч: {(card.ml_analytics.p_match * 100).toFixed(1)}% · Сет1: {(card.ml_analytics.p_set1 * 100).toFixed(1)}% · Сет2: {(card.ml_analytics.p_set2 * 100).toFixed(1)}%
+            </p>
+            <p className="text-xs text-slate-500 mt-1">
+              {card.ml_analytics.model_used ? "XGBoost + Monte Carlo" : "Monte Carlo"}
+            </p>
+          </div>
+          {card.ml_analytics.features && (
+            <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
+              <span className="text-slate-400 text-sm">Фичи (Elo, форма, усталость, H2H)</span>
+              <ul className="text-xs text-slate-200 mt-1 space-y-0.5">
+                <li>Elo: {card.ml_analytics.features.elo_p1.toFixed(0)} vs {card.ml_analytics.features.elo_p2.toFixed(0)} (Δ {card.ml_analytics.features.elo_diff > 0 ? "+" : ""}{card.ml_analytics.features.elo_diff})</li>
+                <li>Форма: {card.ml_analytics.features.form_diff > 0 ? "+" : ""}{card.ml_analytics.features.form_diff.toFixed(3)}</li>
+                <li>Усталость: {card.ml_analytics.features.fatigue_diff > 0 ? "+" : ""}{card.ml_analytics.features.fatigue_diff}</li>
+                <li>H2H: {card.ml_analytics.features.h2h_count} матчей{card.ml_analytics.features.h2h_p1_wr != null ? ` · WR П1: ${(card.ml_analytics.features.h2h_p1_wr * 100).toFixed(1)}%` : ""}</li>
+                <li>Выборка: {card.ml_analytics.features.sample_size} матчей</li>
+              </ul>
+            </div>
+          )}
+          {card.ml_analytics.value_signals && card.ml_analytics.value_signals.length > 0 && (
+            <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
+              <span className="text-slate-400 text-sm">Value‑сигналы</span>
+              <ul className="text-xs text-slate-200 mt-1 space-y-1">
+                {card.ml_analytics.value_signals.map((s, i) => (
+                  <li key={i}>
+                    {s.market} {s.side}: кф {s.odds.toFixed(2)}, p={((s.probability ?? 0) * 100).toFixed(1)}%, EV {((s.ev ?? 0) * 100).toFixed(1)}%
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+        {!card.ml_analytics.features && (
+          <p className="text-slate-500 text-xs mt-2">Фичи не рассчитаны (игроки не в ML‑базе или недостаточно истории).</p>
+        )}
+      </section>
+      )}
     </div>
   );
 }

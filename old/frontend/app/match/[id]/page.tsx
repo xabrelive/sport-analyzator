@@ -3,7 +3,7 @@
 import React, { useMemo, useState, useEffect, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { fetchMatch, fetchPlayerStats, fetchMatchAnalytics, fetchStoredRecommendation, ensureRecommendation, fetchLiveRecommendations, type Match, type OddsSnapshot, type PlayerStats, type MatchAnalytics, type LiveRecommendationItem } from "@/lib/api";
+import { fetchMatch, fetchPlayerStats, fetchMatchAnalytics, fetchStoredRecommendation, fetchLiveRecommendations, type Match, type OddsSnapshot, type PlayerStats, type MatchAnalytics, type LiveRecommendationItem } from "@/lib/api";
 import { getCachedMatch, setCachedMatches, isMatchNewerThan } from "@/lib/matchCache";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { formatStartTime, formatDateTimeWithYear, setsTotal, getSetsDisplay, formatOddsTime } from "@/lib/format";
@@ -339,15 +339,6 @@ export default function MatchDetailPage() {
           setCachedMatches([nextMatch]);
           setAnalytics(a);
           setStoredRec(rec);
-          // Если прогноза нет и матч в линии/лайве — запускаем расчёт и через 4 сек подтягиваем результат
-          if (rec == null && nextMatch && (nextMatch.status === "scheduled" || nextMatch.status === "live")) {
-            ensureRecommendation(id).then(() => {
-              if (cancelled) return;
-              setTimeout(() => {
-                fetchStoredRecommendation(id).then((r) => { if (!cancelled) setStoredRec(r); }).catch(() => {});
-              }, 4000);
-            }).catch(() => {});
-          }
         }
         if (m?.home_player?.id) fetchPlayerStats(m.home_player.id).then((s) => { if (!cancelled) setStatsHome(s); });
         if (m?.away_player?.id) fetchPlayerStats(m.away_player.id).then((s) => { if (!cancelled) setStatsAway(s); });

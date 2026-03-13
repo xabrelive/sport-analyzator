@@ -9,6 +9,7 @@ from app.models.user import User
 from app.schemas.me import MeProfile, MeSettingsUpdate
 from app.services.subscription_access import (
     has_analytics_subscription,
+    has_no_ml_analytics_subscription,
     has_vip_channel_subscription,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +57,7 @@ async def get_me(
     """Профиль и настройки уведомлений: привязки Telegram/почты, режим тишины."""
     has_analytics = await has_analytics_subscription(user.id, session)
     has_vip = await has_vip_channel_subscription(user.id, session)
+    has_no_ml = await has_no_ml_analytics_subscription(user.id, session)
     telegram_linked = user.telegram_id is not None
     is_tg_only = user.is_telegram_only()
     email_linked = not is_tg_only or (user.notification_email or "").strip() != ""
@@ -76,6 +78,7 @@ async def get_me(
         is_superadmin=bool(getattr(user, "is_superadmin", False)),
         has_analytics_subscription=has_analytics,
         has_vip_channel_subscription=has_vip,
+        has_no_ml_analytics_subscription=has_no_ml,
     )
 
 
@@ -88,6 +91,7 @@ async def update_me(
     """Обновить настройки: режим тишины."""
     has_analytics = await has_analytics_subscription(user.id, session)
     has_vip = await has_vip_channel_subscription(user.id, session)
+    has_no_ml = await has_no_ml_analytics_subscription(user.id, session)
     if data.quiet_hours_start is not None:
         user.quiet_hours_start = _str_to_time(data.quiet_hours_start)
     if data.quiet_hours_end is not None:
@@ -118,6 +122,7 @@ async def update_me(
         is_superadmin=bool(getattr(user, "is_superadmin", False)),
         has_analytics_subscription=has_analytics,
         has_vip_channel_subscription=has_vip,
+        has_no_ml_analytics_subscription=has_no_ml,
     )
 
 

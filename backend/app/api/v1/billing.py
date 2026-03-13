@@ -235,6 +235,7 @@ async def billing_my_subscriptions(
             for s in rows
         ],
         "analytics": _service_payload("analytics"),
+        "analytics_no_ml": _service_payload("analytics_no_ml"),
         "vip_channel": _service_payload("vip_channel"),
     }
 

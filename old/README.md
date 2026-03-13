@@ -1,68 +1,34 @@
-# Sport Analyzator — настольный теннис
+# Sport Analyzator (PingWin)
 
-Сервис сбора данных, расчёта вероятностей, поиска value и сигналов для настольного тенниса.
+Настольный теннис: линия, лайв, ML-прогнозы (XGBoost + Monte Carlo), value-сигналы.
 
-## Стек
-
-- **Backend:** Python 3.12+, FastAPI
-- **БД:** PostgreSQL 16
-- **Кэш/очередь:** Redis 7
-- **Планировщик:** Celery + Redis
-- **Telegram:** отдельный сервис (python-telegram-bot)
-- **Frontend:** Next.js 14, Tailwind, WebSocket
-
-## Архитектура
-
-```
-Sports Data API / Odds API
-         ↓
-   Data Collectors (Celery)
-         ↓
-      Redis Queue
-         ↓
-     Normalizer
-         ↓
-    PostgreSQL
-         ↓
-Probability Engine ← → Value Detector → Signal Engine
-         ↓                    ↓
-    Backend API          Telegram Bot
-         ↓
-   Frontend (Live UI)
-```
-
-## Запуск
+## Запуск (Docker, GPU)
 
 ```bash
-cp .env.example .env
-# Заполнить API-ключи и TELEGRAM_BOT_TOKEN
-
-docker compose up -d postgres redis
-cd backend && uv sync && alembic upgrade head
-uv run uvicorn app.main:app --reload
-
-# В другом терминале — воркеры
-cd backend && celery -A app.worker.celery_app worker -l info
-cd backend && celery -A app.worker.celery_app beat -l info
-
-# Frontend
-cd frontend && pnpm install && pnpm dev
-
-# Telegram bot
-cd telegram_bot && uv run python -m app.main
+cp .env.example .env   # отредактировать TELEGRAM_BOT_TOKEN, BETSAPI_TOKEN и др.
+./up.sh                # docker compose up -d с GPU
 ```
 
-## Структура
+**Порты:** frontend 12000, backend (в контейнере 12000, с хоста 12001), postgres 12002→12000, redis 12003→12000.
 
-- `backend/` — FastAPI, модели, API, коллекторы, нормализатор, probability/value/signal engine
-- `telegram_bot/` — бот для рассылки сигналов
-- `frontend/` — админка с live-таблицей матчей
+**Без GPU:** `SKIP_GPU=1 ./up.sh`
 
-## Этапы
+**Требования:** [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). При ошибке `nvidia-persistenced/socket`: `sudo nvidia-smi -pm 0`.
 
-1. **Сбор данных** — коллекторы (Sportradar, The Odds API), нормализатор, очередь
-2. **Хранение** — PostgreSQL (matches, sets, odds_history, results)
-3. **Вероятности** — Beta-Bayes + марковская модель сета
-4. **Value** — EV = (P × odds) − 1, порог
-5. **Сигналы** — фильтры, отправка в Telegram
-6. **Фронт** — Live / Upcoming / Finished, WebSocket, цветовая индикация value
+**Удаление папки old/ (если есть):** `sudo rm -rf old/`
+
+### Сброс БД (таблицы создадутся заново при старте)
+
+- **Только БД:** `./scripts/reset-db.sh` — удаляет базу `sport_analyzator`, создаёт её заново и перезапускает backend (alembic при старте создаст все таблицы).
+- **Полный сброс данных Postgres (включая объём):** `docker compose down && docker volume rm sport-analyzator_postgres_data && docker compose up -d` — после этого при первом старте БД и таблицы создадутся заново.
+
+## Сервисы
+
+- **postgres** — основная БД + pingwin_ml (ML-модели, Elo, фичи)
+- **backend** — FastAPI (без воркеров при RUN_BACKGROUND_WORKERS=false)
+- **frontend** — Next.js
+- **telegram_bot** — бот и каналы
+- **tt_workers** — BetsAPI (линия, лайв, odds), **автодогрузка main→ML** (ml_sync_loop каждые 60 сек), прогнозы
+- **ml_worker** — очередь ML-задач (Full rebuild, backfill, retrain)
+
+**Важно:** для автодогрузки данных в ML-базу должны быть запущены **tt_workers** и **ml_worker**.

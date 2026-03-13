@@ -31,7 +31,6 @@ from app.models.user_forecast_notification import UserForecastNotification
 from app.services.forecast_v2_pipeline import (
     get_kpi_runtime_state,
     run_kpi_guard_once,
-    rebuild_features_once,
     run_forecast_v2_once,
     run_result_priority_once,
     run_validation_checks_once,
@@ -118,6 +117,52 @@ def _normalize_forecast_event_status(event: TableTennisLineEvent | None) -> str 
     if (not has_final_sets) or _has_in_progress_set_fragment(event.live_score):
         return LINE_EVENT_STATUS_LIVE
     return event.status
+
+
+def _compute_ml_analytics(event: TableTennisLineEvent) -> dict | None:
+    """ML-аналитика для карточки матча: вероятности, фичи, value-сигналы."""
+    if not event.home_id or not event.away_id:
+        return None
+    try:
+        from app.ml.inference import predict_for_upcoming
+
+        pred = predict_for_upcoming(
+            home_id=event.home_id,
+            away_id=event.away_id,
+            league_id=event.league_id or "",
+            odds_p1=float(event.odds_1 or 1.9),
+            odds_p2=float(event.odds_2 or 1.9),
+            start_time=event.starts_at,
+            match_id=event.id,
+        )
+        if pred is None:
+            return None
+        out = {
+            "p_match": round(pred.p_match, 4),
+            "p_set1": round(pred.p_set1, 4),
+            "p_set2": round(pred.p_set2, 4),
+            "model_used": pred.model_used,
+            "value_signals": pred.value_signals,
+        }
+        if getattr(pred, "suspicious", False):
+            out["suspicious"] = True
+            out["suspicious_score"] = round(pred.suspicious_score, 3)
+            out["suspicious_reason"] = pred.suspicious_reason or ""
+        if pred.features:
+            f = pred.features
+            out["features"] = {
+                "elo_diff": round(f.elo_diff, 1),
+                "form_diff": round(f.form_diff, 4),
+                "fatigue_diff": round(f.fatigue_diff, 1),
+                "h2h_count": f.h2h_count,
+                "h2h_p1_wr": round(f.h2h_p1_wr, 3) if f.h2h_count else None,
+                "sample_size": f.sample_size,
+                "elo_p1": round(f.elo_p1, 0),
+                "elo_p2": round(f.elo_p2, 0),
+            }
+        return out
+    except Exception:
+        return None
 
 
 def _event_to_dict(r: TableTennisLineEvent) -> dict:
@@ -313,7 +358,7 @@ async def get_table_tennis_live(
     """Лайв: матчи со статусом live, а также finished — но только в течение 5 минут после завершения."""
     now = datetime.now(timezone.utc)
     five_minutes_ago = now - timedelta(minutes=5)
-    live_freshness_cutoff = now - timedelta(minutes=15)
+    live_freshness_cutoff = now - timedelta(minutes=30)
     result = await session.execute(
         select(TableTennisLineEvent).where(
             or_(
@@ -323,6 +368,7 @@ async def get_table_tennis_live(
                     or_(
                         TableTennisLineEvent.last_score_changed_at >= live_freshness_cutoff,
                         TableTennisLineEvent.starts_at >= live_freshness_cutoff,
+                        TableTennisLineEvent.updated_at >= live_freshness_cutoff,
                     ),
                 ),
                 and_(
@@ -793,7 +839,7 @@ async def _build_player_match_context(
     }
 
 
-ALL_CHANNELS = ["free", "paid", "vip", "bot_signals"]
+ALL_CHANNELS = ["free", "paid", "vip", "bot_signals", "no_ml"]
 
 
 def _allowed_channels_and_resolved(access: dict, channel: str) -> tuple[list[str], bool]:
@@ -802,6 +848,7 @@ def _allowed_channels_and_resolved(access: dict, channel: str) -> tuple[list[str
     only_resolved — для запрошенного channel: True если нет доступа (показываем только hit/miss, без прогнозов и pending).
     """
     has_analytics = access["has_analytics"]
+    has_no_ml = access.get("has_analytics_no_ml", False)
     has_vip = access["has_vip_channel"]
 
     if channel == "free":
@@ -812,6 +859,10 @@ def _allowed_channels_and_resolved(access: dict, channel: str) -> tuple[list[str
         only_resolved = not has_vip
     elif channel == "bot_signals":
         only_resolved = not has_analytics
+    elif channel == "no_ml":
+        # Аналитика без ML: отдельная услуга, доступ только при подписке analytics_no_ml.
+        # Без неё показываем только уже завершённые прогнозы (hit/miss), без pending.
+        only_resolved = not has_no_ml
     else:
         only_resolved = True
 
@@ -1126,6 +1177,7 @@ async def get_table_tennis_match_card_v2(
             "forecast_locked": True,
             "forecast_locked_message": FORECAST_LOCKED_ANALYTICS,
             "forecast_purchase_url": DASHBOARD_PURCHASE_URL,
+            "ml_analytics": None,
         }
     if access["forecast_channel"]:
         channel = access["forecast_channel"]
@@ -1164,11 +1216,13 @@ async def get_table_tennis_match_card_v2(
         ).scalars().all()
 
     player_context = await _build_player_match_context(session, event)
+    ml_analytics = _compute_ml_analytics(event)
 
     return {
         "match": _event_to_dict(event),
         "forecast_v2": _forecast_v2_item(forecast, event, explanations) if forecast else None,
         "player_context": player_context,
+        "ml_analytics": ml_analytics,
     }
 
 
@@ -1261,17 +1315,14 @@ async def get_table_tennis_v2_kpi_debug(recompute: bool = False):
 
 @router.post("/v2/debug/run-once")
 async def run_table_tennis_v2_once(
-    run_features: bool = True,
     run_forecast: bool = True,
     run_results: bool = True,
 ):
-    features = await rebuild_features_once() if run_features else 0
     forecasts = await run_forecast_v2_once() if run_forecast else 0
     resolved = await run_result_priority_once() if run_results else 0
     kpi = await run_kpi_guard_once()
     validation = await run_validation_checks_once()
     return {
-        "features_rebuilt": features,
         "forecasts_created_or_updated": forecasts,
         "resolved_outcomes": resolved,
         "kpi": kpi,
@@ -1883,7 +1934,7 @@ async def _live_sse_generator(user: User):
         while True:
             now = datetime.now(timezone.utc)
             five_minutes_ago = now - timedelta(minutes=5)
-            live_freshness_cutoff = now - timedelta(minutes=15)
+            live_freshness_cutoff = now - timedelta(minutes=30)
             async with async_session_maker() as session:
                 result = await session.execute(
                     select(TableTennisLineEvent).where(
@@ -1894,6 +1945,7 @@ async def _live_sse_generator(user: User):
                                 or_(
                                     TableTennisLineEvent.last_score_changed_at >= live_freshness_cutoff,
                                     TableTennisLineEvent.starts_at >= live_freshness_cutoff,
+                                    TableTennisLineEvent.updated_at >= live_freshness_cutoff,
                                 ),
                             ),
                             and_(

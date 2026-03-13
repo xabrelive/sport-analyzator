@@ -18,6 +18,7 @@ class MeProfile(BaseModel):
     is_superadmin: bool
     has_analytics_subscription: bool = False
     has_vip_channel_subscription: bool = False
+    has_no_ml_analytics_subscription: bool = False
 
 
 class MeSettingsUpdate(BaseModel):

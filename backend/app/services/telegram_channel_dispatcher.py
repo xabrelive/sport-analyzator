@@ -246,6 +246,61 @@ async def _send_events_to_channel(
     return 0
 
 
+async def _get_no_ml_candidates_for_channel(
+    session: AsyncSession,
+    channel: str,
+    min_lead_minutes: int,
+    limit: int,
+) -> list[tuple[TableTennisLineEvent, TableTennisForecastV2]]:
+    """Кандидаты из канала analytics без ML для отправки в указанный Telegram-канал."""
+    now = _utc_now()
+    min_starts = now + timedelta(minutes=max(0, min_lead_minutes))
+    rows = (
+        await session.execute(
+            select(TableTennisLineEvent, TableTennisForecastV2)
+            .join(
+                TableTennisForecastV2,
+                and_(
+                    TableTennisForecastV2.event_id == TableTennisLineEvent.id,
+                    TableTennisForecastV2.channel == "no_ml",
+                    TableTennisForecastV2.status == "pending",
+                ),
+            )
+            .where(
+                TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
+                TableTennisLineEvent.starts_at > min_starts,
+            )
+            .order_by(TableTennisLineEvent.starts_at.asc(), TableTennisForecastV2.created_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    if not rows:
+        return []
+
+    uniq: list[tuple[TableTennisLineEvent, TableTennisForecastV2]] = []
+    seen: set[str] = set()
+    for e, f in rows:
+        eid = str(e.id)
+        if eid in seen:
+            continue
+        seen.add(eid)
+        uniq.append((e, f))
+
+    # Исключаем матчи, которые уже отправлялись в данный канал.
+    already = {
+        str(x[0])
+        for x in (
+            await session.execute(
+                select(TelegramChannelNotification.event_id).where(
+                    TelegramChannelNotification.channel == channel,
+                    TelegramChannelNotification.event_id.in_([str(e.id) for e, _ in uniq]),
+                )
+            )
+        ).all()
+    }
+    return [(e, f) for e, f in uniq if str(e.id) not in already]
+
+
 async def _ensure_marker(
     session: AsyncSession,
     marker_key: str,
@@ -449,8 +504,8 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                             sent_vip += c
 
             # FREE regular slots by Moscow time:
-            # 1) 12:00 MSK, 2) 15:00 MSK, 3) 18:00-19:00 MSK.
-            # В каждый слот отправляем максимум 1 случайный матч.
+            # 1) 11:00 MSK, 2) 15:00 MSK, 3) 17:00 MSK.
+            # В каждый слот отправляем максимум 1 случайный матч (из ML-аналитики).
             msk_day = now_msk.strftime("%Y%m%d")
             day_start_msk = datetime(now_msk.year, now_msk.month, now_msk.day, tzinfo=now_msk.tzinfo)
             day_start_utc = day_start_msk.astimezone(timezone.utc)
@@ -466,9 +521,9 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                 or 0
             )
             free_slots: list[tuple[str, bool]] = [
-                ("12:00", (now_msk.hour > 12) or (now_msk.hour == 12 and now_msk.minute >= 0)),
+                ("11:00", (now_msk.hour > 11) or (now_msk.hour == 11 and now_msk.minute >= 0)),
                 ("15:00", (now_msk.hour > 15) or (now_msk.hour == 15 and now_msk.minute >= 0)),
-                ("18:00-19:00", (now_msk.hour == 18)),
+                ("17:00", (now_msk.hour > 17) or (now_msk.hour == 17 and now_msk.minute >= 0)),
             ]
             for slot_name, should_try in free_slots:
                 if free_sent_today >= 3:
@@ -492,7 +547,18 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                 sent_free += sent_now
                 free_sent_today += sent_now
 
-            # VIP hourly (3-4 matches each hour).
+                # Дополнительно: один матч из аналитики без ML в бесплатный канал.
+                candidates_no_ml_free = await _get_no_ml_candidates_for_channel(
+                    session,
+                    CHANNEL_FREE,
+                    min_lead_minutes=max(0, int(settings.telegram_free_min_lead_minutes)),
+                    limit=200,
+                )
+                if candidates_no_ml_free:
+                    pick_no_ml_free = random.choice(candidates_no_ml_free)
+                    sent_free += await _send_events_to_channel(session, CHANNEL_FREE, [pick_no_ml_free])
+
+            # VIP hourly (3-4 matches each hour) из основной (ML) аналитики.
             marker_key = f"vip_hourly_{now.strftime('%Y%m%d_%H')}"
             if await _ensure_marker(session, marker_key, CHANNEL_VIP, "hourly"):
                 candidates = await _get_candidates(
@@ -507,6 +573,32 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                     k = min(len(candidates), random.randint(k_min, k_max))
                     picks = random.sample(candidates, k=k)
                     sent_vip += await _send_events_to_channel(session, CHANNEL_VIP, picks)
+
+            # VIP: три раза в день (12:00, 16:00, 19:00 МСК) отправляем по одному
+            # случайному прогнозу из аналитики без ML.
+            vip_day = now_msk.strftime("%Y%m%d")
+            vip_slots: list[tuple[str, bool]] = [
+                ("12:00", (now_msk.hour > 12) or (now_msk.hour == 12 and now_msk.minute >= 0)),
+                ("16:00", (now_msk.hour > 16) or (now_msk.hour == 16 and now_msk.minute >= 0)),
+                ("19:00", (now_msk.hour > 19) or (now_msk.hour == 19 and now_msk.minute >= 0)),
+            ]
+            for slot_name, should_try in vip_slots:
+                if not should_try:
+                    continue
+                marker_key = f"vip_no_ml_slot_msk_{vip_day}_{slot_name}"
+                created = await _ensure_marker(session, marker_key, CHANNEL_VIP, "slot_no_ml")
+                if not created:
+                    continue
+                candidates_no_ml = await _get_no_ml_candidates_for_channel(
+                    session,
+                    CHANNEL_VIP,
+                    min_lead_minutes=max(0, int(settings.telegram_free_min_lead_minutes)),
+                    limit=200,
+                )
+                if not candidates_no_ml:
+                    continue
+                pick_no_ml = random.choice(candidates_no_ml)
+                sent_vip += await _send_events_to_channel(session, CHANNEL_VIP, [pick_no_ml])
 
             # Daily summaries.
             await _send_daily_summary(session, CHANNEL_FREE, hour_utc=21)

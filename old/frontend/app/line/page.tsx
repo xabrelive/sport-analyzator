@@ -54,7 +54,7 @@ function hasWinnerOdds(match: Match): boolean {
   let hasAway = false;
   for (const o of odds) {
     const market = (o.market || "").toLowerCase();
-    if (market !== "winner" && market !== "win" && market !== "92_1" && market !== "1_1") continue;
+    if (market !== "winner" && market !== "win" && market !== "92_1") continue;
     const sel = (o.selection || "").toLowerCase();
     if (sel === "home" || sel === "1") hasHome = true;
     if (sel === "away" || sel === "2") hasAway = true;
@@ -189,7 +189,7 @@ export default function LinePage() {
       }
     }
     void boot();
-    const matchesTimer = setInterval(() => void loadMatchesOnly(), 6000);
+    const matchesTimer = setInterval(() => void loadMatchesOnly(), 10_000);
     const signalsTimer = setInterval(() => void loadSignalsOnly(), 45000);
     return () => {
       cancelled = true;

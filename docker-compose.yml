@@ -10,6 +10,7 @@ services:
     command: ["postgres", "-c", "port=11002"]
     volumes:
       - pingwin_postgres_data:/var/lib/postgresql/data
+      - ./ml_db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -p 11002 -U ${POSTGRES_USER:-pingwin} -d ${POSTGRES_DB:-pingwin}"]
       interval: 5s
@@ -23,24 +24,38 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/${POSTGRES_DB:-pingwin}
+      BETSAPI_TOKEN: ${BETSAPI_TOKEN:-}
+      DATABASE_URL_ML: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/pingwin_ml
+      ML_MODEL_DIR: /app/ml_models
+      ML_USE_GPU: ${ML_USE_GPU:-true}
+      RUN_BACKGROUND_WORKERS: "false"
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USE_SSL: ${SMTP_USE_SSL:-false}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+    volumes:
+      - pingwin_ml_models:/app/ml_models
     ports:
       - "11001:11001"
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "11001"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "11001", "--workers", "1"]
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:11001/health')\""]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   frontend:
     build:
@@ -70,5 +85,64 @@ services:
       backend:
         condition: service_healthy
 
+  ml_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.ml  # xgboost-cu12 для V100 (cu13 не поддерживает sm_70)
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/${POSTGRES_DB:-pingwin}
+      DATABASE_URL_ML: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/pingwin_ml
+      ML_MODEL_DIR: /app/ml_models
+      ML_USE_GPU: ${ML_USE_GPU:-true}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      ML_SYNC_INTERVAL_SEC: ${ML_SYNC_INTERVAL_SEC:-60}
+      ML_SYNC_BATCH_SIZE: ${ML_SYNC_BATCH_SIZE:-15000}
+      ML_BACKFILL_WORKERS: ${ML_BACKFILL_WORKERS:-6}
+    volumes:
+      - pingwin_ml_models:/app/ml_models
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.ml.worker_cli", "run"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  tt_workers:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/${POSTGRES_DB:-pingwin}
+      DATABASE_URL_ML: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/pingwin_ml
+      ML_MODEL_DIR: /app/ml_models
+      ML_USE_GPU: ${ML_USE_GPU:-true}
+      ML_SYNC_INTERVAL_SEC: ${ML_SYNC_INTERVAL_SEC:-60}
+      ML_SYNC_BATCH_SIZE: ${ML_SYNC_BATCH_SIZE:-15000}
+      ML_BACKFILL_WORKERS: ${ML_BACKFILL_WORKERS:-6}
+      RUN_BACKGROUND_WORKERS: "true"
+      BETSAPI_TOKEN: ${BETSAPI_TOKEN:-}
+    volumes:
+      - pingwin_ml_models:/app/ml_models
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.worker.runner"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
 volumes:
   pingwin_postgres_data:
+  pingwin_ml_models:

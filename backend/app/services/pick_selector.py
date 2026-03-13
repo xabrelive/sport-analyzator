@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.services.model_scorer_v2 import ScoredForecast
+from app.services.ml_scorer import ScoredForecast
 
 
 @dataclass
@@ -74,12 +74,26 @@ def select_pick(
     if not candidates:
         return None
 
+    def _value_score(p: SelectedPick) -> float:
+        """
+        Оцениваем сигнал по ожидаемой выгоде:
+        - edge (value) важнее просто вероятности,
+        - даём бонус за более крупный кф (но без перекоса в заведомо лютые андердоги).
+        """
+        # Нормируем odds в зоне 1.6–2.5 как «сладкое место»
+        odds_bonus = 0.0
+        if p.odds_used >= 1.6:
+            # до 2.5 растёт бонус, дальше — плато
+            capped = min(p.odds_used, 2.5)
+            odds_bonus = (capped - 1.6) * 1.5  # максимум ~1.35
+        return p.edge_pct + odds_bonus
+
     candidates.sort(
         key=lambda x: (
-            x.quality_tier,  # A first lexicographically later, inverted by reverse below
-            x.confidence_score,
-            x.edge_pct,
-            1 if x.market != "match" else 0,  # slight boost for set picks
+            x.quality_tier,           # A/B/C/D
+            _value_score(x),          # сначала лучшие по value и кф
+            x.confidence_score,       # затем по уверенности
+            0 if x.market == "match" else 1,  # матчевые чуть выше сетов
         ),
         reverse=True,
     )

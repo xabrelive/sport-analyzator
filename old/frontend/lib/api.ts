@@ -1,7 +1,7 @@
 // В браузере — относительный путь (Next.js rewrites проксирует на backend). На сервере — BACKEND_URL или localhost.
 function getApiBase(): string {
   if (typeof window !== "undefined") return "";
-  return process.env.BACKEND_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:11001";
+  return process.env.BACKEND_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:12000";
 }
 const API_BASE = getApiBase();
 
@@ -10,7 +10,7 @@ function apiUrl(path: string): string {
   const base = getApiBase();
   return base ? `${base.replace(/\/$/, "")}/api/v1/${path}` : `/api/v1/${path}`;
 }
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:11001";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:12000";
 
 const AUTH_TOKEN_KEY = "sport_analyzator_token";
 const REQUEST_TIMEOUT_MS = 12_000;
@@ -145,7 +145,7 @@ export async function fetchMatches(
   const url =
     typeof window !== "undefined"
       ? pathWithQuery
-      : new URL(pathWithQuery, "http://localhost:11000").toString();
+      : new URL(pathWithQuery, "http://localhost:12000").toString();
   return fetchJson<Match[]>(url);
 }
 
@@ -166,17 +166,7 @@ export async function fetchMatchesOverview(params?: {
   const url =
     typeof window !== "undefined"
       ? path
-      : new URL(path, "http://localhost:11000").toString();
-  return fetchJson<MatchesOverviewResponse>(url, { cache: "no-store" });
-}
-
-/** Быстрый запрос только лайва (оптимизированный эндпоинт). Использовать вместо overview при запросе только live. */
-export async function fetchMatchesLive(limit: number = 200): Promise<MatchesOverviewResponse> {
-  const path = `${apiUrl("matches/live")}?limit=${limit}`;
-  const url =
-    typeof window !== "undefined"
-      ? path
-      : new URL(path, "http://localhost:11000").toString();
+      : new URL(path, "http://localhost:12000").toString();
   return fetchJson<MatchesOverviewResponse>(url, { cache: "no-store" });
 }
 
@@ -195,7 +185,7 @@ export async function fetchFinishedMatches(params?: {
 }): Promise<FinishedMatchesResponse> {
   const url = new URL(
     apiUrl("matches/finished"),
-    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:12000"
   );
   if (params) {
     Object.entries(params).forEach(([k, v]) => {
@@ -208,7 +198,7 @@ export async function fetchFinishedMatches(params?: {
 export async function fetchMatchesByLeague(leagueId: string, status?: string): Promise<Match[]> {
   const url = new URL(
     apiUrl("matches"),
-    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:12000"
   );
   url.searchParams.set("league_id", leagueId);
   if (status) url.searchParams.set("status", status);
@@ -218,7 +208,7 @@ export async function fetchMatchesByLeague(leagueId: string, status?: string): P
 export async function fetchMatch(id: string): Promise<Match> {
   const path = apiUrl(`matches/${id}`);
   const url =
-    typeof window !== "undefined" ? path : new URL(path, "http://localhost:11000").toString();
+    typeof window !== "undefined" ? path : new URL(path, "http://localhost:12000").toString();
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(res.statusText);
   return res.json();
@@ -254,16 +244,6 @@ export async function fetchStoredRecommendation(matchId: string): Promise<string
   return data.recommendation ?? null;
 }
 
-/** Запустить расчёт прогноза для матча, если его ещё нет. После вызова через 3–5 сек стоит повторно запросить fetchStoredRecommendation. */
-export async function ensureRecommendation(matchId: string): Promise<{ queued?: boolean; already?: boolean; recommendation?: string }> {
-  const res = await fetch(apiUrl(`matches/${matchId}/ensure-recommendation`), {
-    method: "POST",
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(res.statusText);
-  return res.json();
-}
-
 export interface LiveRecommendationItem {
   text: string;
   confidence_pct: number;
@@ -285,7 +265,7 @@ export async function fetchLiveRecommendations(matchId: string): Promise<LiveRec
 export async function fetchLeagues(params?: Record<string, string | number>): Promise<League[]> {
   const url = new URL(
     apiUrl("leagues"),
-    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:12000"
   );
   if (params) {
     Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, String(v)));
@@ -319,7 +299,7 @@ export async function fetchPlayer(id: string): Promise<Player> {
 export async function fetchPlayers(params?: { search?: string; limit?: number; offset?: number }): Promise<Player[]> {
   const url = new URL(
     apiUrl("players"),
-    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:12000"
   );
   if (params) {
     Object.entries(params).forEach(([k, v]) => {
@@ -341,7 +321,7 @@ export async function fetchPlayerMatches(
 ): Promise<Match[]> {
   const url = new URL(
     apiUrl(`players/${id}/matches`),
-    typeof window !== "undefined" ? window.location.origin : "http://localhost:11000"
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:12000"
   );
   if (params) {
     Object.entries(params).forEach(([k, v]) => {
@@ -385,7 +365,7 @@ export function getWsUrl(): string {
     return `${proto}://${window.location.host}/ws`;
   }
 
-  return normalizeEnvWs(envWsRaw)?.toString() || "ws://localhost:11001/ws";
+  return normalizeEnvWs(envWsRaw)?.toString() || "ws://localhost:12000/ws";
 }
 
 export async function login(email: string, password: string): Promise<{ access_token: string }> {
@@ -475,7 +455,7 @@ export async function fetchSignals(params?: {
   limit?: number;
   offset?: number;
 }): Promise<SignalItem[]> {
-  const url = new URL(apiUrl("signals"), typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+  const url = new URL(apiUrl("signals"), typeof window !== "undefined" ? window.location.origin : "http://localhost:12000");
   if (params) {
     Object.entries(params).forEach(([k, v]) => {
       if (v !== undefined) url.searchParams.set(k, String(v));
@@ -491,7 +471,7 @@ export type SignalsStatsParams = {
 };
 
 export async function fetchSignalsStats(params?: number | SignalsStatsParams): Promise<SignalStatsResponse> {
-  const url = new URL(apiUrl("signals/stats"), typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+  const url = new URL(apiUrl("signals/stats"), typeof window !== "undefined" ? window.location.origin : "http://localhost:12000");
   if (typeof params === "number") {
     url.searchParams.set("days", String(params));
   } else if (params) {
@@ -551,7 +531,7 @@ export interface FetchRecommendationsStatsParams {
 }
 
 export async function fetchRecommendationsStats(params?: FetchRecommendationsStatsParams): Promise<RecommendationStatsResponse> {
-  const url = new URL(apiUrl("statistics/recommendations"), typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+  const url = new URL(apiUrl("statistics/recommendations"), typeof window !== "undefined" ? window.location.origin : "http://localhost:12000");
   if (params?.page != null) url.searchParams.set("page", String(params.page));
   if (params?.per_page != null) url.searchParams.set("per_page", String(params.per_page));
   if (params?.result_filter != null && params.result_filter !== "all") url.searchParams.set("result_filter", params.result_filter);
@@ -624,7 +604,7 @@ export async function fetchMyProfile(): Promise<MyProfile> {
   const url =
     typeof window !== "undefined"
       ? apiUrl("me/profile")
-      : new URL(apiUrl("me/profile"), "http://localhost:11000").toString();
+      : new URL(apiUrl("me/profile"), "http://localhost:12000").toString();
   return fetchJson<MyProfile>(url, {
     headers: { ...authHeaders() },
     dedupeKey: `GET:${url}:auth:${getAuthToken() ?? "none"}`,
@@ -640,7 +620,7 @@ export async function patchMyProfile(body: PatchProfileBody): Promise<MyProfile>
   const url =
     typeof window !== "undefined"
       ? apiUrl("me/profile")
-      : new URL(apiUrl("me/profile"), "http://localhost:11000").toString();
+      : new URL(apiUrl("me/profile"), "http://localhost:12000").toString();
   const res = await fetch(url, {
     method: "PATCH",
     headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -664,7 +644,7 @@ export async function fetchLinkTelegramRequest(): Promise<LinkTelegramRequestRes
   const url =
     typeof window !== "undefined"
       ? apiUrl("me/link-telegram-request")
-      : new URL(apiUrl("me/link-telegram-request"), "http://localhost:11000").toString();
+      : new URL(apiUrl("me/link-telegram-request"), "http://localhost:12000").toString();
   const res = await fetch(url, {
     method: "POST",
     headers: { ...authHeaders() },
@@ -694,7 +674,7 @@ export async function requestVerifyEmail(email: string): Promise<{ message: stri
   const url =
     typeof window !== "undefined"
       ? apiUrl("me/request-verify-email")
-      : new URL(apiUrl("me/request-verify-email"), "http://localhost:11000").toString();
+      : new URL(apiUrl("me/request-verify-email"), "http://localhost:12000").toString();
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -736,7 +716,7 @@ export async function fetchMeAccess(): Promise<AccessSummaryResponse> {
   const url =
     typeof window !== "undefined"
       ? apiUrl("me/access")
-      : new URL(apiUrl("me/access"), "http://localhost:11000").toString();
+      : new URL(apiUrl("me/access"), "http://localhost:12000").toString();
   try {
     return await fetchJson<AccessSummaryResponse>(url, {
       headers: { ...authHeaders() },
@@ -751,7 +731,7 @@ export async function fetchMySubscriptions(): Promise<SubscriptionOut[]> {
   const url =
     typeof window !== "undefined"
       ? apiUrl("me/subscriptions")
-      : new URL(apiUrl("me/subscriptions"), "http://localhost:11000").toString();
+      : new URL(apiUrl("me/subscriptions"), "http://localhost:12000").toString();
   const res = await fetch(url, { headers: { ...authHeaders() }, cache: "no-store" });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -793,8 +773,8 @@ export async function fetchMySignals(params?: number | MySignalsParams): Promise
   const base =
     typeof window !== "undefined"
       ? apiUrl("me/signals")
-      : new URL(apiUrl("me/signals"), "http://localhost:11000").toString();
-  const url = new URL(base, typeof window !== "undefined" ? window.location.origin : "http://localhost:11000");
+      : new URL(apiUrl("me/signals"), "http://localhost:12000").toString();
+  const url = new URL(base, typeof window !== "undefined" ? window.location.origin : "http://localhost:12000");
   if (typeof params === "number") {
     url.searchParams.set("days", String(params));
   } else if (params) {
@@ -821,7 +801,7 @@ export async function fetchVipChannelStats(days = 7): Promise<VipChannelStatsRes
   const url =
     typeof window !== "undefined"
       ? `${apiUrl("statistics/vip-channel")}?days=${days}`
-      : new URL(apiUrl("statistics/vip-channel"), "http://localhost:11000").toString() + `?days=${days}`;
+      : new URL(apiUrl("statistics/vip-channel"), "http://localhost:12000").toString() + `?days=${days}`;
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to fetch VIP channel stats");
   return res.json();
@@ -841,7 +821,7 @@ export async function fetchFreeChannelStats(days = 7): Promise<FreeChannelStatsR
   const url =
     typeof window !== "undefined"
       ? `${apiUrl("statistics/free-channel")}?days=${days}`
-      : new URL(apiUrl("statistics/free-channel"), "http://localhost:11000").toString() + `?days=${days}`;
+      : new URL(apiUrl("statistics/free-channel"), "http://localhost:12000").toString() + `?days=${days}`;
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to fetch free channel stats");
   return res.json();
@@ -1250,7 +1230,7 @@ export async function deleteAdminScheduledPost(id: string): Promise<{ ok: boolea
 
 export async function fetchSports(): Promise<SportOption[]> {
   const res = await fetch(
-    typeof window !== "undefined" ? apiUrl("sports") : new URL(apiUrl("sports"), "http://localhost:11000").toString(),
+    typeof window !== "undefined" ? apiUrl("sports") : new URL(apiUrl("sports"), "http://localhost:12000").toString(),
     { next: { revalidate: 60 } }
   );
   if (!res.ok) throw new Error(res.statusText);

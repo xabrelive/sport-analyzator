@@ -19,7 +19,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-BACKEND_URL = (os.environ.get("BACKEND_URL") or "http://localhost:11001").rstrip("/")
+BACKEND_URL = (os.environ.get("BACKEND_URL") or "http://localhost:12000").rstrip("/")
 
 
 async def _link_by_token(update: Update, token: str) -> None:

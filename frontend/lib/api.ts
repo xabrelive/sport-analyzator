@@ -630,12 +630,42 @@ export async function getTableTennisMatchCard(matchId: string): Promise<TableTen
   return res.json();
 }
 
+export interface MlAnalyticsFeatures {
+  elo_diff: number;
+  form_diff: number;
+  fatigue_diff: number;
+  h2h_count: number;
+  h2h_p1_wr: number | null;
+  sample_size: number;
+  elo_p1: number;
+  elo_p2: number;
+}
+
+export interface MlAnalyticsValueSignal {
+  market: string;
+  side: string;
+  odds: number;
+  probability: number;
+  ev: number;
+  confidence: number;
+}
+
+export interface MlAnalytics {
+  p_match: number;
+  p_set1: number;
+  p_set2: number;
+  model_used: boolean;
+  value_signals: MlAnalyticsValueSignal[];
+  features?: MlAnalyticsFeatures;
+}
+
 export interface TableTennisMatchCardV2 {
   match: TableTennisLiveEvent | null;
   forecast_v2: TableTennisForecastItem | null;
   forecast_locked?: boolean;
   forecast_locked_message?: string;
   forecast_purchase_url?: string;
+  ml_analytics?: MlAnalytics | null;
   player_context?: {
     home?: {
       played?: number;
@@ -1357,6 +1387,193 @@ export async function getAdminInvoices(params?: {
   return res.json();
 }
 
+// --- Admin ML (sync, backfill, retrain) ---
+export interface AdminMlProgressItem {
+  status: "idle" | "running" | "done";
+  message: string;
+  current: number;
+  total: number;
+  result?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface AdminMlProgress {
+  sync: AdminMlProgressItem;
+  backfill: AdminMlProgressItem;
+  retrain: AdminMlProgressItem;
+  league_performance?: AdminMlProgressItem;
+  player_stats?: AdminMlProgressItem;
+  full_rebuild?: AdminMlProgressItem;
+}
+
+export interface AdminMlDashboard {
+  tables: Record<string, number>;
+  fill_pct: Record<string, number>;
+  main: { matches: number; players: number; leagues: number };
+  diff: { matches: number; players: number; leagues: number };
+  sync_ok: boolean;
+  progress: AdminMlProgress;
+  queue_size: number;
+}
+
+export async function getAdminMlDashboard(): Promise<AdminMlDashboard> {
+  const res = await fetch(apiUrl("admin/ml/dashboard"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function getAdminMlProgress(): Promise<AdminMlProgress> {
+  const res = await fetch(apiUrl("admin/ml/progress"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export interface AdminMlStats {
+  matches: number;
+  match_features: number;
+  players?: number;
+  leagues?: number;
+}
+
+export interface AdminMlVerify {
+  main: { matches: number; players: number; leagues: number };
+  ml: { matches: number; players: number; leagues: number };
+  diff: { matches: number; players: number; leagues: number };
+  ok: boolean;
+  message: string;
+}
+
+export async function getAdminMlVerify(): Promise<AdminMlVerify> {
+  const res = await fetch(apiUrl("admin/ml/verify"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function getAdminMlStats(): Promise<AdminMlStats> {
+  const res = await fetch(apiUrl("admin/ml/stats"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlSyncLeagues(): Promise<{ ok: boolean; added: number; total: number }> {
+  const res = await fetch(apiUrl("admin/ml/sync-leagues"), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlSyncPlayers(): Promise<{ ok: boolean; added: number; total: number }> {
+  const res = await fetch(apiUrl("admin/ml/sync-players"), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlLoadArchive(params?: {
+  days?: number;
+}): Promise<{ ok: boolean; inserted?: number; updated?: number; skipped?: number }> {
+  const sp = new URLSearchParams();
+  if (params?.days != null) sp.set("days", String(params.days));
+  const res = await fetch(apiUrl(`admin/ml/load-archive?${sp}`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlSync(params?: {
+  limit?: number;
+  days_back?: number;
+  full?: boolean;
+}): Promise<{ ok: boolean; message?: string; error?: string; synced?: number; skipped?: number }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.days_back != null) sp.set("days_back", String(params.days_back));
+  if (params?.full) sp.set("full", "true");
+  const res = await fetch(apiUrl(`admin/ml/sync?${sp}`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlBackfillFeatures(params?: {
+  limit?: number;
+}): Promise<{ ok: boolean; message?: string; error?: string; features_added?: number }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  const res = await fetch(apiUrl(`admin/ml/backfill-features?${sp}`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlRetrain(params?: {
+  min_rows?: number;
+}): Promise<{ ok: boolean; message?: string; error?: string; trained?: boolean; rows?: number; path?: string }> {
+  const sp = new URLSearchParams();
+  if (params?.min_rows != null) sp.set("min_rows", String(params.min_rows));
+  const res = await fetch(apiUrl(`admin/ml/retrain?${sp}`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlPlayerStats(params?: {
+  limit?: number;
+}): Promise<{ ok: boolean; message?: string; error?: string }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  const res = await fetch(apiUrl(`admin/ml/player-stats?${sp}`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlResetProgress(op?: string): Promise<{ ok: boolean; message?: string }> {
+  const sp = new URLSearchParams();
+  if (op) sp.set("op", op);
+  const res = await fetch(apiUrl(`admin/ml/reset-progress?${sp}`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlFullRebuild(params?: {
+  sync_limit?: number;
+  backfill_limit?: number;
+  player_stats_limit?: number;
+  league_limit?: number;
+  min_rows?: number;
+}): Promise<{ ok: boolean; message?: string; error?: string }> {
+  const sp = new URLSearchParams();
+  if (params?.sync_limit != null) sp.set("sync_limit", String(params.sync_limit));
+  if (params?.backfill_limit != null) sp.set("backfill_limit", String(params.backfill_limit));
+  if (params?.player_stats_limit != null) sp.set("player_stats_limit", String(params.player_stats_limit));
+  if (params?.league_limit != null) sp.set("league_limit", String(params.league_limit));
+  if (params?.min_rows != null) sp.set("min_rows", String(params.min_rows));
+  const res = await fetch(apiUrl(`admin/ml/full-rebuild?${sp}`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
 export async function patchAdminInvoiceStatus(
   invoiceId: string,
   paid: boolean
@@ -1491,6 +1708,7 @@ export interface BillingMyServiceSummary {
 export interface BillingMySubscriptionsResponse {
   items: BillingMySubscriptionItem[];
   analytics: BillingMyServiceSummary;
+  analytics_no_ml: BillingMyServiceSummary;
   vip_channel: BillingMyServiceSummary;
 }
 

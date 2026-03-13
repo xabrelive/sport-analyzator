@@ -26,8 +26,9 @@ async def start_pipeline() -> None:
         table_tennis_results_loop,
     )
     from app.services.forecast_v2_pipeline import (
-        features_loop,
+        early_scan_loop,
         forecast_v2_loop,
+        no_ml_forecast_loop,
         result_priority_loop,
         kpi_guard_loop,
     )
@@ -35,6 +36,7 @@ async def start_pipeline() -> None:
     from app.services.subscription_expiry_notifier import subscription_expiry_loop
     from app.services.telegram_channel_dispatcher import telegram_channel_dispatcher_loop
     from app.services.vip_channel_access import vip_channel_access_loop
+    from app.services.ml_sync_loop import ml_sync_loop
 
     num_workers = max(1, settings.line_worker_count)
     get_line_queue()  # инициализировать очередь до старта воркеров
@@ -45,14 +47,17 @@ async def start_pipeline() -> None:
     asyncio.create_task(table_tennis_odds_loop())
     asyncio.create_task(table_tennis_live_loop())
     asyncio.create_task(table_tennis_results_loop())
-    asyncio.create_task(features_loop())
+    asyncio.create_task(early_scan_loop())
     asyncio.create_task(forecast_v2_loop())
+    asyncio.create_task(no_ml_forecast_loop())
     asyncio.create_task(result_priority_loop())
     asyncio.create_task(kpi_guard_loop())
     asyncio.create_task(forecast_notifications_loop())
     asyncio.create_task(subscription_expiry_loop())
     asyncio.create_task(telegram_channel_dispatcher_loop())
     asyncio.create_task(vip_channel_access_loop())
+    if settings.ml_sync_interval_sec > 0:
+        asyncio.create_task(ml_sync_loop())
 
     logger.info(
         "Table tennis line pipeline started: %s workers, queue_maxsize=%s",

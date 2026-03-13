@@ -12,6 +12,13 @@ class Settings(BaseSettings):
     # Database (PostgreSQL — рассчитан на миллионы строк и сотни/тысячи записей в день)
     database_url: str = "postgresql://pingwin:pingwin@localhost:11002/pingwin"
     database_url_async: str | None = None
+    # Пул соединений: backend запускает 12+ фоновых задач (BetsAPI, прогнозы, ML sync и т.д.),
+    # API-запросы конкурируют за соединения. При pool_size=10 запросы могут ждать 30+ сек.
+    db_pool_size: int = 75
+    db_pool_max_overflow: int = 75
+    db_pool_recycle_sec: int = 300  # переподключение каждые 5 мин (избежать stale connections)
+    # ML-база (Elo, фичи, модели, сигналы, подозрительные матчи)
+    database_url_ml: str = "postgresql://pingwin:pingwin@localhost:11002/pingwin_ml"
 
     # Auth
     secret_key: str = "change-me"
@@ -49,11 +56,16 @@ class Settings(BaseSettings):
     betsapi_table_tennis_cancel_missing_horizon_minutes: int = 90  # помечаем cancelled только для ближних матчей
     # Задержка перед расчётом прематч‑прогноза (минуты) после появления матча в линии
     betsapi_table_tennis_forecast_delay_minutes: int = 5
+    # Окно публикации прогноза: 1–3 часа до матча (Stage 2). Не пересчитываем после.
+    betsapi_table_tennis_forecast_min_minutes_before: int = 60   # мин. минут до начала
+    betsapi_table_tennis_forecast_max_minutes_before: int = 180  # макс. минут до начала
     # Минимальный коэффициент на исход прогноза (для выбранной стороны), ниже — прогноз не даём
-    betsapi_table_tennis_min_odds_for_forecast: float = 1.4
+    # Цель — не играть откровенный 1.10–1.30, а держаться в районе 1.6+.
+    betsapi_table_tennis_min_odds_for_forecast: float = 1.6
     # V2 loops and KPI targets
     betsapi_table_tennis_v2_features_interval_sec: int = 300
     betsapi_table_tennis_v2_forecast_interval_sec: int = 60
+    betsapi_table_tennis_early_scan_interval_sec: int = 600  # Stage 1: раз в 10 мин
     betsapi_table_tennis_v2_result_priority_interval_sec: int = 20
     betsapi_table_tennis_v2_kpi_guard_interval_sec: int = 60
     betsapi_table_tennis_v2_forecast_batch_size: int = 400
@@ -66,7 +78,18 @@ class Settings(BaseSettings):
     betsapi_table_tennis_v2_min_edge_ceiling: float = 8.0
     betsapi_table_tennis_v2_base_min_edge: float = 3.0
     table_tennis_match_sets_to_win: int = 3
+    # ML pipeline: синхронизация main→ML и переобучение, интервал в секундах (0 = отключено)
+    ml_sync_interval_sec: int = 600  # 10 мин: подтяжка данных + retrain
+    ml_model_dir: str = "/tmp/pingwin_ml_models"
+    ml_use_gpu: bool = True  # ML_USE_GPU=false — принудительно CPU (Docker без --gpus)
+    ml_retrain_min_new_matches: int = 500  # 500+ для стабильной модели (меньше шума)
+    ml_sync_days_back: int = 0  # 0 = весь архив, иначе N дней назад
+    ml_sync_batch_size: int = 15000  # батч синхронизации main→ML (больше = быстрее)
+    ml_backfill_workers: int = 6  # параллельных воркеров для backfill фичей
 
+    # Разделение API и воркеров: при run_background_workers=false контейнер только API (быстрый, масштабируемый).
+    # Воркеры (BetsAPI, прогнозы, ML sync) — в отдельном tt_workers контейнере.
+    run_background_workers: bool = True  # false = API-only (для масштабирования 100-300 пользователей)
     # Очередь и воркеры линии (масштабирование при росте объёма данных)
     line_queue_maxsize: int = 32  # макс. батчей в очереди (при переполнении продюсер ждёт)
     line_worker_count: int = 3    # число воркеров, обрабатывающих очередь (увеличить при росте нагрузки)
