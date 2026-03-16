@@ -7,8 +7,8 @@ from app.config import settings
 
 def get_ml_engine():
     workers = getattr(settings, "ml_backfill_workers", 1)
-    pool_size = max(10, workers + 4)
-    max_overflow = max(20, workers * 2)
+    pool_size = max(4, min(10, workers + 2))
+    max_overflow = max(4, min(10, workers))
     return create_engine(
         settings.database_url_ml,
         pool_pre_ping=True,

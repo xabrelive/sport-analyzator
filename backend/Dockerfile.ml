@@ -1,17 +1,14 @@
-FROM nvidia/cuda:13.0.2-devel-ubuntu24.04
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-dev python3-venv python3-pip \
-    build-essential libpq-dev curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3 /usr/bin/python
-
-WORKDIR /app
+# Использует предсобранный базовый образ (CUDA + LightGBM). Без него сборка ~10 мин.
+# Один раз соберите базу: docker build -f Dockerfile.ml.base -t sport-analyzator-ml-base:latest .
+# Или: make -C .. build-ml-base
+ARG ML_BASE_IMAGE=sport-analyzator-ml-base:latest
+FROM ${ML_BASE_IMAGE}
 
 COPY pyproject.toml ./
-COPY . .
+COPY app ./app
 
-RUN pip install --break-system-packages --no-cache-dir .
+RUN pip install --break-system-packages --no-deps .
+RUN pip install --break-system-packages clickhouse-connect
 
 ENV PYTHONDONTWRITEBYTECODE=1
 EXPOSE 11001

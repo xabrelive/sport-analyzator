@@ -222,6 +222,7 @@ export interface MeProfile {
   quiet_hours_end: string | null;
   notify_telegram: boolean;
   notify_email: boolean;
+  notification_tz_offset_minutes: number;
   is_telegram_only: boolean;
   is_superadmin: boolean;
 }
@@ -240,6 +241,7 @@ export interface MeSettingsUpdate {
   quiet_hours_end?: string | null;
   notify_telegram?: boolean | null;
   notify_email?: boolean | null;
+  notification_tz_offset_minutes?: number | null;
 }
 
 export async function patchMe(data: MeSettingsUpdate): Promise<MeProfile> {
@@ -340,6 +342,8 @@ export interface TableTennisLineEvent {
   odds_2?: number | null;
   /** Прогноз (если есть); для фильтра «только с прогнозом» */
   forecast?: string | null;
+  forecast_ml?: string | null;
+  forecast_no_ml?: string | null;
 }
 
 export interface TableTennisLeague {
@@ -381,6 +385,8 @@ export interface TableTennisLiveEvent {
   odds_1?: number | null;
   odds_2?: number | null;
   forecast?: string | null;
+  forecast_ml?: string | null;
+  forecast_no_ml?: string | null;
   sets_score?: string | null; // общий счёт по сетам, например "2-1"
   sets?: Record<string, { home: string; away: string }>; // счёт по каждому сету
   last_score_changed_at?: number | null;
@@ -1419,11 +1425,14 @@ export interface AdminMlProgressItem {
   total: number;
   result?: Record<string, unknown>;
   error?: string;
+  updated_at_ts?: number;
+  completed_at_ts?: number;
 }
 
 export interface AdminMlProgress {
   sync: AdminMlProgressItem;
   backfill: AdminMlProgressItem;
+  odds_backfill?: AdminMlProgressItem;
   retrain: AdminMlProgressItem;
   league_performance?: AdminMlProgressItem;
   player_stats?: AdminMlProgressItem;
@@ -1438,10 +1447,46 @@ export interface AdminMlDashboard {
   sync_ok: boolean;
   progress: AdminMlProgress;
   queue_size: number;
+  meta?: Record<string, string>;
+}
+
+export interface AdminMlV2Status {
+  engine: string;
+  queue_size: number;
+  progress: AdminMlProgress;
+  clickhouse_ok: boolean;
+  clickhouse_error?: string;
+  tables: Record<string, number>;
+  main_finished: number;
+  delta_main_minus_ch_matches: number;
+  delta_ch_matches_minus_features: number;
+  delta_ch_matches_minus_match_sets: number;
+  match_sets_gap_pct: number;
+  match_sets_gap_alert: boolean;
+  delta_main_minus_ch_features: number;
+  meta?: Record<string, string>;
+  kpi?: {
+    match_hit_rate?: number;
+    set1_hit_rate?: number;
+    sample_size?: number;
+  };
+  v2_config?: {
+    ml_v2_use_experience_regimes: boolean;
+    ml_v2_experience_regime_min_train: number;
+    betsapi_table_tennis_v2_confidence_filter_min_pct: number;
+    ml_v2_train_max_league_upset_rate: number;
+  };
+  v2_meta?: Record<string, unknown>;
 }
 
 export async function getAdminMlDashboard(): Promise<AdminMlDashboard> {
   const res = await fetch(apiUrl("admin/ml/dashboard"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function getAdminMlV2Status(): Promise<AdminMlV2Status> {
+  const res = await fetch(apiUrl("admin/ml/v2/status"), { headers: authHeaders(), cache: "no-store" });
   if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
   return res.json();
 }
@@ -1467,6 +1512,52 @@ export interface AdminMlVerify {
   message: string;
 }
 
+export interface AdminMlSyncAudit {
+  main_finished_events: number;
+  ml_matches: number;
+  delta_matches_main_minus_ml: number;
+  main_players: number;
+  ml_players: number;
+  delta_players_main_minus_ml: number;
+  main_leagues: number;
+  ml_leagues: number;
+  delta_leagues_main_minus_ml: number;
+  recent_sample_checked: number;
+  recent_missing_count: number;
+  recent_missing_preview: string[];
+}
+
+export interface AdminMlNoMlStatsLeague {
+  league_id: string;
+  league_name: string;
+  hit: number;
+  miss: number;
+  total?: number;
+  hit_rate_pct?: number;
+}
+
+export interface AdminMlNoMlStatsStreaks {
+  max_streak_miss: number;
+  max_streak_hit: number;
+  current_streak_miss: number;
+  current_streak_hit: number;
+}
+
+export interface AdminMlNoMlStats {
+  total_hit: number;
+  total_miss: number;
+  streaks?: AdminMlNoMlStatsStreaks;
+  leagues_bad: AdminMlNoMlStatsLeague[];
+  leagues_weak: AdminMlNoMlStatsLeague[];
+  by_league: AdminMlNoMlStatsLeague[];
+}
+
+export async function getAdminMlNoMlStats(): Promise<AdminMlNoMlStats> {
+  const res = await fetch(apiUrl("admin/ml/no-ml-stats"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
 export async function getAdminMlVerify(): Promise<AdminMlVerify> {
   const res = await fetch(apiUrl("admin/ml/verify"), { headers: authHeaders(), cache: "no-store" });
   if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
@@ -1475,6 +1566,66 @@ export async function getAdminMlVerify(): Promise<AdminMlVerify> {
 
 export async function getAdminMlStats(): Promise<AdminMlStats> {
   const res = await fetch(apiUrl("admin/ml/stats"), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function getAdminMlSyncAudit(params?: {
+  sample_limit?: number;
+  missing_preview?: number;
+}): Promise<AdminMlSyncAudit> {
+  const sp = new URLSearchParams();
+  if (params?.sample_limit != null) sp.set("sample_limit", String(params.sample_limit));
+  if (params?.missing_preview != null) sp.set("missing_preview", String(params.missing_preview));
+  const res = await fetch(apiUrl(`admin/ml/sync-audit?${sp}`), { headers: authHeaders(), cache: "no-store" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlRequestFullSync(): Promise<{ ok: boolean; message: string }> {
+  const res = await fetch(apiUrl("admin/ml/request-full-sync"), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminForecastsClearAll(): Promise<{
+  ok: boolean;
+  message: string;
+  deleted: Record<string, number>;
+}> {
+  const res = await fetch(apiUrl("admin/forecasts/clear-all"), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminForecastsClearMl(): Promise<{
+  ok: boolean;
+  message: string;
+  deleted: Record<string, number>;
+}> {
+  const res = await fetch(apiUrl("admin/forecasts/clear-ml"), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminForecastsClearNoMl(): Promise<{
+  ok: boolean;
+  message: string;
+  deleted: Record<string, number>;
+}> {
+  const res = await fetch(apiUrl("admin/forecasts/clear-no-ml"), {
+    method: "POST",
+    headers: authHeaders(),
+  });
   if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
   return res.json();
 }
@@ -1499,9 +1650,13 @@ export async function postAdminMlSyncPlayers(): Promise<{ ok: boolean; added: nu
 
 export async function postAdminMlLoadArchive(params?: {
   days?: number;
+  date_from?: string;
+  date_to?: string;
 }): Promise<{ ok: boolean; inserted?: number; updated?: number; skipped?: number }> {
   const sp = new URLSearchParams();
   if (params?.days != null) sp.set("days", String(params.days));
+  if (params?.date_from) sp.set("date_from", params.date_from);
+  if (params?.date_to) sp.set("date_to", params.date_to);
   const res = await fetch(apiUrl(`admin/ml/load-archive?${sp}`), {
     method: "POST",
     headers: authHeaders(),
@@ -1533,6 +1688,40 @@ export async function postAdminMlBackfillFeatures(params?: {
   const sp = new URLSearchParams();
   if (params?.limit != null) sp.set("limit", String(params.limit));
   const res = await fetch(apiUrl(`admin/ml/backfill-features?${sp}`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+/** Дозаполняет ml.match_sets из main DB (live_sets_score, live_score). limit 100–20000. */
+export async function postAdminMlV2BackfillMatchSets(limit?: number): Promise<{
+  ok: boolean;
+  filled: number;
+  sets_inserted: number;
+  remaining: number;
+}> {
+  const sp = new URLSearchParams();
+  if (limit != null) sp.set("limit", String(limit));
+  const res = await fetch(apiUrl(`admin/ml/v2/backfill-match-sets?${sp}`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminMlOddsBackfillBg(params?: {
+  limit?: number;
+  batches?: number;
+  pause_ms?: number;
+}): Promise<{ ok: boolean; message?: string; error?: string }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.batches != null) sp.set("batches", String(params.batches));
+  if (params?.pause_ms != null) sp.set("pause_ms", String(params.pause_ms));
+  const res = await fetch(apiUrl(`admin/ml/odds-backfill-bg?${sp}`), {
     method: "POST",
     headers: authHeaders(),
   });

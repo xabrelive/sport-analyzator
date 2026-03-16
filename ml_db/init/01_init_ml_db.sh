@@ -13,6 +13,7 @@ for f in /docker-entrypoint-initdb.d/schema/02_ml_schema.sql \
          /docker-entrypoint-initdb.d/schema/07_player_style.sql \
          /docker-entrypoint-initdb.d/schema/08_player_elo_history.sql \
          /docker-entrypoint-initdb.d/schema/09_add_duration_to_matches.sql \
-         /docker-entrypoint-initdb.d/schema/10_ml_features_v3_strong.sql; do
+         /docker-entrypoint-initdb.d/schema/10_ml_features_v3_strong.sql \
+         /docker-entrypoint-initdb.d/schema/11_ml_features_h2h_sample_league.sql; do
   [ -f "$f" ] && psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d pingwin_ml -p "$PGPORT" -f "$f"
 done

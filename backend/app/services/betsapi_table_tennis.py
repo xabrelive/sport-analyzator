@@ -1681,11 +1681,15 @@ async def sync_results_from_archive_range_once(
 async def load_archive_to_main(
     days_back: int = 90,
     max_pages_per_day: int = 10,
+    date_from: date | None = None,
+    date_to: date | None = None,
 ) -> dict[str, int]:
     """Загружает завершённые матчи из архива BetsAPI в main DB (table_tennis_line_events).
 
     Используется для первичного наполнения: линия даёт только upcoming, архив — finished.
     Без этого ML-таблицы остаются пустыми (sync читает только finished с live_sets_score).
+
+    Если заданы date_from/date_to — используются они; иначе days_back от сегодня.
     """
     token = (settings.betsapi_token or "").strip()
     if not token:
@@ -1693,8 +1697,11 @@ async def load_archive_to_main(
         return {"inserted": 0, "updated": 0, "skipped": 0}
 
     today = datetime.now(timezone.utc).date()
-    date_from = today - timedelta(days=max(1, days_back))
-    date_to = today
+    if date_from is not None and date_to is not None:
+        pass  # используем переданные даты
+    else:
+        date_from = today - timedelta(days=max(1, days_back))
+        date_to = today
 
     all_events: list[Dict[str, Any]] = []
     async with httpx.AsyncClient() as client:
@@ -1970,10 +1977,12 @@ async def table_tennis_live_loop() -> None:
                 today = datetime.now(timezone.utc).date()
                 yesterday = today - timedelta(days=1)
                 try:
+                    # only_forecasted=False: подтягиваем результаты по всем матчам в диапазоне,
+                    # иначе после очистки прогнозов или для матчей без прогноза результаты не обновляются
                     archive_res = await sync_results_from_archive_range_once(
                         date_from=yesterday,
                         date_to=today,
-                        only_forecasted=True,
+                        only_forecasted=False,
                         max_pages_per_day=6,
                     )
                     logger.info("BetsAPI archive sync (today/yesterday): %s", archive_res)

@@ -1,4 +1,10 @@
-"""Feature Engine v2: Elo, Form, Tempo, Streak, Density, Dominance, Volatility, League, Odds."""
+"""Feature Engine v2: Elo, Form, Tempo, Streak, Density, Dominance, Volatility, League, Odds.
+
+Правила против data leakage (утечки будущего):
+- Все признаки считаются строго по данным ДО матча: cutoff = start_time - 1 сек.
+- Elo берётся из player_elo_history (elo_after последнего матча до cutoff), не из player_ratings.
+- История матчей: только m.start_time < cutoff. Winrate, dominance, fatigue — только по прошлым матчам.
+- Симметрия: в модель подаём в основном diff-фичи (elo_diff, form_diff, dominance_diff, ...)."""
 from __future__ import annotations
 
 import math
@@ -156,6 +162,8 @@ class MatchFeatures:
     dominance_trend_diff: float
     # style_clash: |tempo_p1 - tempo_p2| (attacker vs defender proxy)
     style_clash: float
+    # league_upset_rate: доля побед андердога по Elo в лиге (Tier A)
+    league_upset_rate: float
 
 
 def _utc_now() -> datetime:
@@ -206,13 +214,28 @@ class FeatureEngine:
             minutes_to_match = max(0.0, (start_time - ref).total_seconds() / 60.0)
             day_start = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
 
-            ratings_rows = session.execute(
-                text("SELECT player_id, rating, matches_played FROM player_ratings WHERE player_id = ANY(:pids)"),
-                {"pids": [player1_id, player2_id]},
-            ).fetchall()
-            ratings = {r[0]: (float(r[1] or self.default_elo), int(r[2] or 0)) for r in ratings_rows}
-            elo_p1, matches_played_p1 = ratings.get(player1_id, (self.default_elo, 0))
-            elo_p2, matches_played_p2 = ratings.get(player2_id, (self.default_elo, 0))
+            # Важно: Elo только по прошлым матчам (no leakage). Берём elo_after последнего матча до cutoff.
+            def _elo_and_matches_as_of(pid: int) -> tuple[float, int]:
+                row = session.execute(
+                    text("""
+                        SELECT elo_after FROM player_elo_history
+                        WHERE player_id = :pid AND match_date < :cutoff
+                        ORDER BY match_date DESC
+                        LIMIT 1
+                    """),
+                    {"pid": pid, "cutoff": cutoff},
+                ).fetchone()
+                if not row:
+                    return self.default_elo, 0
+                cnt = session.execute(
+                    text(
+                        "SELECT COUNT(*) FROM player_elo_history WHERE player_id = :pid AND match_date < :cutoff"
+                    ),
+                    {"pid": pid, "cutoff": cutoff},
+                ).scalar_one()
+                return float(row[0] or self.default_elo), int(cnt or 0)
+            elo_p1, matches_played_p1 = _elo_and_matches_as_of(player1_id)
+            elo_p2, matches_played_p2 = _elo_and_matches_as_of(player2_id)
             elo_diff = elo_p1 - elo_p2
 
             def _player_history(pid: int, limit: int) -> list[tuple[int, int, int, int, int, float, int, int, datetime | None]]:
@@ -450,19 +473,23 @@ class FeatureEngine:
             tempo_p2 = _get_tempo(player2_id)
             style_clash = abs(tempo_p1 - tempo_p2)
 
-            # opponent_strength: avg_opponent_elo_last10
+            # opponent_strength: avg_opponent_elo_last10 (Elo соперников на момент cutoff — без утечки)
             def _avg_opponent_elo(hist: list, default: float = 1500.0) -> float:
-                opp_ids = [x[7] for x in hist if x[7]]
+                opp_ids = list({x[7] for x in hist if x[7]})
                 if not opp_ids:
                     return default
-                placeholders = ", ".join(f":id{i}" for i in range(len(opp_ids)))
-                params = {f"id{i}": oid for i, oid in enumerate(opp_ids)}
-                rows = session.execute(
-                    text(f"SELECT player_id, rating FROM player_ratings WHERE player_id IN ({placeholders})"),
-                    params,
-                ).fetchall()
-                elo_map = {r[0]: float(r[1] or default) for r in rows}
-                return sum(elo_map.get(oid, default) for oid in opp_ids) / len(opp_ids)
+                total = 0.0
+                for oid in opp_ids:
+                    r = session.execute(
+                        text("""
+                            SELECT elo_after FROM player_elo_history
+                            WHERE player_id = :pid AND match_date < :cutoff
+                            ORDER BY match_date DESC LIMIT 1
+                        """),
+                        {"pid": oid, "cutoff": cutoff},
+                    ).fetchone()
+                    total += float(r[0] or default) if r else default
+                return total / len(opp_ids)
             opponent_strength_p1 = _avg_opponent_elo(h1_10, elo_p2)
             opponent_strength_p2 = _avg_opponent_elo(h2_10, elo_p1)
             opponent_strength_diff = opponent_strength_p1 - opponent_strength_p2
@@ -576,10 +603,11 @@ class FeatureEngine:
             upset_rate_p2 = 0.5
             upset_rate_diff = 0.0
 
-            # League aggregates
+            # League aggregates (включая league_upset_rate: доля побед андердога по Elo в лиге)
             league_strength = 0.0
             league_avg_sets = 3.5
             league_avg_point_diff = 0.0
+            league_upset_rate = 0.5
             if league_id:
                 row = session.execute(
                     text("""
@@ -592,6 +620,22 @@ class FeatureEngine:
                 ).fetchone()
                 if row and row[1] and row[1] > 10:
                     league_avg_sets = float(row[0] or 3.5)
+                # league_upset_rate: доля матчей, где выиграл игрок с меньшим Elo (по данным match_features)
+                upset_row = session.execute(
+                    text("""
+                        SELECT COUNT(*),
+                               SUM(CASE WHEN (m.score_sets_p1 > m.score_sets_p2 AND mf.elo_p1 < mf.elo_p2)
+                                     OR (m.score_sets_p2 > m.score_sets_p1 AND mf.elo_p2 < mf.elo_p1) THEN 1 ELSE 0 END)
+                        FROM matches m
+                        JOIN match_features mf ON mf.match_id = m.id
+                        WHERE m.league_id = :lid AND m.status = 'finished'
+                          AND m.start_time < :cutoff AND m.start_time >= :since
+                          AND mf.elo_p1 IS NOT NULL AND mf.elo_p2 IS NOT NULL
+                    """),
+                    {"lid": league_id, "cutoff": cutoff, "since": cutoff - timedelta(days=365)},
+                ).fetchone()
+                if upset_row and upset_row[0] and int(upset_row[0]) > 20:
+                    league_upset_rate = float(upset_row[1] or 0) / float(upset_row[0])
 
             # H2H (с start_time для hours_since_last_h2h)
             h2h_rows = session.execute(
@@ -688,10 +732,15 @@ class FeatureEngine:
 
             # closing_line_value: odds_open/odds_close. CLV>1.1 — рынок сильно двигался
             closing_line_value_p1 = closing_line_value_p2 = 1.0
-            if match_id and match_id > 0:
+            match_id_int: int | None
+            try:
+                match_id_int = int(match_id) if match_id is not None else None
+            except Exception:
+                match_id_int = None
+            if match_id_int is not None and match_id_int > 0:
                 odds_rows = session.execute(
                     text("SELECT odds_p1, odds_p2 FROM odds WHERE match_id = :mid ORDER BY created_at ASC"),
-                    {"mid": match_id},
+                    {"mid": match_id_int},
                 ).fetchall()
                 if len(odds_rows) >= 2:
                     oo1, oo2 = float(odds_rows[0][0] or 1.9), float(odds_rows[0][1] or 1.9)
@@ -826,6 +875,7 @@ class FeatureEngine:
             dominance_trend_p2=dominance_trend_p2,
             dominance_trend_diff=dominance_trend_diff,
             style_clash=style_clash,
+            league_upset_rate=league_upset_rate,
             daily_performance_trend_p1=daily_performance_trend_p1,
             daily_performance_trend_p2=daily_performance_trend_p2,
             daily_performance_trend_diff=daily_performance_trend_diff,
@@ -870,7 +920,8 @@ class FeatureEngine:
                         momentum_today_diff, set1_strength_diff, comeback_rate_diff,
                         dominance_last_50_diff, fatigue_index_diff, fatigue_ratio, minutes_to_match,
                         odds_shift_p1, odds_shift_p2, elo_volatility_p1, elo_volatility_p2, elo_volatility_diff,
-                        daily_performance_trend_diff, dominance_trend_diff, style_clash
+                        daily_performance_trend_diff, dominance_trend_diff, style_clash,
+                        hours_since_last_h2h, sample_size, league_upset_rate
                     ) VALUES (
                         :mid, :e1, :e2, :ed, :f1, :f2, :fd, :g1, :g2, :gd, :hc, :hw, :hd,
                         :w1, :w2, :wd, :o1, :o2, :od, :lid,
@@ -879,7 +930,8 @@ class FeatureEngine:
                         :momentum_diff, :set1_str, :comeback_diff,
                         :dom50_diff, :fatigue_idx_diff, :fatigue_ratio, :mins_to_match,
                         :odds_shift_p1, :odds_shift_p2, :elo_vol_p1, :elo_vol_p2, :elo_vol_diff,
-                        :daily_trend_diff, :dom_trend_diff, :style_clash
+                        :daily_trend_diff, :dom_trend_diff, :style_clash,
+                        :hours_since_last_h2h, :sample_size, :league_upset_rate
                     )
                     ON CONFLICT (match_id) DO UPDATE SET
                         elo_p1 = EXCLUDED.elo_p1, elo_p2 = EXCLUDED.elo_p2, elo_diff = EXCLUDED.elo_diff,
@@ -915,6 +967,9 @@ class FeatureEngine:
                         daily_performance_trend_diff = EXCLUDED.daily_performance_trend_diff,
                         dominance_trend_diff = EXCLUDED.dominance_trend_diff,
                         style_clash = EXCLUDED.style_clash,
+                        hours_since_last_h2h = EXCLUDED.hours_since_last_h2h,
+                        sample_size = EXCLUDED.sample_size,
+                        league_upset_rate = EXCLUDED.league_upset_rate,
                         created_at = NOW()
                 """),
                 {
@@ -952,6 +1007,9 @@ class FeatureEngine:
                     "daily_trend_diff": features.daily_performance_trend_diff,
                     "dom_trend_diff": features.dominance_trend_diff,
                     "style_clash": features.style_clash,
+                    "hours_since_last_h2h": features.hours_since_last_h2h,
+                    "sample_size": features.sample_size,
+                    "league_upset_rate": getattr(features, "league_upset_rate", 0.5),
                 },
             )
             session.commit()

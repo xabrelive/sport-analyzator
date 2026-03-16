@@ -1,0 +1,4 @@
+<clickhouse>
+  <http_port replace="1">11003</http_port>
+  <tcp_port replace="1">11004</tcp_port>
+</clickhouse>

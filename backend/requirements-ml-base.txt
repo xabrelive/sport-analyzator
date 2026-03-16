@@ -1,0 +1,18 @@
+# Зависимости для ml_worker без lightgbm (LightGBM с CUDA ставится отдельно в Dockerfile).
+# Синхронизировано с pyproject.toml (кроме lightgbm).
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+psycopg2-binary>=2.9.0
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.5.0
+alembic>=1.14.0
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+email-validator>=2.0.0
+python-jose[cryptography]>=3.3.0
+bcrypt>=4.2.0
+httpx>=0.28.0
+clickhouse-connect>=0.8.10

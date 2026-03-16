@@ -25,4 +25,4 @@ UNION ALL SELECT 'league_performance', COUNT(*) FROM league_performance;
 " 2>/dev/null
 
 echo ""
-echo "Готово. tt_workers продолжат автодогрузку (ml_sync_loop каждые 60 сек)."
+echo "Готово. tt_workers продолжат автодогрузку (ml_sync_loop каждые 10 мин)."

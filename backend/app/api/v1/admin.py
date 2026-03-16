@@ -1,15 +1,18 @@
 """Admin API: superadmin-only service management."""
 from __future__ import annotations
 
+import os
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import httpx
 import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.auth import get_current_user
@@ -21,6 +24,12 @@ from app.models.invoice import Invoice
 from app.models.payment_method import PaymentMethod
 from app.models.user import User
 from app.models.user_subscription import UserSubscription
+from app.models.telegram_channel_notification import TelegramChannelNotification
+from app.models.telegram_channel_marker import TelegramChannelMarker
+from app.models.user_forecast_notification import UserForecastNotification
+from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
+from app.models.table_tennis_forecast_early_scan import TableTennisForecastEarlyScan
+from app.models.table_tennis_line_event import TableTennisLineEvent
 from app.services.email import send_html_email
 from app.services.telegram_channel_dispatcher import _load_dispatch_cfg
 from app.services.vip_channel_access import send_vip_invite_to_user
@@ -708,7 +717,7 @@ async def get_telegram_dispatch_config(
     session: AsyncSession = Depends(get_async_session),
 ):
     cfg = await _load_dispatch_cfg(session)
-    row = (await session.execute(select(AppSetting).where(AppSetting.key == DISPATCH_CFG_KEY))).scalar_one_or_none()
+    row = (await session.execute(select(AppSetting).where(AppSetting.key == DISPATCH_CFG_KEY))).scalars().one_or_none()
     has_saved = bool(row and (row.value or "").strip())
     try:
         raw_cfg = json.loads(row.value) if has_saved else None
@@ -730,7 +739,7 @@ async def put_telegram_dispatch_config(
     serialized = json.dumps(body.config, ensure_ascii=False)
     row = (
         await session.execute(select(AppSetting).where(AppSetting.key == DISPATCH_CFG_KEY))
-    ).scalar_one_or_none()
+    ).scalars().one_or_none()
     if row:
         row.value = serialized
     else:
@@ -750,7 +759,7 @@ async def get_telegram_bot_info(
     """Get the message shown in bot's «Получить информацию» button."""
     row = (
         await session.execute(select(AppSetting).where(AppSetting.key == BOT_INFO_KEY))
-    ).scalar_one_or_none()
+    ).scalars().one_or_none()
     return {"message": (row.value if row else "") or ""}
 
 
@@ -768,7 +777,7 @@ async def put_telegram_bot_info(
     val = (body.message or "").strip() or None
     row = (
         await session.execute(select(AppSetting).where(AppSetting.key == BOT_INFO_KEY))
-    ).scalar_one_or_none()
+    ).scalars().one_or_none()
     if row:
         row.value = val
     else:
@@ -802,13 +811,141 @@ async def admin_ml_sync_players(
 @router.post("/ml/load-archive")
 async def admin_ml_load_archive(
     _: User = Depends(require_superadmin),
-    days: int = Query(default=90, ge=1, le=365),
+    days: int | None = Query(default=None, ge=1, le=365),
+    date_from: str | None = Query(default=None, description="YYYYMMDD"),
+    date_to: str | None = Query(default=None, description="YYYYMMDD"),
 ):
-    """Загрузка завершённых матчей из архива BetsAPI в main DB. Нужно для первичного наполнения."""
+    """Загрузка завершённых матчей из архива BetsAPI в main DB. Нужно для первичного наполнения.
+    Либо days (дней назад), либо date_from+date_to."""
+    from datetime import date
     from app.services.betsapi_table_tennis import load_archive_to_main
 
-    result = await load_archive_to_main(days_back=days, max_pages_per_day=10)
+    if date_from and date_to:
+        df = date(int(date_from[:4]), int(date_from[4:6]), int(date_from[6:8]))
+        dt = date(int(date_to[:4]), int(date_to[4:6]), int(date_to[6:8]))
+        result = await load_archive_to_main(date_from=df, date_to=dt, max_pages_per_day=10)
+    else:
+        result = await load_archive_to_main(days_back=days or 90, max_pages_per_day=10)
     return {"ok": True, **result}
+
+
+def _compute_streaks(statuses: list[str]) -> dict:
+    """Считает серии подряд hit/miss. statuses — список 'hit'|'miss' в хронологическом порядке."""
+    max_streak_miss = 0
+    max_streak_hit = 0
+    current_streak_miss = 0
+    current_streak_hit = 0
+    run_miss = 0
+    run_hit = 0
+    for s in statuses:
+        if s == "miss":
+            run_miss += 1
+            run_hit = 0
+            max_streak_miss = max(max_streak_miss, run_miss)
+        else:
+            run_hit += 1
+            run_miss = 0
+            max_streak_hit = max(max_streak_hit, run_hit)
+    current_streak_miss = run_miss
+    current_streak_hit = run_hit
+    return {
+        "max_streak_miss": max_streak_miss,
+        "max_streak_hit": max_streak_hit,
+        "current_streak_miss": current_streak_miss,
+        "current_streak_hit": current_streak_hit,
+    }
+
+
+@router.get("/ml/no-ml-stats")
+async def admin_ml_no_ml_stats(
+    _: User = Depends(require_superadmin),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Статистика Аналитики без ML: угадано/не угадано всего и по лигам; серии промахов; лиги с % < 50%."""
+    from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
+    from app.models.table_tennis_line_event import TableTennisLineEvent
+
+    # Общие счётчики по каналу no_ml (case для условного подсчёта)
+    r = await session.execute(
+        select(
+            func.count(case((TableTennisForecastV2.status == "hit", 1))).label("hit"),
+            func.count(case((TableTennisForecastV2.status == "miss", 1))).label("miss"),
+        ).select_from(TableTennisForecastV2).where(
+            TableTennisForecastV2.channel == "no_ml",
+            TableTennisForecastV2.status.in_(["hit", "miss"]),
+        )
+    )
+    row = r.one()
+    total_hit = int(row.hit or 0)
+    total_miss = int(row.miss or 0)
+
+    # Серии не угадано / угадано: по одному исходу на матч (market=match), по времени начала матча
+    r_streak = await session.execute(
+        select(TableTennisForecastV2.status, TableTennisLineEvent.starts_at)
+        .select_from(TableTennisForecastV2)
+        .join(
+            TableTennisLineEvent,
+            TableTennisLineEvent.id == TableTennisForecastV2.event_id,
+        )
+        .where(
+            TableTennisForecastV2.channel == "no_ml",
+            TableTennisForecastV2.market == "match",
+            TableTennisForecastV2.status.in_(["hit", "miss"]),
+        )
+        .order_by(TableTennisLineEvent.starts_at.asc())
+    )
+    statuses = [row[0] for row in r_streak.fetchall()]
+    streaks = _compute_streaks(statuses) if statuses else {}
+
+    # По лигам: hit и miss на лигу
+    subq = (
+        select(
+            TableTennisLineEvent.league_id,
+            TableTennisLineEvent.league_name,
+            func.count(case((TableTennisForecastV2.status == "hit", 1))).label("hit"),
+            func.count(case((TableTennisForecastV2.status == "miss", 1))).label("miss"),
+        )
+        .select_from(TableTennisForecastV2)
+        .join(
+            TableTennisLineEvent,
+            TableTennisLineEvent.id == TableTennisForecastV2.event_id,
+        )
+        .where(
+            TableTennisForecastV2.channel == "no_ml",
+            TableTennisForecastV2.status.in_(["hit", "miss"]),
+        )
+        .group_by(TableTennisLineEvent.league_id, TableTennisLineEvent.league_name)
+    )
+    r = await session.execute(subq)
+    by_league = []
+    for x in r.all():
+        hit = int(x.hit or 0)
+        miss = int(x.miss or 0)
+        total = hit + miss
+        hit_rate_pct = round((hit / total) * 100, 1) if total else 0.0
+        by_league.append({
+            "league_id": x.league_id,
+            "league_name": x.league_name,
+            "hit": hit,
+            "miss": miss,
+            "total": total,
+            "hit_rate_pct": hit_rate_pct,
+        })
+    leagues_bad = [x for x in by_league if x["miss"] > x["hit"]]
+    leagues_bad.sort(key=lambda t: (t["miss"] - t["hit"], t["miss"]), reverse=True)
+    # Лиги с процентом угадывания < 50% и хотя бы 5 исходов — кандидаты на exclude или invert.
+    min_sample = 5
+    leagues_weak = [x for x in by_league if x["total"] >= min_sample and x["hit_rate_pct"] < 50]
+    leagues_weak.sort(key=lambda t: (t["hit_rate_pct"], -t["total"]))
+
+    return {
+        "total_hit": total_hit,
+        "total_miss": total_miss,
+        "streaks": streaks,
+        "leagues_bad": leagues_bad,
+        "leagues_weak": leagues_weak,
+        "by_league": by_league,
+    }
 
 
 @router.get("/ml/verify")
@@ -919,6 +1056,291 @@ async def admin_ml_stats(
         s.close()
 
 
+@router.get("/ml/sync-audit")
+async def admin_ml_sync_audit(
+    _: User = Depends(require_superadmin),
+    sample_limit: int = Query(default=5000, ge=100, le=200000),
+    missing_preview: int = Query(default=20, ge=1, le=200),
+):
+    """Ручная сверка покрытия main↔ML и preview пропущенных матчей."""
+    from app.ml.db import get_ml_session
+    from app.db.session import async_session_maker
+
+    main_finished = 0
+    main_players = 0
+    main_leagues = 0
+    recent_main_ids: list[str] = []
+
+    async with async_session_maker() as session:
+        r = await session.execute(
+            text(
+                "SELECT COUNT(*) FROM table_tennis_line_events "
+                "WHERE status='finished' AND live_sets_score IS NOT NULL"
+            )
+        )
+        main_finished = int(r.scalar_one() or 0)
+        r = await session.execute(
+            text(
+                "SELECT COUNT(*) FROM ("
+                " SELECT home_id AS pid FROM table_tennis_line_events WHERE home_id IS NOT NULL AND TRIM(home_id) != ''"
+                " UNION"
+                " SELECT away_id AS pid FROM table_tennis_line_events WHERE away_id IS NOT NULL AND TRIM(away_id) != ''"
+                ") t"
+            )
+        )
+        main_players = int(r.scalar_one() or 0)
+        r = await session.execute(
+            text(
+                "SELECT COUNT(DISTINCT league_id) FROM table_tennis_line_events "
+                "WHERE league_id IS NOT NULL AND TRIM(league_id) != ''"
+            )
+        )
+        main_leagues = int(r.scalar_one() or 0)
+        rows = await session.execute(
+            text(
+                "SELECT id FROM table_tennis_line_events "
+                "WHERE status='finished' AND live_sets_score IS NOT NULL "
+                "ORDER BY starts_at DESC LIMIT :lim"
+            ),
+            {"lim": sample_limit},
+        )
+        recent_main_ids = [str(x[0]) for x in rows.all()]
+
+    ml_session = get_ml_session()
+    try:
+        ml_matches = _ml_table_count(ml_session, "matches")
+        ml_players = _ml_table_count(ml_session, "players")
+        ml_leagues = _ml_table_count(ml_session, "leagues")
+
+        existing_recent: set[str] = set()
+        if recent_main_ids:
+            rows = ml_session.execute(
+                text("SELECT external_id FROM matches WHERE external_id = ANY(:ids)"),
+                {"ids": recent_main_ids},
+            ).fetchall()
+            existing_recent = {str(x[0]) for x in rows}
+        missing_recent = [eid for eid in recent_main_ids if eid not in existing_recent]
+    finally:
+        ml_session.close()
+
+    return {
+        "main_finished_events": main_finished,
+        "ml_matches": ml_matches,
+        "delta_matches_main_minus_ml": main_finished - ml_matches,
+        "main_players": main_players,
+        "ml_players": ml_players,
+        "delta_players_main_minus_ml": main_players - ml_players,
+        "main_leagues": main_leagues,
+        "ml_leagues": ml_leagues,
+        "delta_leagues_main_minus_ml": main_leagues - ml_leagues,
+        "recent_sample_checked": len(recent_main_ids),
+        "recent_missing_count": len(missing_recent),
+        "recent_missing_preview": missing_recent[:missing_preview],
+    }
+
+
+@router.post("/ml/request-full-sync")
+async def admin_ml_request_full_sync(
+    _: User = Depends(require_superadmin),
+):
+    """Ставит флаг: следующий проход ml_sync_loop выполнит полный sync."""
+    from app.db.session import async_session_maker
+
+    async with async_session_maker() as session:
+        row = (
+            await session.execute(
+                select(AppSetting).where(AppSetting.key == "ml_sync_force_full_once")
+            )
+        ).scalar_one_or_none()
+        if row:
+            row.value = "1"
+        else:
+            session.add(AppSetting(key="ml_sync_force_full_once", value="1"))
+        await session.commit()
+    return {"ok": True, "message": "Флаг full sync установлен. Будет выполнен на следующем цикле ml_sync_loop."}
+
+
+@router.post("/forecasts/clear-all")
+async def admin_forecasts_clear_all(
+    _: User = Depends(require_superadmin),
+):
+    """Удаляет все прогнозы V2, статистику каналов и денормализованные поля.
+    После вызова forecast_v2_loop и no_ml_forecast_loop заново рассчитают и покажут прогнозы."""
+    from app.db.session import async_session_maker
+
+    async with async_session_maker() as session:
+        # Логи публикаций в каналах (free, vip, no_ml)
+        r1 = await session.execute(delete(TelegramChannelNotification))
+        n_notif = r1.rowcount
+        # Логи доставки пользователям (telegram/email)
+        r2 = await session.execute(delete(UserForecastNotification))
+        n_user_notif = r2.rowcount
+        # Маркеры слотов каналов (чтобы снова публиковать)
+        r3 = await session.execute(delete(TelegramChannelMarker))
+        n_markers = r3.rowcount
+        # Прогнозы V2 (CASCADE удалит table_tennis_forecast_explanations)
+        r4 = await session.execute(delete(TableTennisForecastV2))
+        n_forecasts = r4.rowcount
+        # Денормализованные forecast/forecast_confidence на матчах
+        r5 = await session.execute(
+            update(TableTennisLineEvent).where(
+                or_(
+                    TableTennisLineEvent.forecast.is_not(None),
+                    TableTennisLineEvent.forecast_confidence.is_not(None),
+                )
+            ).values(forecast=None, forecast_confidence=None)
+        )
+        n_line_cleared = r5.rowcount
+        # Ранний скрининг (заново заполнится early_scan_loop)
+        r6 = await session.execute(delete(TableTennisForecastEarlyScan))
+        n_early_scan = r6.rowcount
+        await session.commit()
+
+    return {
+        "ok": True,
+        "message": "Все прогнозы и статистика каналов удалены. Прогнозы будут заново рассчитаны в следующих циклах forecast_v2_loop и no_ml_forecast_loop.",
+        "deleted": {
+            "telegram_channel_notifications": n_notif,
+            "user_forecast_notifications": n_user_notif,
+            "telegram_channel_markers": n_markers,
+            "table_tennis_forecasts_v2": n_forecasts,
+            "line_events_forecast_cleared": n_line_cleared,
+            "table_tennis_forecast_early_scan": n_early_scan,
+        },
+    }
+
+
+@router.post("/forecasts/clear-ml")
+async def admin_forecasts_clear_ml(
+    _: User = Depends(require_superadmin),
+):
+    """Удаляет только ML прогнозы/статистику (paid/free/vip/bot_signals), не трогая no_ml."""
+    from app.db.session import async_session_maker
+
+    no_ml_channels = ("no_ml", "no_ml_channel")
+    ml_channel_notifications = ("free", "vip")
+
+    async with async_session_maker() as session:
+        ml_forecast_ids_subq = select(TableTennisForecastV2.id).where(
+            ~TableTennisForecastV2.channel.in_(no_ml_channels)
+        )
+
+        r1 = await session.execute(
+            delete(TelegramChannelNotification).where(
+                TelegramChannelNotification.channel.in_(ml_channel_notifications)
+            )
+        )
+        n_notif = r1.rowcount
+
+        r2 = await session.execute(
+            delete(UserForecastNotification).where(
+                UserForecastNotification.forecast_v2_id.in_(ml_forecast_ids_subq)
+            )
+        )
+        n_user_notif = r2.rowcount
+
+        r3 = await session.execute(
+            delete(TelegramChannelMarker).where(
+                TelegramChannelMarker.channel.in_(ml_channel_notifications)
+            )
+        )
+        n_markers = r3.rowcount
+
+        r4 = await session.execute(
+            delete(TableTennisForecastV2).where(
+                ~TableTennisForecastV2.channel.in_(no_ml_channels)
+            )
+        )
+        n_forecasts = r4.rowcount
+
+        r5 = await session.execute(
+            update(TableTennisLineEvent)
+            .where(
+                or_(
+                    TableTennisLineEvent.forecast.is_not(None),
+                    TableTennisLineEvent.forecast_confidence.is_not(None),
+                )
+            )
+            .values(forecast=None, forecast_confidence=None)
+        )
+        n_line_cleared = r5.rowcount
+
+        r6 = await session.execute(delete(TableTennisForecastEarlyScan))
+        n_early_scan = r6.rowcount
+
+        await session.commit()
+
+    return {
+        "ok": True,
+        "message": "ML прогнозы и ML статистика очищены. no_ml данные сохранены.",
+        "deleted": {
+            "telegram_channel_notifications": n_notif,
+            "user_forecast_notifications": n_user_notif,
+            "telegram_channel_markers": n_markers,
+            "table_tennis_forecasts_v2": n_forecasts,
+            "line_events_forecast_cleared": n_line_cleared,
+            "table_tennis_forecast_early_scan": n_early_scan,
+        },
+    }
+
+
+@router.post("/forecasts/clear-no-ml")
+async def admin_forecasts_clear_no_ml(
+    _: User = Depends(require_superadmin),
+):
+    """Удаляет только no_ml прогнозы/статистику, не трогая ML."""
+    from app.db.session import async_session_maker
+
+    no_ml_channels = ("no_ml", "no_ml_channel")
+    no_ml_channel_notifications = ("no_ml_channel",)
+
+    async with async_session_maker() as session:
+        no_ml_forecast_ids_subq = select(TableTennisForecastV2.id).where(
+            TableTennisForecastV2.channel.in_(no_ml_channels)
+        )
+
+        r1 = await session.execute(
+            delete(TelegramChannelNotification).where(
+                TelegramChannelNotification.channel.in_(no_ml_channel_notifications)
+            )
+        )
+        n_notif = r1.rowcount
+
+        r2 = await session.execute(
+            delete(UserForecastNotification).where(
+                UserForecastNotification.forecast_v2_id.in_(no_ml_forecast_ids_subq)
+            )
+        )
+        n_user_notif = r2.rowcount
+
+        r3 = await session.execute(
+            delete(TelegramChannelMarker).where(
+                TelegramChannelMarker.channel.in_(no_ml_channel_notifications)
+            )
+        )
+        n_markers = r3.rowcount
+
+        r4 = await session.execute(
+            delete(TableTennisForecastV2).where(
+                TableTennisForecastV2.channel.in_(no_ml_channels)
+            )
+        )
+        n_forecasts = r4.rowcount
+
+        await session.commit()
+
+    return {
+        "ok": True,
+        "message": "no_ml прогнозы и no_ml статистика очищены. ML данные сохранены.",
+        "deleted": {
+            "telegram_channel_notifications": n_notif,
+            "user_forecast_notifications": n_user_notif,
+            "telegram_channel_markers": n_markers,
+            "table_tennis_forecasts_v2": n_forecasts,
+        },
+    }
+
+
 @router.get("/ml/dashboard")
 async def admin_ml_dashboard(
     _: User = Depends(require_superadmin),
@@ -989,6 +1411,74 @@ async def admin_ml_dashboard(
         "leagues": main_counts["leagues"] - tables.get("leagues", 0),
     }
     sync_ok = diff["matches"] <= 0 and diff["players"] <= 0 and diff["leagues"] <= 0
+    meta: dict[str, str] = {}
+    try:
+        async with async_session_maker() as session:
+            rows = (
+                await session.execute(
+                    select(AppSetting).where(
+                        AppSetting.key.in_(
+                            [
+                                "ml_last_sync_at_ts",
+                                "ml_last_autosync_at_ts",
+                                "ml_last_sync_synced",
+                                "ml_last_sync_skipped",
+                                "ml_last_sync_full",
+                                "ml_last_data_pull_at_ts",
+                                "ml_last_data_pull_total",
+                                "ml_last_data_pull_odds",
+                                "ml_last_data_pull_features",
+                                "ml_last_retrain_at_ts",
+                                "ml_last_retrain_trained",
+                                "ml_last_retrain_rows",
+                                "ml_last_retrain_path",
+                                "ml_last_model_created_at_ts",
+                                "ml_last_odds_backfill_at_ts",
+                                "ml_last_odds_backfill_added_total",
+                                "ml_last_odds_backfill_api_total",
+                                "ml_last_odds_backfill_cursor",
+                                "ml_v2_last_sync_at_ts",
+                                "ml_v2_last_retrain_at_ts",
+                                "ml_v2_last_retrain_requested_at_ts",
+                                "ml_v2_last_retrain_trained",
+                                "ml_v2_last_retrain_rows",
+                                "ml_v2_last_model_created_at_ts",
+                                "ml_v2_last_retrain_device",
+                                "ml_v2_last_kpi",
+                            ]
+                        )
+                    )
+                )
+            ).scalars().all()
+        for r in rows:
+            meta[str(r.key)] = str(r.value or "")
+    except Exception:
+        pass
+    meta["ml_engine"] = str(getattr(settings, "ml_engine", "v1"))
+
+    # Если модель обучали вручную (docker run ml_train_gpu), метки в БД не обновляются.
+    # Подтягиваем время последней модели с диска, чтобы админка показывала актуальные даты.
+    try:
+        model_dir = getattr(settings, "ml_model_dir", None) or os.environ.get("ML_MODEL_DIR", "")
+        if model_dir and Path(model_dir).is_dir():
+            latest_ts = 0
+            for p in Path(model_dir).glob("tt_ml_*.joblib"):
+                try:
+                    mtime = int(p.stat().st_mtime)
+                    if mtime > latest_ts:
+                        latest_ts = mtime
+                except OSError:
+                    continue
+            if latest_ts > 0:
+                db_created = int(meta.get("ml_last_model_created_at_ts") or 0)
+                if latest_ts >= db_created:
+                    meta["ml_last_model_created_at_ts"] = str(latest_ts)
+                db_retrain = int(meta.get("ml_last_retrain_at_ts") or 0)
+                if latest_ts > db_retrain:
+                    meta["ml_last_retrain_at_ts"] = str(latest_ts)
+                    meta["ml_last_retrain_trained"] = "1"
+    except Exception:
+        pass
 
     return {
         "tables": tables,
@@ -998,7 +1488,248 @@ async def admin_ml_dashboard(
         "sync_ok": sync_ok,
         "progress": get_progress(),
         "queue_size": queue_size(),
+        "meta": meta,
     }
+
+
+@router.get("/ml/v2/status")
+async def admin_ml_v2_status(
+    _: User = Depends(require_superadmin),
+):
+    """Статус ML v2: ClickHouse таблицы, мета автосинка/retrain, очередь, KPI."""
+    from app.db.session import async_session_maker
+    from app.ml_v2.ch_client import get_ch_client
+    from app.services.ml_progress import get_progress
+    from app.services.ml_queue import queue_size
+
+    tables: dict[str, int] = {
+        "matches": 0,
+        "match_sets": 0,
+        "match_features": 0,
+        "player_match_stats": 0,
+        "player_daily_stats": 0,
+        "player_elo_history": 0,
+        "match_sets_uniq_matches": 0,
+        "matches_uniq_matches": 0,
+        "match_sets_gap_count": 0,
+    }
+    ch_ok = True
+    ch_error = ""
+    try:
+        client = get_ch_client()
+        for table in (
+            "matches",
+            "match_sets",
+            "match_features",
+            "player_match_stats",
+            "player_daily_stats",
+            "player_elo_history",
+        ):
+            try:
+                rows = client.query(f"SELECT count() FROM ml.{table}").result_rows
+                tables[table] = int((rows[0][0] if rows else 0) or 0)
+            except Exception:
+                pass
+        try:
+            set_uniq_rows = client.query("SELECT uniqExact(match_id) FROM ml.match_sets").result_rows
+            tables["match_sets_uniq_matches"] = int((set_uniq_rows[0][0] if set_uniq_rows else 0) or 0)
+        except Exception:
+            pass
+        try:
+            mu = client.query("SELECT uniqExact(match_id) FROM ml.matches").result_rows
+            tables["matches_uniq_matches"] = int((mu[0][0] if mu else 0) or 0)
+        except Exception:
+            tables["matches_uniq_matches"] = int(tables.get("matches", 0))
+        tables["match_sets_gap_count"] = max(0, int(tables.get("matches_uniq_matches", 0)) - int(tables.get("match_sets_uniq_matches", 0)))
+    except Exception as exc:
+        ch_ok = False
+        ch_error = str(exc)
+
+    main_finished = 0
+    async with async_session_maker() as session:
+        r = await session.execute(
+            text(
+                "SELECT COUNT(*) FROM table_tennis_line_events "
+                "WHERE status='finished' AND live_sets_score IS NOT NULL"
+            )
+        )
+        main_finished = int(r.scalar_one() or 0)
+
+        meta_rows = (
+            await session.execute(
+                select(AppSetting).where(
+                    AppSetting.key.in_(
+                        [
+                            "ml_v2_last_sync_at_ts",
+                            "ml_v2_last_retrain_requested_at_ts",
+                            "ml_v2_last_retrain_at_ts",
+                            "ml_v2_last_retrain_trained",
+                            "ml_v2_last_retrain_rows",
+                            "ml_v2_last_model_created_at_ts",
+                            "ml_v2_last_retrain_device",
+                            "ml_v2_last_kpi",
+                        ]
+                    )
+                )
+            )
+        ).scalars().all()
+
+    meta: dict[str, str] = {str(row.key): str(row.value or "") for row in meta_rows}
+    kpi: dict[str, float] = {}
+    try:
+        raw_kpi = meta.get("ml_v2_last_kpi")
+        if raw_kpi:
+            parsed = json.loads(raw_kpi)
+            if isinstance(parsed, dict):
+                kpi = {
+                    "match_hit_rate": float(parsed.get("match_hit_rate", 0.0) or 0.0),
+                    "set1_hit_rate": float(parsed.get("set1_hit_rate", 0.0) or 0.0),
+                    "sample_size": float(parsed.get("sample_size", parsed.get("n", 0.0)) or 0.0),
+                }
+    except Exception:
+        kpi = {}
+
+    model_dir = Path(getattr(settings, "ml_model_dir", "/tmp/pingwin_ml_models"))
+    v2_meta: dict[str, Any] = {}
+    meta_path = model_dir / "tt_ml_v2_meta.json"
+    if meta_path.exists():
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                v2_meta = json.load(f)
+        except Exception:
+            v2_meta = {}
+
+    return {
+        "engine": str(getattr(settings, "ml_engine", "v1")),
+        "queue_size": queue_size(),
+        "progress": get_progress(),
+        "clickhouse_ok": ch_ok,
+        "clickhouse_error": ch_error,
+        "tables": tables,
+        "main_finished": int(main_finished),
+        "delta_main_minus_ch_matches": int(main_finished - int(tables.get("matches", 0))),
+        "delta_ch_matches_minus_features": int(int(tables.get("matches", 0)) - int(tables.get("match_features", 0))),
+        "delta_ch_matches_minus_match_sets": int(tables.get("match_sets_gap_count", max(0, int(tables.get("matches", 0)) - int(tables.get("match_sets_uniq_matches", 0))))),
+        "match_sets_gap_pct": round(
+            100.0 * max(0, int(tables.get("match_sets_gap_count", 0))) / max(1, int(tables.get("matches_uniq_matches", tables.get("matches", 1)))),
+            2,
+        ),
+        "match_sets_gap_alert": bool(int(tables.get("match_sets_gap_count", 0)) > 0),
+        "delta_main_minus_ch_features": int(main_finished - int(tables.get("match_features", 0))),
+        "meta": meta,
+        "kpi": kpi,
+        "v2_config": {
+            "ml_v2_use_experience_regimes": bool(getattr(settings, "ml_v2_use_experience_regimes", False)),
+            "ml_v2_experience_regime_min_train": int(getattr(settings, "ml_v2_experience_regime_min_train", 500)),
+            "betsapi_table_tennis_v2_confidence_filter_min_pct": float(getattr(settings, "betsapi_table_tennis_v2_confidence_filter_min_pct", 0) or 0),
+            "betsapi_table_tennis_v2_min_confidence_to_publish": float(getattr(settings, "betsapi_table_tennis_v2_min_confidence_to_publish", 0) or 0),
+            "betsapi_table_tennis_v2_allow_hard_confidence_fallback": bool(getattr(settings, "betsapi_table_tennis_v2_allow_hard_confidence_fallback", False)),
+            "ml_v2_train_max_league_upset_rate": float(getattr(settings, "ml_v2_train_max_league_upset_rate", 0.45)),
+        },
+        "v2_meta": v2_meta,
+    }
+
+
+@router.get("/ml/verify-models")
+async def admin_ml_verify_models(
+    _: User = Depends(require_superadmin),
+    version: str = Query(default="", description="Версия моделей: v2 (по умолчанию) или v1"),
+):
+    """Проверка загруженных моделей: фичи, классы, число деревьев. Убедиться, что обучение прошло корректно."""
+    from app.ml.model_trainer import load_models, _model_summary, FEATURE_COLS
+    from app.ml_v2.features import FEATURE_COLS_V2, FEATURE_COLS_V2_TRAIN
+    from pathlib import Path
+    from app.config import settings
+    import json
+
+    version = (version or str(getattr(settings, "ml_engine", "v2"))).strip().lower()
+    if version not in {"v1", "v2"}:
+        version = "v2"
+
+    model_dir = Path(getattr(settings, "ml_model_dir", None) or __import__("os").environ.get("ML_MODEL_DIR", "/tmp/pingwin_ml_models"))
+    prefix = model_dir / f"tt_ml_{version}"
+    meta_path = Path(str(prefix) + "_meta.json")
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            pass
+
+    if version == "v2":
+        import joblib
+
+        match_path = model_dir / "tt_ml_v2_match.joblib"
+        set1_path = model_dir / "tt_ml_v2_set1.joblib"
+        if not (match_path.exists() and set1_path.exists()):
+            return {"ok": False, "error": "ML v2 models not found", "version": version, "meta": meta}
+        match_model = joblib.load(match_path)
+        set1_model = joblib.load(set1_path)
+        # LightGBM sklearn wrapper stores training names in feature_name_.
+        match_names = list(getattr(match_model, "feature_name_", []) or [])
+        set1_names = list(getattr(set1_model, "feature_name_", []) or [])
+        report = {
+            "ok": True,
+            "version": version,
+            "model_dir": str(model_dir),
+            "expected_features_count": len(FEATURE_COLS_V2_TRAIN),
+            "meta_training_features": len(meta.get("features") or []),
+            "models": {
+                "match": {
+                    "loaded": True,
+                    "n_features": len(match_names),
+                    "best_iteration": int(getattr(match_model, "best_iteration_", 0) or 0),
+                    "n_estimators": int(getattr(match_model, "n_estimators_", 0) or 0),
+                },
+                "set1": {
+                    "loaded": True,
+                    "n_features": len(set1_names),
+                    "best_iteration": int(getattr(set1_model, "best_iteration_", 0) or 0),
+                    "n_estimators": int(getattr(set1_model, "n_estimators_", 0) or 0),
+                },
+            },
+        }
+        report["warnings"] = []
+        if report["models"]["match"]["n_features"] != len(FEATURE_COLS_V2):
+            report["warnings"].append(
+                f"match: n_features={report['models']['match']['n_features']}, ожидается {len(FEATURE_COLS_V2)}"
+            )
+        if report["models"]["set1"]["n_features"] != len(FEATURE_COLS_V2):
+            report["warnings"].append(
+                f"set1: n_features={report['models']['set1']['n_features']}, ожидается {len(FEATURE_COLS_V2)}"
+            )
+        return report
+
+    try:
+        match_model, set1_model, set_model, p_point_model = load_models(version=version)
+    except FileNotFoundError as e:
+        return {"ok": False, "error": str(e), "meta": meta}
+
+    report = {
+        "ok": True,
+        "version": version,
+        "model_dir": str(model_dir),
+        "expected_features_count": len(FEATURE_COLS),
+        "meta_training_features": len(meta.get("training_features") or meta.get("features") or []),
+        "models": {
+            "match": _model_summary("match", match_model),
+            "set1": _model_summary("set1", set1_model),
+            "set": _model_summary("set", set_model),
+            "p_point": _model_summary("p_point", p_point_model),
+        },
+    }
+    # Проверка согласованности
+    n_match = report["models"]["match"].get("n_features") or 0
+    n_set1 = report["models"]["set1"].get("n_features") or 0
+    report["warnings"] = []
+    if n_match > 0 and n_match != len(FEATURE_COLS):
+        report["warnings"].append(f"match: n_features={n_match}, ожидается {len(FEATURE_COLS)}")
+    if n_set1 > 0 and n_set1 != len(FEATURE_COLS):
+        report["warnings"].append(f"set1: n_features={n_set1}, ожидается {len(FEATURE_COLS)}")
+    for name, s in report["models"].items():
+        if s.get("missing_vs_feature_cols"):
+            report["warnings"].append(f"{name}: отсутствуют фичи в обучении: {s['missing_vs_feature_cols'][:8]}")
+    return report
 
 
 @router.get("/ml/progress")
@@ -1011,7 +1742,7 @@ async def admin_ml_progress(_: User = Depends(require_superadmin)):
 @router.post("/ml/reset-progress")
 async def admin_ml_reset_progress(
     _: User = Depends(require_superadmin),
-    op: str | None = Query(default=None, description="sync|backfill|retrain|full_rebuild или пусто=все"),
+    op: str | None = Query(default=None, description="sync|backfill|odds_backfill|retrain|full_rebuild или пусто=все"),
 ):
     """Сброс зависшего прогресса. Используйте если retrain/sync «застрял» в статусе running."""
     from app.services.ml_progress import reset_progress
@@ -1037,6 +1768,30 @@ async def admin_ml_sync(
     return {"ok": True, "message": "Задача добавлена в очередь"}
 
 
+@router.post("/ml/recompute-elo")
+async def admin_ml_recompute_elo(_: User = Depends(require_superadmin)):
+    """Пересчёт рейтинга игроков (Elo) с первого матча по ml.matches. Источник истины — только ml.matches ORDER BY start_time."""
+    from app.ml_v2.sync import recompute_elo_from_matches
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, recompute_elo_from_matches)
+    return {"ok": True, **result}
+
+
+@router.post("/ml/v2/backfill-match-sets")
+async def admin_ml_v2_backfill_match_sets(
+    _: User = Depends(require_superadmin),
+    limit: int = Query(default=5000, ge=100, le=20000, description="Макс. матчей без сетов за один проход"),
+):
+    """Дозаполняет ml.match_sets для матчей из ml.matches, у которых нет записей в match_sets.
+    Источник: main DB (TableTennisLineEvent.live_sets_score, live_score). Возвращает filled, sets_inserted, remaining."""
+    from app.ml_v2.sync import backfill_match_sets_from_main
+
+    result = await backfill_match_sets_from_main(limit=limit)
+    return {"ok": True, **result}
+
+
 @router.post("/ml/backfill-features")
 async def admin_ml_backfill_features(
     _: User = Depends(require_superadmin),
@@ -1057,10 +1812,61 @@ async def admin_ml_backfill_features(
     return {"ok": True, "message": "Задача добавлена в очередь"}
 
 
+@router.post("/ml/odds-backfill-bg")
+async def admin_ml_odds_backfill_bg(
+    _: User = Depends(require_superadmin),
+    limit: int = Query(default=5000, ge=100, le=20000, description="Размер батча по матчам"),
+    batches: int = Query(default=100, ge=1, le=1000, description="Макс. число батчей за запуск"),
+    pause_ms: int = Query(default=600, ge=0, le=5000, description="Пауза между батчами, мс"),
+):
+    """Фоновая догрузка odds (курсорно, с fallback через BetsAPI). Задача в очередь."""
+    from app.services.ml_progress import is_running
+    from app.services.ml_queue import enqueue
+
+    if is_running("odds_backfill"):
+        return {"ok": False, "error": "Фоновая догрузка odds уже выполняется"}
+    if not enqueue("odds_backfill", {"limit": limit, "batches": batches, "pause_ms": pause_ms}):
+        return {"ok": False, "error": "Не удалось добавить в очередь"}
+    return {"ok": True, "message": "Фоновая догрузка odds добавлена в очередь"}
+
+
+@router.post("/ml/hyperparameter-search")
+async def admin_ml_hyperparameter_search(
+    _: User = Depends(require_superadmin),
+    n_iter: int = Query(default=25, ge=5, le=100),
+    limit: int = Query(default=100_000, ge=5000, le=500_000),
+):
+    """Поиск гиперпараметров LightGBM (RandomizedSearchCV). Сохраняет лучшие в tt_ml_hyperparams.json. Может занять 10–30 мин."""
+    from app.ml.model_trainer import load_training_data, run_hyperparameter_search
+    from app.config import settings
+
+    train_start = int(getattr(settings, "ml_train_year_start", 2017))
+    train_end = int(getattr(settings, "ml_train_year_end", 2022))
+    val_start_cfg = int(getattr(settings, "ml_val_year_start", 2023))
+    if train_end >= val_start_cfg:
+        train_end = max(train_start, val_start_cfg - 1)
+    warmup_end = int(getattr(settings, "ml_warmup_year_end", 2016))
+    odds_min = float(getattr(settings, "ml_train_odds_min", 0.0) or 0.0)
+    odds_max = float(getattr(settings, "ml_train_odds_max", 999.0) or 999.0)
+    df = load_training_data(
+        limit=limit,
+        train_year_start=train_start,
+        train_year_end=train_end,
+        warmup_year_end=warmup_end,
+        odds_min=odds_min,
+        odds_max=odds_max,
+    )
+    if len(df) < 3000:
+        return {"ok": False, "error": f"Мало данных: {len(df)} строк. Нужно минимум 3000."}
+    use_gpu = getattr(settings, "ml_use_gpu", True)
+    best = run_hyperparameter_search(df, target_col="target_match", n_iter=n_iter, use_gpu=use_gpu)
+    return {"ok": True, "best_params": best, "rows_used": len(df)}
+
+
 @router.post("/ml/retrain")
 async def admin_ml_retrain(
     _: User = Depends(require_superadmin),
-    min_rows: int = Query(default=100, ge=50, le=10000),
+    min_rows: int = Query(default=500, ge=50, le=500_000),
 ):
     """Переобучение ML-моделей. Задача идёт в очередь."""
     from app.services.ml_progress import is_running
@@ -1069,8 +1875,11 @@ async def admin_ml_retrain(
     if is_running("retrain"):
         return {"ok": False, "error": "Переобучение уже выполняется"}
     if not enqueue("retrain", {"min_rows": min_rows}):
-        return {"ok": False, "error": "Не удалось добавить в очередь"}
-    return {"ok": True, "message": "Задача добавлена в очередь"}
+        return {
+            "ok": False,
+            "error": "Не удалось добавить в очередь. Проверьте, что контейнер backend имеет volume с ML_MODEL_DIR (как в docker-compose) и ml_worker запущен.",
+        }
+    return {"ok": True, "message": "Задача добавлена в очередь. Выполнит ml_worker в течение ~5 сек (обучение 5–15 мин)."}
 
 
 @router.get("/ml/league-performance")

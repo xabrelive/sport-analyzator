@@ -166,7 +166,7 @@ def update_league_performance_once(limit: int = 100_000) -> int:
 
             for side, p, odds in [("p1", p_match, o1), ("p2", 1 - p_match, o2)]:
                 ev = expected_value(p, odds)
-                if ev >= 0.08 and 1.6 <= odds <= 2.6:
+                if ev >= 0.08 and 1.5 <= odds <= 3.0:
                     won = (side == "p1" and p1_won) or (side == "p2" and not p1_won)
                     profit = (odds - 1) if won else -1
                     by_league.setdefault(league_id, []).append((won, ev, odds))

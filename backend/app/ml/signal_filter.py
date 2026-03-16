@@ -1,4 +1,6 @@
-"""Signal Filter: P_model > 0.72, EV > 0.08, confidence > 0.7, league_roi > 5%."""
+"""Signal Filter: edge > 0.05, EV > 0.08, odds 1.5–3.0, fatigue_ratio < 2, league_upset_rate < 40%.
+
+После фильтрации остаётся 8–15% матчей, ROI резко растёт."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,14 +12,16 @@ from app.ml.value_detector import ValueResult
 @dataclass
 class FilterConfig:
     min_probability: float = 0.72
-    min_ev: float = 0.08
-    min_edge: float = 0.05  # edge = P_model - P_market. model=65% market=63% → не value; model=65% market=50% → сильный
+    min_ev: float = 0.08  # EV > 0.08
+    min_edge: float = 0.05  # edge = P_model - P_market
     min_confidence: float = 0.7
     min_sample_size: int = 50
     min_player_matches: int = 100  # новые игроки ломают модель
-    min_odds: float = 1.6
-    max_odds: float = 2.6  # золотая зона 1.6–2.6 (лучше 1.7–2.4)
+    min_odds: float = 1.5  # золотая зона 1.5–3.0
+    max_odds: float = 3.0
     require_league_roi: bool = True
+    max_fatigue_ratio: float = 2.0  # fatigue_ratio >= 2 → один игрок сильно уставший, скип
+    max_league_upset_rate: float = 0.4  # league_upset_rate > 40% → нестабильная лига, скип
 
 
 def confidence_score(
@@ -50,10 +54,11 @@ class SignalFilter:
         daily_performance_trend_p2: float | None = None,
         matches_played_p1: int | None = None,
         matches_played_p2: int | None = None,
+        fatigue_ratio: float | None = None,
+        league_upset_rate: float | None = None,
     ) -> bool:
         """Проверяет, проходит ли сигнал фильтр.
-        volatility_filter: player_std > threshold → confidence ↓.
-        daily_performance_trend < -0.3 → игрок сливает, confidence ↓."""
+        Обязательно: edge > 0.05, EV > 0.08, odds 1.5–3.0, fatigue_ratio < 2, league_upset_rate < 40%."""
         if value.probability < self.config.min_probability:
             return False
         if value.expected_value < self.config.min_ev:
@@ -61,6 +66,13 @@ class SignalFilter:
         edge = value.probability - (1.0 / value.odds) if value.odds > 1e-9 else 0.0
         if edge < self.config.min_edge:
             return False
+        if value.odds < self.config.min_odds or value.odds > self.config.max_odds:
+            return False
+        if fatigue_ratio is not None and fatigue_ratio >= self.config.max_fatigue_ratio:
+            return False  # один игрок сильно уставший — нестабильный сигнал
+        if league_upset_rate is not None and league_upset_rate > self.config.max_league_upset_rate:
+            return False  # лига с >40% апсетов — нестабильная, скип
+
         conf = confidence
         if daily_performance_trend_p1 is not None and daily_performance_trend_p2 is not None:
             trend = daily_performance_trend_p1 if value.side == "p1" else daily_performance_trend_p2
@@ -75,8 +87,6 @@ class SignalFilter:
         if matches_played_p1 is not None and matches_played_p2 is not None:
             if min(matches_played_p1, matches_played_p2) < self.config.min_player_matches:
                 return False
-        if value.odds < self.config.min_odds or value.odds > self.config.max_odds:
-            return False
         if self.config.require_league_roi and league_id:
             from app.ml.league_performance import league_passes_filter
             if not league_passes_filter(league_id):

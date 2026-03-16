@@ -77,11 +77,11 @@ ML-система предсказывает исходы предстоящих
 └─────────────────────────────────────────────────────────────────────────────┘
          ↑ main→ML sync
          │
-    ml_sync_loop (в tt_workers, каждые ~60 сек)
+    ml_sync_loop (в tt_workers, каждые ML_SYNC_INTERVAL_SEC, по умолчанию 10 мин)
     ml_worker full-rebuild (по запросу)
 ```
 
-**ML-таблицы** заполняются на каждой итерации `ml_sync_loop` (каждые ~60 сек):
+**ML-таблицы** заполняются на каждой итерации `ml_sync_loop` (каждые 10 мин по умолчанию):
 
 ```
 main DB (finished матчи) → sync_finished_to_ml / sync_full_main_to_ml
@@ -560,7 +560,7 @@ dominance_trend_diff, style_clash
 
 ## 14. Обновление данных и переобучение
 
-### ml_sync_loop (каждые 60 сек)
+### ml_sync_loop (каждые 10 мин по умолчанию)
 
 **ML только читает из main DB.** BetsAPI не используется. Все таблицы заполняются автоматически:
 
@@ -589,7 +589,7 @@ dominance_trend_diff, style_clash
 
 | Параметр | По умолчанию |
 |----------|--------------|
-| ml_sync_interval_sec | 60 |
+| ml_sync_interval_sec | 600 (10 мин) |
 | ml_sync_days_back | 0 (весь архив) |
 | ml_sync_batch_size | 3000 |
 | ml_retrain_min_new_matches | 500 |
@@ -659,7 +659,7 @@ quality_score = 0.65 × min(1, sample_size/60) + 0.35 × min(1, h2h_count/12)
 | betsapi_table_tennis_v2_min_confidence_ceiling | 88.0 |
 | betsapi_table_tennis_v2_min_edge_floor | 2.0 |
 | betsapi_table_tennis_v2_min_edge_ceiling | 8.0 |
-| ml_sync_interval_sec | 60 |
+| ml_sync_interval_sec | 600 (10 мин) |
 | ml_model_dir | /tmp/pingwin_ml_models |
 | ml_use_gpu | true |
 | ml_retrain_min_new_matches | 500 |

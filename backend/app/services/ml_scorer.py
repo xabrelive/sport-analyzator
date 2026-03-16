@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from app.config import settings
+
 if TYPE_CHECKING:
     from app.models.table_tennis_line_event import TableTennisLineEvent
 
@@ -24,6 +26,7 @@ class ScoredForecast:
     suspicious: bool = False
     suspicious_score: float = 0.0
     suspicious_reason: str = ""
+    regime_bucket: str | None = None  # "rookie"|"low"|"mid"|"pro" при использовании bucket-модели ML v2
 
 
 def score_match_for_forecast(event: "TableTennisLineEvent") -> tuple[ScoredForecast, bool] | None:
@@ -33,6 +36,35 @@ def score_match_for_forecast(event: "TableTennisLineEvent") -> tuple[ScoredForec
         (ScoredForecast, use_ml: bool) или None
     """
     try:
+        if str(getattr(settings, "ml_engine", "v1")).lower() == "v2":
+            from app.ml_v2.inference import predict_for_upcoming_v2
+
+            pred_v2 = predict_for_upcoming_v2(
+                home_id=event.home_id,
+                away_id=event.away_id,
+                league_id=event.league_id or "",
+                odds_p1=float(event.odds_1 or 1.9),
+                odds_p2=float(event.odds_2 or 1.9),
+                start_time=event.starts_at,
+            )
+            if pred_v2 is None:
+                logger.info("ML v2 returned None for event %s (home=%s away=%s) — проверьте: модели в ML_MODEL_DIR, игроки в ML-БД", event.id, getattr(event, "home_id", ""), getattr(event, "away_id", ""))
+                return None
+            return (
+                ScoredForecast(
+                    p_home_match=round(pred_v2.p_match, 6),
+                    p_away_match=round(1.0 - pred_v2.p_match, 6),
+                    p_home_set1=round(pred_v2.p_set1, 6),
+                    p_away_set1=round(1.0 - pred_v2.p_set1, 6),
+                    p_home_set2=round(pred_v2.p_set2, 6),
+                    p_away_set2=round(1.0 - pred_v2.p_set2, 6),
+                    quality_score=float(pred_v2.quality_score),
+                    factors=list(pred_v2.factors[:5]),
+                    regime_bucket=pred_v2.regime_bucket,
+                ),
+                True,
+            )
+
         from app.ml.inference import predict_for_upcoming
 
         pred = predict_for_upcoming(
@@ -80,5 +112,5 @@ def score_match_for_forecast(event: "TableTennisLineEvent") -> tuple[ScoredForec
             pred.model_used,
         )
     except Exception as e:
-        logger.debug("ML scoring failed for %s: %s", event.id, e)
+        logger.warning("ML scoring failed for event %s (home=%s away=%s): %s", event.id, getattr(event, "home_id", ""), getattr(event, "away_id", ""), e)
         return None

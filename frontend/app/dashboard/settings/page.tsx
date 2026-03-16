@@ -16,6 +16,15 @@ import {
 
 const TELEGRAM_BOT_LINK = process.env.NEXT_PUBLIC_TELEGRAM_BOT_LINK || "https://t.me/";
 
+type TimezoneOption = { value: number; label: string };
+
+const TIMEZONE_OPTIONS: TimezoneOption[] = Array.from({ length: 27 }, (_, idx) => {
+  const offset = idx - 12; // UTC-12 ... UTC+14
+  const sign = offset >= 0 ? "+" : "-";
+  const absHours = Math.abs(offset);
+  return { value: offset * 60, label: `UTC${sign}${absHours}` };
+});
+
 export default function DashboardSettingsPage() {
   const [profile, setProfile] = useState<MeProfile | null>(null);
   const [loading, setLoading] = useState(true);
@@ -40,6 +49,7 @@ export default function DashboardSettingsPage() {
   const [quietEnd, setQuietEnd] = useState("");
   const [notifyTelegram, setNotifyTelegram] = useState(true);
   const [notifyEmail, setNotifyEmail] = useState(true);
+  const [notificationTzOffsetMinutes, setNotificationTzOffsetMinutes] = useState(0);
   const [quietLoading, setQuietLoading] = useState(false);
 
   useEffect(() => {
@@ -52,6 +62,7 @@ export default function DashboardSettingsPage() {
           setQuietEnd(p.quiet_hours_end ?? "");
           setNotifyTelegram(p.notify_telegram);
           setNotifyEmail(p.notify_email);
+          setNotificationTzOffsetMinutes(p.notification_tz_offset_minutes ?? 0);
         }
       })
       .catch((e) => !cancelled && setError(e.message))
@@ -152,13 +163,15 @@ export default function DashboardSettingsPage() {
       else data.quiet_hours_end = null;
       data.notify_telegram = notifyTelegram;
       data.notify_email = notifyEmail;
+      data.notification_tz_offset_minutes = notificationTzOffsetMinutes;
       const p = await patchMe(data);
       setProfile(p);
       setQuietStart(p.quiet_hours_start ?? "");
       setQuietEnd(p.quiet_hours_end ?? "");
       setNotifyTelegram(p.notify_telegram);
       setNotifyEmail(p.notify_email);
-      setSuccess("Режим тишины сохранён.");
+      setNotificationTzOffsetMinutes(p.notification_tz_offset_minutes ?? 0);
+      setSuccess("Режим тишины и часовой пояс сохранены.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка");
     } finally {
@@ -405,6 +418,20 @@ export default function DashboardSettingsPage() {
             В этот интервал уведомления не отправляются (например, с 22:00 до 08:00).
           </p>
           <form onSubmit={handleSaveQuietHours} className="flex flex-wrap items-end gap-4">
+            <div>
+              <label className="block text-slate-400 text-xs mb-1">Часовой пояс уведомлений</label>
+              <select
+                value={notificationTzOffsetMinutes}
+                onChange={(e) => setNotificationTzOffsetMinutes(Number(e.target.value) || 0)}
+                className="rounded-lg border border-slate-600 bg-slate-800/80 px-3 py-2 text-white focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+              >
+                {TIMEZONE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
             <div>
               <label className="block text-slate-400 text-xs mb-1">С</label>
               <input

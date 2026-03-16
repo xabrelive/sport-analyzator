@@ -299,7 +299,11 @@ async def _load_v2_forecast_map_resolved_only(
     return await _load_v2_forecast_map(session, event_ids, channel=channel, resolved_only=True)
 
 
-def _build_line_response(rows: list, forecast_map: dict[str, str] | None = None) -> dict:
+def _build_line_response(
+    rows: list,
+    forecast_map_ml: dict[str, str] | None = None,
+    forecast_map_no_ml: dict[str, str] | None = None,
+) -> dict:
     """Собирает ответ с событиями, лигами и игроками по лигам."""
     events = []
     leagues_map = {}
@@ -333,7 +337,9 @@ def _build_line_response(rows: list, forecast_map: dict[str, str] | None = None)
             "status": r.status,
             "odds_1": float(r.odds_1) if r.odds_1 is not None else None,
             "odds_2": float(r.odds_2) if r.odds_2 is not None else None,
-            "forecast": (forecast_map or {}).get(str(r.id)) or r.forecast,
+            "forecast": (forecast_map_ml or {}).get(str(r.id)) or r.forecast,
+            "forecast_ml": (forecast_map_ml or {}).get(str(r.id)) or r.forecast,
+            "forecast_no_ml": (forecast_map_no_ml or {}).get(str(r.id)),
         })
 
     leagues = list(leagues_map.values())
@@ -390,20 +396,35 @@ async def get_table_tennis_live(
     rows = list(result.scalars().all())
     access = await get_subscription_access(user.id, session)
     if not access["can_see_forecasts"]:
-        forecast_map = None
+        forecast_map_ml = None
+        forecast_map_no_ml = None
         forecast_placeholder = FORECAST_LOCKED_ANALYTICS
         forecast_locked = True
         forecast_purchase_url = DASHBOARD_PURCHASE_URL
     else:
         ch = access["forecast_channel"] or "paid"
         if access["only_resolved"]:
-            forecast_map = await _load_v2_forecast_map_resolved_only(session, [str(r.id) for r in rows], channel=ch)
+            forecast_map_ml = await _load_v2_forecast_map_resolved_only(
+                session, [str(r.id) for r in rows], channel=ch
+            )
         else:
-            forecast_map = await _load_v2_forecast_map(session, [str(r.id) for r in rows], channel=ch)
+            forecast_map_ml = await _load_v2_forecast_map(
+                session, [str(r.id) for r in rows], channel=ch
+            )
+        if access.get("has_analytics_no_ml", False):
+            forecast_map_no_ml = await _load_v2_forecast_map(
+                session, [str(r.id) for r in rows], channel="no_ml"
+            )
+        else:
+            forecast_map_no_ml = None
         forecast_placeholder = None
         forecast_locked = False
         forecast_purchase_url = None
-    resp = _build_live_response(rows, forecast_map=forecast_map)
+    resp = _build_live_response(
+        rows,
+        forecast_map_ml=forecast_map_ml,
+        forecast_map_no_ml=forecast_map_no_ml,
+    )
     if forecast_locked:
         for ev in resp.get("events", []):
             ev["forecast"] = forecast_placeholder
@@ -415,7 +436,8 @@ async def get_table_tennis_live(
 
 def _build_live_response(
     rows: list[TableTennisLineEvent],
-    forecast_map: dict[str, str] | None = None,
+    forecast_map_ml: dict[str, str] | None = None,
+    forecast_map_no_ml: dict[str, str] | None = None,
 ) -> dict:
     events = []
     for r in rows:
@@ -432,7 +454,9 @@ def _build_live_response(
                 "status": r.status,
                 "odds_1": float(r.odds_1) if r.odds_1 is not None else None,
                 "odds_2": float(r.odds_2) if r.odds_2 is not None else None,
-                "forecast": (forecast_map or {}).get(str(r.id)) or r.forecast,
+                "forecast": (forecast_map_ml or {}).get(str(r.id)) or r.forecast,
+                "forecast_ml": (forecast_map_ml or {}).get(str(r.id)) or r.forecast,
+                "forecast_no_ml": (forecast_map_no_ml or {}).get(str(r.id)),
                 "sets_score": r.live_sets_score,
                 "sets": r.live_score or {},
                 "last_score_changed_at": int(r.last_score_changed_at.timestamp()) if r.last_score_changed_at else None,
@@ -535,20 +559,35 @@ async def get_table_tennis_line(
     rows = list(result.scalars().all())
     access = await get_subscription_access(user.id, session)
     if not access["can_see_forecasts"]:
-        forecast_map = None
+        forecast_map_ml = None
+        forecast_map_no_ml = None
         forecast_placeholder = FORECAST_LOCKED_ANALYTICS
         forecast_locked = True
         forecast_purchase_url = DASHBOARD_PURCHASE_URL
     else:
         ch = access["forecast_channel"] or "paid"
         if access["only_resolved"]:
-            forecast_map = await _load_v2_forecast_map_resolved_only(session, [str(r.id) for r in rows], channel=ch)
+            forecast_map_ml = await _load_v2_forecast_map_resolved_only(
+                session, [str(r.id) for r in rows], channel=ch
+            )
         else:
-            forecast_map = await _load_v2_forecast_map(session, [str(r.id) for r in rows], channel=ch)
+            forecast_map_ml = await _load_v2_forecast_map(
+                session, [str(r.id) for r in rows], channel=ch
+            )
+        if access.get("has_analytics_no_ml", False):
+            forecast_map_no_ml = await _load_v2_forecast_map(
+                session, [str(r.id) for r in rows], channel="no_ml"
+            )
+        else:
+            forecast_map_no_ml = None
         forecast_placeholder = None
         forecast_locked = False
         forecast_purchase_url = None
-    resp = _build_line_response(rows, forecast_map=forecast_map)
+    resp = _build_line_response(
+        rows,
+        forecast_map_ml=forecast_map_ml,
+        forecast_map_no_ml=forecast_map_no_ml,
+    )
     if forecast_locked:
         for ev in resp.get("events", []):
             ev["forecast"] = forecast_placeholder
@@ -1829,20 +1868,35 @@ async def _line_sse_generator(user: User):
                 rows = list(result.scalars().all())
                 access = await get_subscription_access(user.id, session)
                 if not access["can_see_forecasts"]:
-                    forecast_map = None
+                    forecast_map_ml = None
+                    forecast_map_no_ml = None
                     forecast_placeholder = FORECAST_LOCKED_ANALYTICS
                     forecast_locked = True
                     forecast_purchase_url = DASHBOARD_PURCHASE_URL
                 else:
                     ch = access["forecast_channel"] or "paid"
                     if access["only_resolved"]:
-                        forecast_map = await _load_v2_forecast_map_resolved_only(session, [str(r.id) for r in rows], channel=ch)
+                        forecast_map_ml = await _load_v2_forecast_map_resolved_only(
+                            session, [str(r.id) for r in rows], channel=ch
+                        )
                     else:
-                        forecast_map = await _load_v2_forecast_map(session, [str(r.id) for r in rows], channel=ch)
+                        forecast_map_ml = await _load_v2_forecast_map(
+                            session, [str(r.id) for r in rows], channel=ch
+                        )
+                    if access.get("has_analytics_no_ml", False):
+                        forecast_map_no_ml = await _load_v2_forecast_map(
+                            session, [str(r.id) for r in rows], channel="no_ml"
+                        )
+                    else:
+                        forecast_map_no_ml = None
                     forecast_placeholder = None
                     forecast_locked = False
                     forecast_purchase_url = None
-            payload = _build_line_response(rows, forecast_map=forecast_map)
+            payload = _build_line_response(
+                rows,
+                forecast_map_ml=forecast_map_ml,
+                forecast_map_no_ml=forecast_map_no_ml,
+            )
             if forecast_locked:
                 for ev in payload.get("events", []):
                     ev["forecast"] = forecast_placeholder
@@ -1968,20 +2022,35 @@ async def _live_sse_generator(user: User):
                 rows = list(result.scalars().all())
                 access = await get_subscription_access(user.id, session)
                 if not access["can_see_forecasts"]:
-                    forecast_map = None
+                    forecast_map_ml = None
+                    forecast_map_no_ml = None
                     forecast_placeholder = FORECAST_LOCKED_ANALYTICS
                     forecast_locked = True
                     forecast_purchase_url = DASHBOARD_PURCHASE_URL
                 else:
                     ch = access["forecast_channel"] or "paid"
                     if access["only_resolved"]:
-                        forecast_map = await _load_v2_forecast_map_resolved_only(session, [str(r.id) for r in rows], channel=ch)
+                        forecast_map_ml = await _load_v2_forecast_map_resolved_only(
+                            session, [str(r.id) for r in rows], channel=ch
+                        )
                     else:
-                        forecast_map = await _load_v2_forecast_map(session, [str(r.id) for r in rows], channel=ch)
+                        forecast_map_ml = await _load_v2_forecast_map(
+                            session, [str(r.id) for r in rows], channel=ch
+                        )
+                    if access.get("has_analytics_no_ml", False):
+                        forecast_map_no_ml = await _load_v2_forecast_map(
+                            session, [str(r.id) for r in rows], channel="no_ml"
+                        )
+                    else:
+                        forecast_map_no_ml = None
                     forecast_placeholder = None
                     forecast_locked = False
                     forecast_purchase_url = None
-            payload = _build_live_response(rows, forecast_map=forecast_map)
+            payload = _build_live_response(
+                rows,
+                forecast_map_ml=forecast_map_ml,
+                forecast_map_no_ml=forecast_map_no_ml,
+            )
             if forecast_locked:
                 for ev in payload.get("events", []):
                     ev["forecast"] = forecast_placeholder

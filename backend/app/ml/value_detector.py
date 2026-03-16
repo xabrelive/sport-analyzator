@@ -51,7 +51,7 @@ def bet_size_kelly(bankroll: float, probability: float, odds: float, fraction: f
 class ValueDetector:
     """Поиск value ставок: EV > 0."""
 
-    def __init__(self, min_ev: float = 0.08, min_odds: float = 1.6, max_odds: float = 2.6):
+    def __init__(self, min_ev: float = 0.08, min_odds: float = 1.5, max_odds: float = 3.0):
         self.min_ev = min_ev
         self.min_odds = min_odds
         self.max_odds = max_odds
@@ -64,7 +64,7 @@ class ValueDetector:
         odds_p1: float,
         odds_p2: float,
     ) -> list[ValueResult]:
-        """Возвращает список value-ставок. Золотая зона: 1.6–2.6."""
+        """Возвращает список value-ставок. Золотая зона: 1.5–3.0."""
         results = []
         for market, p in [("match", p_match), ("set1", p_set1), ("set2", p_set2)]:
             for side, prob, odds in [("p1", p, odds_p1), ("p2", 1 - p, odds_p2)]:

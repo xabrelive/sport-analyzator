@@ -37,6 +37,8 @@ class User(Base):
     # Режим тишины: не слать уведомления в этот интервал (локальное время пользователя)
     quiet_hours_start: Mapped[time | None] = mapped_column(Time(), nullable=True)
     quiet_hours_end: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    # Часовой пояс пользователя как смещение от UTC в минутах (например, UTC+3 = 180).
+    notification_tz_offset_minutes: Mapped[int] = mapped_column(nullable=False, default=0)
     is_blocked: Mapped[bool] = mapped_column(Boolean(), default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean(), default=True, nullable=False)
     is_superadmin: Mapped[bool] = mapped_column(Boolean(), default=False, nullable=False)

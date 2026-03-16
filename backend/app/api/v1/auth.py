@@ -331,7 +331,7 @@ async def get_telegram_bot_info(
     """Bot fetches the message for «Получить информацию» button."""
     row = (
         await session.execute(select(AppSetting).where(AppSetting.key == BOT_INFO_KEY))
-    ).scalar_one_or_none()
+    ).scalars().one_or_none()
     return {"message": (row.value if row else "") or ""}
 
 

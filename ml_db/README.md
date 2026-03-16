@@ -2,6 +2,8 @@
 
 Вторая база `pingwin_ml` для ML-моделей: Elo, фичи, XGBoost/LightGBM, Monte Carlo, Value-сигналы, аномалии.
 
+Датасет и защита от утечки данных: см. [../docs/ML_DATASET.md](../docs/ML_DATASET.md).
+
 ## Быстрый старт
 
 ### 1. Создать БД (если postgres уже запущен)
@@ -47,7 +49,17 @@ python ml_db/scripts/train_models.py --limit 50000 --version v1
 
 Модели сохраняются в `ML_MODEL_DIR` (по умолчанию `/tmp/pingwin_ml_models`).
 
-### 5. Переменные окружения
+### 5. Миграция схемы (существующая БД)
+
+Если ML-база создана до добавления фич `hours_since_last_h2h`, `sample_size`, `league_upset_rate`, примените миграцию вручную:
+
+```bash
+psql -U pingwin -d pingwin_ml -p 11002 -f ml_db/init/schema/11_ml_features_h2h_sample_league.sql
+```
+
+После этого пересоберите фичи (backfill) и переобучите модели.
+
+### 6. Переменные окружения
 
 - `DATABASE_URL_ML` — подключение к pingwin_ml
 - `ML_MODEL_DIR` — каталог сохранения моделей

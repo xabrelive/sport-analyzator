@@ -74,27 +74,58 @@ def select_pick(
     if not candidates:
         return None
 
-    def _value_score(p: SelectedPick) -> float:
-        """
-        Оцениваем сигнал по ожидаемой выгоде:
-        - edge (value) важнее просто вероятности,
-        - даём бонус за более крупный кф (но без перекоса в заведомо лютые андердоги).
-        """
-        # Нормируем odds в зоне 1.6–2.5 как «сладкое место»
-        odds_bonus = 0.0
-        if p.odds_used >= 1.6:
-            # до 2.5 растёт бонус, дальше — плато
-            capped = min(p.odds_used, 2.5)
-            odds_bonus = (capped - 1.6) * 1.5  # максимум ~1.35
-        return p.edge_pct + odds_bonus
-
+    # Приоритет — уверенность в исходе (игрок), а не value vs линия. Сортируем: тир → confidence → edge.
     candidates.sort(
         key=lambda x: (
-            x.quality_tier,           # A/B/C/D
-            _value_score(x),          # сначала лучшие по value и кф
-            x.confidence_score,       # затем по уверенности
-            0 if x.market == "match" else 1,  # матчевые чуть выше сетов
+            x.quality_tier,
+            x.confidence_score,
+            x.edge_pct,
         ),
         reverse=True,
     )
+    return candidates[0]
+
+
+def select_best_confidence_pick(
+    scored: ScoredForecast,
+    odds_home: float | None,
+    odds_away: float | None,
+    min_odds: float,
+) -> SelectedPick | None:
+    """Fallback selector: choose most confident market (match/set1) even without value edge."""
+    oh = float(odds_home or 0.0)
+    oa = float(odds_away or 0.0)
+    if oh < min_odds and oa < min_odds:
+        return None
+
+    candidates: list[SelectedPick] = []
+
+    def _add(market: str, side: str, p: float, odds: float, label: str) -> None:
+        if odds < min_odds:
+            return
+        implied = (1.0 / odds) if odds > 1e-9 else 0.0
+        edge = (p - implied) * 100.0
+        confidence = p * 100.0
+        candidates.append(
+            SelectedPick(
+                market=market,
+                side=side,
+                probability_pct=round(confidence, 2),
+                edge_pct=round(edge, 2),
+                confidence_score=round(confidence * (0.4 + 0.6 * scored.quality_score), 2),
+                odds_used=round(odds, 3),
+                forecast_text=f"{label} ({round(confidence, 1)}%)",
+                quality_tier=_quality_tier(scored.quality_score),
+            )
+        )
+
+    # Per requirement: choose between match or set1 by higher confidence.
+    _add("match", "home", scored.p_home_match, oh, "П1 победа в матче")
+    _add("match", "away", scored.p_away_match, oa, "П2 победа в матче")
+    _add("set1", "home", scored.p_home_set1, oh, "П1 выиграет 1-й сет")
+    _add("set1", "away", scored.p_away_set1, oa, "П2 выиграет 1-й сет")
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x.confidence_score, reverse=True)
     return candidates[0]

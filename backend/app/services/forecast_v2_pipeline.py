@@ -22,15 +22,15 @@ from app.models.table_tennis_line_event import (
 from app.models.table_tennis_model_run import TableTennisModelRun
 from app.services.ml_scorer import score_match_for_forecast
 from app.services.outcome_resolver_v2 import resolve_forecast_outcomes_once
-from app.services.pick_selector import select_pick
+from app.services.pick_selector import select_best_confidence_pick, select_pick
 from app.services.table_tennis_analytics import compute_forecast_for_event
 
 logger = logging.getLogger(__name__)
 
 _kpi_runtime_state: dict[str, float] = {
-    "dynamic_min_confidence_pct": 74.0,
-    "dynamic_min_edge_pct": 3.0,
-    "dynamic_min_odds": 1.6,
+    "dynamic_min_confidence_pct": 58.0,
+    "dynamic_min_edge_pct": 0.0,
+    "dynamic_min_odds": 1.5,
     "last_hit_rate": 0.0,
     "last_picks_per_day": 0.0,
     "last_updated_at": 0.0,
@@ -69,8 +69,8 @@ async def _ensure_active_model_run() -> int:
             return active.id
 
         row = TableTennisModelRun(
-            model_name="tt_ml_xgboost",
-            model_version="v1.0.0",
+            model_name="tt_ml_clickhouse_v2" if str(getattr(settings, "ml_engine", "v1")).lower() == "v2" else "tt_ml_xgboost",
+            model_version="v2.0.0" if str(getattr(settings, "ml_engine", "v1")).lower() == "v2" else "v1.0.0",
             params_json={
                 "weights": {
                     "form_delta": 1.9,
@@ -88,14 +88,23 @@ async def _ensure_active_model_run() -> int:
 
 
 async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
-    """Создаёт прогнозы только для матчей в окне 1–3 часа до начала (Stage 2)."""
+    """Создаёт ML-прогнозы для матчей, до начала которых 1 час и менее."""
     _init_kpi_runtime_defaults()
     model_run_id = await _ensure_active_model_run()
     now = _utc_now()
     delay_minutes = max(0, settings.betsapi_table_tennis_forecast_delay_minutes)
     earliest_created_at = now - timedelta(minutes=delay_minutes)
-    min_min = getattr(settings, "betsapi_table_tennis_forecast_min_minutes_before", 60)
-    max_min = getattr(settings, "betsapi_table_tennis_forecast_max_minutes_before", 180)
+    # Окно ML: прогнозы только для матчей до начала которых 1 час и менее.
+    window_min = max(
+        1,
+        int(getattr(settings, "betsapi_table_tennis_forecast_window_min_minutes_before", 1)),
+    )
+    window_max = max(
+        1,
+        int(getattr(settings, "betsapi_table_tennis_forecast_ml_max_minutes_before", 60)),
+    )
+    min_min = window_min
+    max_min = min(window_max, 300)  # не более 5 ч
     window_start = now + timedelta(minutes=min_min)
     window_end = now + timedelta(minutes=max_min)
 
@@ -106,7 +115,6 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
                     and_(
                         TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
                         TableTennisLineEvent.starts_at > now,
-                        TableTennisLineEvent.starts_at <= now + timedelta(hours=3),
                         TableTennisLineEvent.starts_at >= window_start,
                         TableTennisLineEvent.starts_at <= window_end,
                         TableTennisLineEvent.created_at <= earliest_created_at,
@@ -133,27 +141,77 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
                     .limit(1)
                 )
             ).scalar_one_or_none()
-            # Где уже дали прогноз — не пересчитываем
-            if existing and existing.status in {"pending", "hit", "miss", "cancelled", "no_result"}:
+            # One-shot policy: once ML forecast is created for event+channel, never recalculate it.
+            # This prevents drift between prematch signal and later live/finish states.
+            if existing:
                 continue
 
             scored_result = score_match_for_forecast(event)
             if scored_result is None:
                 continue
             scored, use_ml = scored_result
+            effective_min_odds = max(
+                float(_kpi_runtime_state["dynamic_min_odds"]),
+                float(getattr(settings, "betsapi_table_tennis_v2_preferred_min_odds", 1.75)),
+            )
 
+            conf_floor = float(getattr(settings, "betsapi_table_tennis_v2_confidence_filter_min_pct", 0) or 0)
+            effective_min_conf = max(float(_kpi_runtime_state["dynamic_min_confidence_pct"]), conf_floor)
             selected = select_pick(
                 scored=scored,
                 odds_home=float(event.odds_1 or 0.0),
                 odds_away=float(event.odds_2 or 0.0),
-                min_odds=float(_kpi_runtime_state["dynamic_min_odds"]),
-                min_confidence_pct=float(_kpi_runtime_state["dynamic_min_confidence_pct"]),
+                min_odds=effective_min_odds,
+                min_confidence_pct=effective_min_conf,
                 min_edge_pct=float(_kpi_runtime_state["dynamic_min_edge_pct"]),
             )
+            # Fallback profile: when model is conservative around p~0.5, strict confidence gates can
+            # block all picks despite positive edge. Keep stream alive with softer bounds.
+            if not selected and bool(getattr(settings, "betsapi_table_tennis_v2_allow_soft_fallback", False)):
+                soft_conf = min(50.0, float(_kpi_runtime_state["dynamic_min_confidence_pct"]))
+                selected = select_pick(
+                    scored=scored,
+                    odds_home=float(event.odds_1 or 0.0),
+                    odds_away=float(event.odds_2 or 0.0),
+                    min_odds=effective_min_odds,
+                    min_confidence_pct=max(conf_floor, soft_conf),
+                    min_edge_pct=max(
+                        0.8,
+                        float(_kpi_runtime_state["dynamic_min_edge_pct"]) * 0.4,
+                    ),
+                )
+            if not selected and settings.betsapi_table_tennis_v2_allow_hard_confidence_fallback:
+                # Hard fallback: лучший по уверенности; min_odds ниже (1.5), чтобы чаще был хотя бы один прогноз.
+                fallback_min_odds = min(
+                    effective_min_odds,
+                    float(getattr(settings, "betsapi_table_tennis_min_odds_for_forecast", 1.5)),
+                )
+                selected = select_best_confidence_pick(
+                    scored=scored,
+                    odds_home=float(event.odds_1 or 0.0),
+                    odds_away=float(event.odds_2 or 0.0),
+                    min_odds=fallback_min_odds,
+                )
+                if selected:
+                    logger.debug("ML v2 event %s: выбран пик по hard fallback (confidence=%.1f%%)", event.id, selected.probability_pct)
             if not selected:
+                logger.debug(
+                    "ML v2 event %s: пик не выбран (min_conf=%.1f%%, min_edge=%.2f%%, p_match=%.3f p_set1=%.3f)",
+                    event.id, effective_min_conf, _kpi_runtime_state["dynamic_min_edge_pct"],
+                    scored.p_home_match, scored.p_home_set1,
+                )
                 continue
 
-            row = existing or TableTennisForecastV2(
+            # Только уверенные: не публикуем прогноз, если модель не уверена в результате (матч или 1-й сет).
+            min_publish = float(getattr(settings, "betsapi_table_tennis_v2_min_confidence_to_publish", 0) or 0)
+            if min_publish > 0 and selected.probability_pct < min_publish:
+                logger.debug(
+                    "ML v2 event %s: пропуск (confidence %.1f%% < min_to_publish %.1f%%)",
+                    event.id, selected.probability_pct, min_publish,
+                )
+                continue
+
+            row = TableTennisForecastV2(
                 event_id=event.id,
                 channel=channel,
                 model_run_id=model_run_id,
@@ -172,11 +230,10 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
             row.explanation_summary = (
                 f"Tier {selected.quality_tier}{ml_tag}: edge {selected.edge_pct:.2f}%, conf {selected.confidence_score:.2f}%"
             )
-            if not existing:
-                session.add(row)
-                await session.flush()
-            else:
-                await session.flush()
+            if min_publish > 0 and selected.probability_pct < 55 and selected.probability_pct >= 50:
+                logger.debug("ML v2 event %s: публикуем при confidence %.1f%% (min_publish=%.1f)", event.id, selected.probability_pct, min_publish)
+            session.add(row)
+            await session.flush()
 
             await session.execute(
                 delete(TableTennisForecastExplanation).where(
@@ -199,6 +256,13 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
 
         if created:
             await session.commit()
+        if not created and events:
+            logger.info(
+                "ML v2 forecast: 0 создано при %s событиях в окне (проверь min_confidence_to_publish, allow_hard_fallback, пороги select_pick)",
+                len(events),
+            )
+        elif not created:
+            logger.debug("ML v2 forecast: 0 событий в окне [%s–%s] мин до старта", min_min, max_min)
         return created
 
 
@@ -209,11 +273,14 @@ async def run_no_ml_forecast_once(limit: int = 400, channel: str = "no_ml") -> i
     и сетов, формируем текст вида «П1 победа в матче ...» или «П2 выиграет 1-й сет ...».
     """
     now = _utc_now()
-    # Для аналитики без ML берём широкий прематч-интервал: от текущего момента до 8 часов вперёд.
-    window_start = now
-    window_end = now + timedelta(hours=8)
+    model_run_id = await _ensure_active_model_run()
+    # No-ML: окно до 2 часов до старта (прогнозы за 2 ч и менее).
+    min_min = max(0, int(getattr(settings, "betsapi_table_tennis_no_ml_forecast_min_minutes_ahead", 1)))
+    max_hours = max(1, int(settings.betsapi_table_tennis_no_ml_forecast_max_hours_ahead))
+    window_start = now + timedelta(minutes=min_min)
+    window_end = now + timedelta(hours=max_hours)
 
-    min_odds = float(getattr(settings, "betsapi_table_tennis_min_odds_for_forecast", 1.4))
+    min_odds = float(getattr(settings, "betsapi_table_tennis_min_odds_for_forecast", 1.5))
 
     async with async_session_maker() as session:
         events = (
@@ -233,12 +300,27 @@ async def run_no_ml_forecast_once(limit: int = 400, channel: str = "no_ml") -> i
             )
         ).scalars().all()
 
+        # Лиги, для которых no_ML прогноз не выдаём (исключаем из расчёта).
+        exclude_names = (getattr(settings, "betsapi_table_tennis_no_ml_exclude_league_names", "") or "").strip()
+        exclude_parts = [x.strip() for x in exclude_names.split(",") if x.strip()] if exclude_names else []
+
         created = 0
+        skip_no_text = 0
+        skip_exclude_league = 0
+        skip_existing = 0
+        skip_low_odds = 0
+        skip_bad_format = 0
         for event in events:
+            if exclude_parts:
+                league_name = (getattr(event, "league_name", None) or "").strip()
+                if any(part in league_name for part in exclude_parts):
+                    skip_exclude_league += 1
+                    continue
             # Прогноз уже есть для этого рынка и канала — не пересчитываем.
             # Рынок определяем позже, поэтому сначала считаем текст.
             text, conf = await compute_forecast_for_event(session, event)
             if not text:
+                skip_no_text += 1
                 continue
 
             t = text.lower()
@@ -247,7 +329,7 @@ async def run_no_ml_forecast_once(limit: int = 400, channel: str = "no_ml") -> i
             elif "п2" in t:
                 side = "away"
             else:
-                # Неподдерживаемый формат текста.
+                skip_bad_format += 1
                 continue
 
             if "1-й сет" in t:
@@ -256,6 +338,21 @@ async def run_no_ml_forecast_once(limit: int = 400, channel: str = "no_ml") -> i
                 market = "set2"
             else:
                 market = "match"
+
+            # Для отдельных лиг инвертируем выбор: рассчитали П1 — выдаём П2 и наоборот.
+            invert_names = (getattr(settings, "betsapi_table_tennis_no_ml_invert_pick_league_names", "") or "").strip()
+            if invert_names:
+                league_name = (getattr(event, "league_name", None) or "").strip()
+                for name_part in (x.strip() for x in invert_names.split(",") if x.strip()):
+                    if name_part and name_part in league_name:
+                        side = "away" if side == "home" else "home"
+                        # Меняем П1/П2 в тексте (сохраняем регистр и форму).
+                        if "п1" in t:
+                            text = text.replace("П1", "П2").replace("п1", "п2")
+                        else:
+                            text = text.replace("П2", "П1").replace("п2", "п1")
+                        t = text.lower()
+                        break
 
             existing = (
                 await session.execute(
@@ -271,6 +368,7 @@ async def run_no_ml_forecast_once(limit: int = 400, channel: str = "no_ml") -> i
                 )
             ).scalar_one_or_none()
             if existing and existing.status in {"pending", "hit", "miss", "cancelled", "no_result"}:
+                skip_existing += 1
                 continue
 
             odds_val: float | None
@@ -279,12 +377,13 @@ async def run_no_ml_forecast_once(limit: int = 400, channel: str = "no_ml") -> i
             else:
                 odds_val = float(event.odds_2 or 0.0)
             if odds_val and odds_val < min_odds:
-                # Слишком маленький коэффициент — пропускаем.
+                skip_low_odds += 1
                 continue
 
             row = existing or TableTennisForecastV2(
                 event_id=event.id,
                 channel=channel,
+                model_run_id=model_run_id,
             )
             row.market = market
             row.pick_side = side
@@ -308,6 +407,18 @@ async def run_no_ml_forecast_once(limit: int = 400, channel: str = "no_ml") -> i
 
         if created:
             await session.commit()
+        if not created and events:
+            logger.info(
+                "No-ML forecast: 0 создано при %s событиях в окне | нет_текста=%s (нет стат/низкая уверенность) excluded=%s existing=%s low_odds=%s bad_format=%s",
+                len(events),
+                skip_no_text,
+                skip_exclude_league,
+                skip_existing,
+                skip_low_odds,
+                skip_bad_format,
+            )
+        elif not created:
+            logger.debug("No-ML forecast: 0 событий в окне %s мин – %s ч до старта", min_min, max_hours)
         return created
 
 
@@ -358,7 +469,7 @@ async def run_early_scan_once(limit: int = 200) -> int:
             ev_h = scored.p_home_match * oh - 1.0 if oh > 0 else 0
             ev_a = scored.p_away_match * oa - 1.0 if oa > 0 else 0
             has_value = (
-                (ev_h >= 0.08 and 1.6 <= oh <= 2.6) or (ev_a >= 0.08 and 1.6 <= oa <= 2.6)
+                (ev_h >= 0.08 and 1.5 <= oh <= 3.0) or (ev_a >= 0.08 and 1.5 <= oa <= 3.0)
             )
             minutes_to_match = int((event.starts_at - now).total_seconds() / 60) if event.starts_at else None
             row = TableTennisForecastEarlyScan(
@@ -412,16 +523,17 @@ async def run_kpi_guard_once() -> dict:
         picks_ratio = 1.0
     resolved_count = float(len(resolved))
 
-    # Volume-first correction when we are far below target.
-    if picks_ratio < 0.5:
-        conf -= 2.0
-        edge -= 0.7
-    elif picks_ratio < 0.8:
-        conf -= 1.0
-        edge -= 0.4
-    elif picks_ratio > 1.3 and resolved_count >= 30:
-        conf += 0.7
-        edge += 0.2
+    # Volume-first correction can reduce quality. Keep optional for conservative mode.
+    if not bool(getattr(settings, "betsapi_table_tennis_v2_prioritize_quality_over_volume", True)):
+        if picks_ratio < 0.5:
+            conf -= 2.0
+            edge -= 0.7
+        elif picks_ratio < 0.8:
+            conf -= 1.0
+            edge -= 0.4
+        elif picks_ratio > 1.3 and resolved_count >= 30:
+            conf += 0.7
+            edge += 0.2
 
     # Accuracy correction only when enough resolved outcomes exist.
     if resolved_count >= 25:
@@ -539,11 +651,12 @@ async def forecast_v2_loop() -> None:
             logger.info("V2 forecast loop created/updated=%s", cnt)
         except Exception:
             logger.exception("V2 forecast loop failed")
-        await asyncio.sleep(max(10, settings.betsapi_table_tennis_v2_forecast_interval_sec))
+        await asyncio.sleep(max(1, settings.betsapi_table_tennis_v2_forecast_interval_sec))
 
 
 async def no_ml_forecast_loop() -> None:
     """Форкастинг канала no_ml по тем же окнам, но без ML."""
+    interval_no_ml = max(30, getattr(settings, "betsapi_table_tennis_no_ml_forecast_interval_sec", 180))
     while True:
         try:
             cnt = await run_no_ml_forecast_once(
@@ -553,7 +666,7 @@ async def no_ml_forecast_loop() -> None:
             logger.info("No-ML forecast loop created/updated=%s", cnt)
         except Exception:
             logger.exception("No-ML forecast loop failed")
-        await asyncio.sleep(max(30, settings.betsapi_table_tennis_v2_forecast_interval_sec))
+        await asyncio.sleep(interval_no_ml)
 
 
 async def result_priority_loop() -> None:

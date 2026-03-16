@@ -29,10 +29,37 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _user_tz_offset_minutes(user: User) -> int:
+    raw = int(getattr(user, "notification_tz_offset_minutes", 0) or 0)
+    if raw < -720:
+        return -720
+    if raw > 840:
+        return 840
+    return raw
+
+
+def _user_timezone(user: User) -> timezone:
+    return timezone(timedelta(minutes=_user_tz_offset_minutes(user)))
+
+
+def _format_tz_label(offset_minutes: int) -> str:
+    sign = "+" if offset_minutes >= 0 else "-"
+    abs_minutes = abs(offset_minutes)
+    hours = abs_minutes // 60
+    minutes = abs_minutes % 60
+    if minutes == 0:
+        return f"UTC{sign}{hours}"
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def _user_now(user: User, now_utc: datetime) -> datetime:
+    return now_utc.astimezone(_user_timezone(user))
+
+
 def _in_quiet_hours(user: User, now_utc: datetime) -> bool:
     if user.quiet_hours_start is None or user.quiet_hours_end is None:
         return False
-    now_t = now_utc.time()
+    now_t = _user_now(user, now_utc).time()
     start = user.quiet_hours_start
     end = user.quiet_hours_end
     if start == end:
@@ -91,10 +118,18 @@ def _is_late_appeared(
     return forecast.created_at >= threshold
 
 
-def _telegram_match_block(event: TableTennisLineEvent, forecast: TableTennisForecastV2, now: datetime) -> str:
-    starts = event.starts_at.astimezone(timezone.utc) if event.starts_at else now
-    when = starts.strftime("%d.%m.%Y %H:%M UTC")
-    countdown = _human_countdown(starts, now)
+def _telegram_match_block(
+    event: TableTennisLineEvent,
+    forecast: TableTennisForecastV2,
+    now: datetime,
+    user: User,
+) -> str:
+    tz = _user_timezone(user)
+    tz_label = _format_tz_label(_user_tz_offset_minutes(user))
+    starts = event.starts_at.astimezone(tz) if event.starts_at else now.astimezone(tz)
+    user_now = now.astimezone(tz)
+    when = f"{starts.strftime('%d.%m.%Y %H:%M')} {tz_label}"
+    countdown = _human_countdown(starts, user_now)
     odds = float(forecast.odds_used) if forecast.odds_used is not None else None
     lines = [
         f"🏆 {escape(event.league_name or '—')}",
@@ -109,10 +144,14 @@ def _telegram_match_block(event: TableTennisLineEvent, forecast: TableTennisFore
     return "\n".join(lines)
 
 
-def _build_telegram_batch(events: list[tuple[TableTennisLineEvent, TableTennisForecastV2]], now: datetime) -> str:
+def _build_telegram_batch(
+    events: list[tuple[TableTennisLineEvent, TableTennisForecastV2]],
+    now: datetime,
+    user: User,
+) -> str:
     blocks = []
     for event, forecast in events:
-        blocks.append(_telegram_match_block(event, forecast, now))
+        blocks.append(_telegram_match_block(event, forecast, now, user))
     footer = "\n\n┄┄┄┄┄┄┄┄┄┄┄┄\n🐧 <a href=\"https://pingwin.pro\">pingwin.pro</a> — аналитический сервис"
     return "\n\n".join(blocks) + footer
 
@@ -120,16 +159,20 @@ def _build_telegram_batch(events: list[tuple[TableTennisLineEvent, TableTennisFo
 def _build_email_batch(
     events: list[tuple[TableTennisLineEvent, TableTennisForecastV2]],
     now: datetime,
+    user: User,
 ) -> tuple[str, str, str]:
+    tz = _user_timezone(user)
+    tz_label = _format_tz_label(_user_tz_offset_minutes(user))
+    user_now = now.astimezone(tz)
     subject = f"PingWin: новые прогнозы ({len(events)})"
     lines: list[str] = []
     cards_html: list[str] = []
     for event, forecast in events:
-        starts = event.starts_at.astimezone(timezone.utc) if event.starts_at else now
+        starts = event.starts_at.astimezone(tz) if event.starts_at else user_now
         link = _event_link(str(event.id))
         lines.append(f"{event.league_name or '—'}")
-        lines.append(starts.strftime("%d.%m.%Y %H:%M UTC"))
-        lines.append(_human_countdown(starts, now))
+        lines.append(f"{starts.strftime('%d.%m.%Y %H:%M')} {tz_label}")
+        lines.append(_human_countdown(starts, user_now))
         lines.append(f"{event.home_name or '—'} — {event.away_name or '—'}")
         if forecast.odds_used is not None:
             lines.append(f"Кф: {float(forecast.odds_used):.2f}")
@@ -140,8 +183,8 @@ def _build_email_batch(
             (
                 "<div style=\"border:1px solid #cbd5e1;border-radius:10px;padding:14px 16px;margin-bottom:12px;background:#ffffff;\">"
                 f"<div style=\"font-size:14px;color:#0f172a;font-weight:700;margin-bottom:6px;\">🏆 {escape(event.league_name or '—')}</div>"
-                f"<div style=\"font-size:13px;color:#334155;margin-bottom:2px;\">{starts.strftime('%d.%m.%Y %H:%M UTC')}</div>"
-                f"<div style=\"font-size:13px;color:#334155;margin-bottom:8px;\">⏱ {escape(_human_countdown(starts, now))}</div>"
+                f"<div style=\"font-size:13px;color:#334155;margin-bottom:2px;\">{starts.strftime('%d.%m.%Y %H:%M')} {escape(tz_label)}</div>"
+                f"<div style=\"font-size:13px;color:#334155;margin-bottom:8px;\">⏱ {escape(_human_countdown(starts, user_now))}</div>"
                 f"<div style=\"font-size:14px;color:#0f172a;font-weight:600;margin-bottom:8px;\">{escape(event.home_name or '—')} — {escape(event.away_name or '—')}</div>"
                 + (
                     f"<div style=\"font-size:13px;color:#334155;margin-bottom:6px;\">Кф: {float(forecast.odds_used):.2f}</div>"
@@ -317,6 +360,15 @@ async def dispatch_forecast_notifications_once() -> dict[str, int]:
     batch_minutes = max(1, int(getattr(settings, "notifications_batch_interval_minutes", 30)))
     urgent_minutes = max(1, int(getattr(settings, "telegram_urgent_lead_minutes", 30)))
     min_lead_minutes = max(0, int(getattr(settings, "telegram_free_min_lead_minutes", 60)))
+    immediate_after_forecast_sec = max(
+        0,
+        int(getattr(settings, "notifications_immediate_after_forecast_sec", 300)),
+    )
+    new_forecast_batch_minutes = max(
+        1,
+        int(getattr(settings, "notifications_new_forecast_batch_minutes", 10)),
+    )
+    new_forecast_batch_sec = new_forecast_batch_minutes * 60
     delivered_events = 0
     delivered_messages = 0
     result_replies = 0
@@ -368,6 +420,11 @@ async def dispatch_forecast_notifications_once() -> dict[str, int]:
                         (e, f) for e, f in unsent
                         if (
                             (e.starts_at is not None and e.starts_at <= urgent_cutoff)
+                            or (
+                                immediate_after_forecast_sec > 0
+                                and f.created_at is not None
+                                and (now - f.created_at).total_seconds() <= immediate_after_forecast_sec
+                            )
                             or _is_late_appeared(
                                 e,
                                 f,
@@ -376,9 +433,39 @@ async def dispatch_forecast_notifications_once() -> dict[str, int]:
                             )
                         )
                     ]
+                    urgent_event_ids = {str(e.id) for e, _ in urgent_unsent}
+                    non_urgent_unsent = [
+                        (e, f) for e, f in unsent if str(e.id) not in urgent_event_ids
+                    ]
+
+                    # Для прематча за ~1 час: копим новые прогнозы в течение окна и отправляем пачкой.
+                    grouped_new_unsent = [
+                        (e, f)
+                        for e, f in non_urgent_unsent
+                        if (
+                            f.created_at is not None
+                            and (now - f.created_at).total_seconds() >= new_forecast_batch_sec
+                        )
+                    ]
+                    grouped_new_event_ids = {str(e.id) for e, _ in grouped_new_unsent}
+                    pending_group_unsent = [
+                        (e, f)
+                        for e, f in non_urgent_unsent
+                        if (
+                            f.created_at is not None
+                            and (now - f.created_at).total_seconds() < new_forecast_batch_sec
+                        )
+                    ]
+                    pending_group_event_ids = {str(e.id) for e, _ in pending_group_unsent}
+
                     regular_unsent = [
                         (e, f) for e, f in unsent
-                        if e.starts_at is None or e.starts_at > urgent_cutoff
+                        if (
+                            str(e.id) not in urgent_event_ids
+                            and str(e.id) not in grouped_new_event_ids
+                            and str(e.id) not in pending_group_event_ids
+                            and (e.starts_at is None or e.starts_at > urgent_cutoff)
+                        )
                     ]
                     last_sent = (
                         await session.execute(
@@ -396,10 +483,12 @@ async def dispatch_forecast_notifications_once() -> dict[str, int]:
                         to_send_batches: list[list[tuple[TableTennisLineEvent, TableTennisForecastV2]]] = []
                         if urgent_unsent:
                             to_send_batches.append(urgent_unsent)
+                        if grouped_new_unsent:
+                            to_send_batches.append(grouped_new_unsent)
                         if can_send_regular and regular_unsent:
                             to_send_batches.append(regular_unsent)
                         for batch in to_send_batches:
-                            message_text = _build_telegram_batch(batch, now)
+                            message_text = _build_telegram_batch(batch, now, user)
                             message_id = await _send_telegram_message(int(user.telegram_id), message_text)
                             if message_id is None:
                                 continue
@@ -433,10 +522,12 @@ async def dispatch_forecast_notifications_once() -> dict[str, int]:
                         to_send_batches: list[list[tuple[TableTennisLineEvent, TableTennisForecastV2]]] = []
                         if urgent_unsent:
                             to_send_batches.append(urgent_unsent)
+                        if grouped_new_unsent:
+                            to_send_batches.append(grouped_new_unsent)
                         if can_send_regular and regular_unsent:
                             to_send_batches.append(regular_unsent)
                         for batch in to_send_batches:
-                            subject, body_text, body_html = _build_email_batch(batch, now)
+                            subject, body_text, body_html = _build_email_batch(batch, now, user)
                             if not send_html_email(effective_email, subject, body_text, body_html):
                                 continue
                             delivered_messages += 1
@@ -559,6 +650,10 @@ async def dispatch_forecast_notifications_once() -> dict[str, int]:
 async def forecast_notifications_loop() -> None:
     interval = max(20, int(getattr(settings, "notifications_loop_interval_sec", 60)))
     logger.info("Notifications: starting loop (interval=%ss)", interval)
+    if not (settings.telegram_bot_token or "").strip():
+        logger.warning(
+            "Telegram личные уведомления: telegram_bot_token не задан — сообщения пользователям в бот не отправляются"
+        )
     while True:
         try:
             await dispatch_forecast_notifications_once()

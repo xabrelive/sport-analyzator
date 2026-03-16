@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Tuple
@@ -27,18 +28,19 @@ from app.models.table_tennis_line_event import (
 from app.models.table_tennis_forecast_v2 import TableTennisForecastV2
 from app.config import settings
 
+logger = logging.getLogger(__name__)
 
-# Пороги и требования — как в старом проекте (analytics_service).
-CONFIDENCE_THRESHOLD = 0.72           # для сетов (П1/П2 выиграет сет)
-CONFIDENCE_THRESHOLD_MATCH = 0.75     # для победы в матче
+# Пороги no-ML: прогноз только при максимальной уверенности (не на каждый матч).
+CONFIDENCE_THRESHOLD = 0.72           # для сетов — только если уверенность >= 72%
+CONFIDENCE_THRESHOLD_MATCH = 0.75    # для победы в матче — >= 75%
 MIN_MATCHES_FOR_RECOMMENDATION = 3    # минимум матчей у каждого для любых выводов
-MIN_MATCHES_FOR_MATCH_RECOMMENDATION = 6  # для матча — требуем побольше истории
-MIN_CONFIDENCE_MARGIN = 0.05          # минимальный отрыв лучшего исхода
+MIN_MATCHES_FOR_MATCH_RECOMMENDATION = 6  # для прогноза на матч — больше истории
+MIN_CONFIDENCE_MARGIN = 0.05         # минимальный отрыв лучшего исхода от альтернативы (5%)
 
-# Окна для статистики как в старом recommendations/engine.py + player_stats_service.py.
+# Окна для статистики.
 RECOMMENDATION_LOOKBACK_DAYS = 180
 RECOMMENDATION_PREFER_RECENT_DAYS: int | None = 30
-RECOMMENDATION_MIN_MATCHES_IN_LEAGUE = 3
+RECOMMENDATION_MIN_MATCHES_IN_LEAGUE = 1  # было 3 — меньше требований к лиге, больше прогнозов
 
 
 @dataclass
@@ -496,10 +498,7 @@ def _first_recommendation_text_and_confidence(
         threshold=thr,
         threshold_match=thr_m,
     )
-    if not recs:
-        return None, 0.0
 
-    # Рекомендацию на победу в матче учитываем только при достаточной истории.
     min_match_rec = (
         min_matches_for_match
         if min_matches_for_match is not None
@@ -507,6 +506,8 @@ def _first_recommendation_text_and_confidence(
     )
     if n_home < min_match_rec or n_away < min_match_rec:
         recs = [r for r in recs if not _is_match_win_rec(r.text)]
+
+    # Прогноз только при максимальной уверенности: если ни один исход не прошёл порог — не даём прогноз.
     if not recs:
         return None, 0.0
 
@@ -522,6 +523,10 @@ async def compute_forecast_for_event(
     home_id = event.home_id
     away_id = event.away_id
     if not home_id or not away_id:
+        logger.debug(
+            "no-ML event %s: нет home_id или away_id (прогноз невозможен)",
+            getattr(event, "id", "?"),
+        )
         return None, 0.0
 
     # Для no-ML прогноза используем «умную» статистику:
@@ -533,6 +538,10 @@ async def compute_forecast_for_event(
         getattr(event, "league_id", None),
     )
     if not stats_home or not stats_away:
+        logger.debug(
+            "no-ML event %s: нет статистики по игрокам (в table_tennis_line_events нужны завершённые матчи со счётом)",
+            getattr(event, "id", "?"),
+        )
         return None, 0.0
 
     text, conf = _first_recommendation_text_and_confidence(
@@ -544,6 +553,10 @@ async def compute_forecast_for_event(
         min_matches_for_match=MIN_MATCHES_FOR_MATCH_RECOMMENDATION,
     )
     if not text:
+        logger.debug(
+            "no-ML event %s: нет рекомендации (нет статистики или недостаточно матчей у игроков в table_tennis_line_events)",
+            getattr(event, "id", "?"),
+        )
         return None, 0.0
     return text, conf
 

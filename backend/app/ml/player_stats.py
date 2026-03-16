@@ -20,6 +20,16 @@ def backfill_player_daily_stats_once(limit: int = 50_000) -> int:
                        m.score_sets_p1, m.score_sets_p2
                 FROM matches m
                 WHERE m.status = 'finished' AND m.score_sets_p1 IS NOT NULL
+                  AND (
+                    NOT EXISTS (
+                      SELECT 1 FROM player_elo_history eh
+                      WHERE eh.player_id = m.player1_id AND eh.match_id = m.id
+                    )
+                    OR NOT EXISTS (
+                      SELECT 1 FROM player_elo_history eh
+                      WHERE eh.player_id = m.player2_id AND eh.match_id = m.id
+                    )
+                  )
                 ORDER BY m.start_time ASC
                 LIMIT :lim
             """),

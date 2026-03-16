@@ -405,6 +405,8 @@ async def sync_finished_to_ml_once(
     days_back: int | None = 365,
     since: datetime | None = None,
     offset: int = 0,
+    after_starts_at: datetime | None = None,
+    after_event_id: int = 0,
 ) -> dict[str, int]:
     """Синхронизирует завершённые матчи из основной БД в ML-базу.
     days_back=0 или None — весь архив без ограничения по дате."""
@@ -416,11 +418,13 @@ async def sync_finished_to_ml_once(
         if since is None:
             since = datetime.now(timezone.utc) - timedelta(days=days_back)
         filters.append(TableTennisLineEvent.starts_at >= since)
+    if after_starts_at is not None:
+        filters.append(TableTennisLineEvent.starts_at > after_starts_at)
     async with async_session_maker() as session:
         stmt = (
             select(TableTennisLineEvent)
             .where(*filters)
-            .order_by(TableTennisLineEvent.starts_at.asc())
+            .order_by(TableTennisLineEvent.starts_at.asc(), TableTennisLineEvent.id.asc())
             .offset(offset)
             .limit(limit)
         )
@@ -428,7 +432,15 @@ async def sync_finished_to_ml_once(
         events = list(result.scalars().all())
 
     if not events:
-        return {"synced": 0, "skipped": 0}
+        return {
+            "synced": 0,
+            "skipped": 0,
+            "fetched": 0,
+            "last_event_id": after_event_id or 0,
+            "last_starts_at_ts": (
+                int(after_starts_at.timestamp()) if after_starts_at else 0
+            ),
+        }
 
     ml_session = get_ml_session()
     synced = 0
@@ -450,7 +462,14 @@ async def sync_finished_to_ml_once(
     finally:
         ml_session.close()
 
-    return {"synced": synced, "skipped": len(events) - synced}
+    last_event = events[-1]
+    return {
+        "synced": synced,
+        "skipped": len(events) - synced,
+        "fetched": len(events),
+        "last_event_id": int(last_event.id),
+        "last_starts_at_ts": int(last_event.starts_at.timestamp()) if last_event.starts_at else 0,
+    }
 
 
 async def sync_full_main_to_ml(
@@ -463,6 +482,8 @@ async def sync_full_main_to_ml(
     total_synced = 0
     total_skipped = 0
     offset = 0
+    last_event_id = 0
+    last_starts_at_ts = 0
     while True:
         res = await sync_finished_to_ml_once(
             limit=batch_size,
@@ -474,6 +495,8 @@ async def sync_full_main_to_ml(
         batch_len = synced + skipped
         total_synced += synced
         total_skipped += skipped
+        last_event_id = int(res.get("last_event_id", last_event_id) or last_event_id)
+        last_starts_at_ts = int(res.get("last_starts_at_ts", last_starts_at_ts) or last_starts_at_ts)
         if progress_callback:
             progress_callback(current=total_synced + total_skipped, total=0, message=f"Синхронизировано: {total_synced}, пропущено: {total_skipped}")
         if batch_len == 0:
@@ -481,7 +504,81 @@ async def sync_full_main_to_ml(
         offset += batch_len
         if synced > 0:
             logger.info("Full sync batch: synced=%s, total=%s", synced, total_synced)
-    return {"synced": total_synced, "skipped": total_skipped}
+    return {
+        "synced": total_synced,
+        "skipped": total_skipped,
+        "last_event_id": last_event_id,
+        "last_starts_at_ts": last_starts_at_ts,
+    }
+
+
+async def sync_missing_finished_to_ml_once(limit: int = 10_000) -> dict[str, int]:
+    """Догружает в ML матчи, которые есть в main (finished + счёт), но отсутствуют в ML.
+    Решает рассинхрон (например, после догрузки результатов в main). Вызывать каждый цикл sync."""
+    async with async_session_maker() as session:
+        result = await session.execute(
+            text("""
+                SELECT id FROM table_tennis_line_events
+                WHERE status = :status AND live_sets_score IS NOT NULL
+            """),
+            {"status": LINE_EVENT_STATUS_FINISHED},
+        )
+        main_ids = {str(r[0]) for r in result.fetchall()}
+    if not main_ids:
+        return {"synced": 0, "missing": 0}
+
+    ml_session = get_ml_session()
+    try:
+        # По батчам main_ids спрашиваем ML: какие из них уже есть
+        ml_ids: set[str] = set()
+        main_list = list(main_ids)
+        for i in range(0, len(main_list), 50_000):
+            batch = main_list[i : i + 50_000]
+            rows = ml_session.execute(
+                text("SELECT external_id FROM matches WHERE external_id = ANY(:eids)"),
+                {"eids": batch},
+            ).fetchall()
+            ml_ids.update(str(r[0]) for r in rows)
+    finally:
+        ml_session.close()
+
+    missing_ids = main_ids - ml_ids
+    if not missing_ids:
+        return {"synced": 0, "missing": 0}
+    to_fetch = list(missing_ids)[:limit]
+
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(TableTennisLineEvent).where(
+                TableTennisLineEvent.id.in_(to_fetch),
+                TableTennisLineEvent.status == LINE_EVENT_STATUS_FINISHED,
+                TableTennisLineEvent.live_sets_score.is_not(None),
+            )
+        )
+        events = list(result.scalars().all())
+
+    if not events:
+        return {"synced": 0, "missing": len(missing_ids)}
+
+    ml_session = get_ml_session()
+    synced = 0
+    try:
+        for event in events:
+            try:
+                if _sync_one_match(ml_session, event):
+                    synced += 1
+            except IntegrityError:
+                ml_session.rollback()
+        ml_session.commit()
+    except Exception:
+        ml_session.rollback()
+        raise
+    finally:
+        ml_session.close()
+
+    if synced > 0:
+        logger.info("ML sync missing: synced=%s (main has %s not in ML)", synced, len(missing_ids))
+    return {"synced": synced, "missing": len(missing_ids)}
 
 
 def backfill_odds_from_main_once(limit: int = 50000) -> int:
@@ -489,12 +586,12 @@ def backfill_odds_from_main_once(limit: int = 50000) -> int:
     Для матчей в ML без коэффициентов берёт их из main.
     Использует sync-движок, чтобы избежать конфликта event loop при вызове из worker_cli (asyncio.run)."""
     from sqlalchemy import create_engine, text
+    from sqlalchemy.pool import NullPool
 
     main_engine = create_engine(
         settings.database_url,
         pool_pre_ping=True,
-        pool_size=2,
-        max_overflow=2,
+        poolclass=NullPool,
     )
     with main_engine.connect() as conn:
         result = conn.execute(
@@ -561,6 +658,146 @@ def backfill_odds_from_main_once(limit: int = 50000) -> int:
         raise
     finally:
         ml_session.close()
+        main_engine.dispose()
+
+
+def backfill_odds_from_main_incremental_once(limit: int = 50000, after_match_id: int = 0) -> dict[str, int | bool]:
+    """Инкрементальная догрузка odds с курсором по matches.id (только для матчей без odds)."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.pool import NullPool
+
+    def _load_missing(min_id: int) -> list[tuple[int, str]]:
+        s = get_ml_session()
+        try:
+            return s.execute(
+                text(
+                    """
+                    SELECT m.id, m.external_id
+                    FROM matches m
+                    WHERE m.status = 'finished'
+                      AND m.id > :min_id
+                      AND NOT EXISTS (SELECT 1 FROM odds o WHERE o.match_id = m.id)
+                    ORDER BY m.id ASC
+                    LIMIT :lim
+                    """
+                ),
+                {"min_id": int(min_id or 0), "lim": limit},
+            ).fetchall()
+        finally:
+            s.close()
+
+    rows = _load_missing(after_match_id)
+    wrapped = False
+    if not rows and int(after_match_id or 0) > 0:
+        rows = _load_missing(0)
+        wrapped = True
+    if not rows:
+        return {"added": 0, "fetched": 0, "last_match_id": int(after_match_id or 0), "wrapped": wrapped}
+
+    external_ids = [str(r[1]) for r in rows if r[1]]
+    odds_by_external: dict[str, tuple[float, float]] = {}
+    fetched_from_api = 0
+    if external_ids:
+        main_engine = create_engine(
+            settings.database_url,
+            pool_pre_ping=True,
+            poolclass=NullPool,
+        )
+        with main_engine.connect() as conn:
+            main_rows = conn.execute(
+                text(
+                    """
+                    SELECT CAST(id AS TEXT) AS eid, odds_1, odds_2
+                    FROM table_tennis_line_events
+                    WHERE CAST(id AS TEXT) = ANY(:ids)
+                      AND odds_1 IS NOT NULL AND odds_1 > 0
+                      AND odds_2 IS NOT NULL AND odds_2 > 0
+                    """
+                ),
+                {"ids": external_ids},
+            ).fetchall()
+        for r in main_rows:
+            odds_by_external[str(r[0])] = (float(r[1]), float(r[2]))
+
+        # Fallback: для части матчей без odds в main пробуем добрать через BetsAPI /event/odds.
+        missing_in_main = [eid for eid in external_ids if eid not in odds_by_external]
+        if missing_in_main:
+            max_api_fetch = min(200, len(missing_in_main))
+            to_fetch = missing_in_main[:max_api_fetch]
+            try:
+                import asyncio
+                import httpx
+                from app.services.betsapi_table_tennis import _fetch_event_odds
+
+                async def _fetch_many(event_ids: list[str]) -> dict[str, tuple[float, float]]:
+                    out: dict[str, tuple[float, float]] = {}
+                    sem = asyncio.Semaphore(10)
+                    async with httpx.AsyncClient() as client:
+                        async def _one(eid: str) -> None:
+                            async with sem:
+                                try:
+                                    r = await _fetch_event_odds(client, eid)
+                                except Exception:
+                                    return
+                                if r is not None and r[0] > 0 and r[1] > 0:
+                                    out[eid] = (float(r[0]), float(r[1]))
+
+                        await asyncio.gather(*(_one(eid) for eid in event_ids))
+                    return out
+
+                api_odds = asyncio.run(_fetch_many(to_fetch))
+                if api_odds:
+                    now_db = datetime.now(timezone.utc)
+                    with main_engine.begin() as conn:
+                        for eid, (o1, o2) in api_odds.items():
+                            conn.execute(
+                                text(
+                                    "UPDATE table_tennis_line_events "
+                                    "SET odds_1 = :o1, odds_2 = :o2, updated_at = :now "
+                                    "WHERE CAST(id AS TEXT) = :eid "
+                                    "AND (odds_1 IS NULL OR odds_1 <= 0 OR odds_2 IS NULL OR odds_2 <= 0)"
+                                ),
+                                {"eid": eid, "o1": float(o1), "o2": float(o2), "now": now_db},
+                            )
+                    odds_by_external.update(api_odds)
+                    fetched_from_api = len(api_odds)
+            except Exception:
+                fetched_from_api = 0
+
+    ml_session = get_ml_session()
+    try:
+        added = 0
+        for mid, external_id in rows:
+            e = str(external_id or "")
+            if not e or e not in odds_by_external:
+                continue
+            o1, o2 = odds_by_external[e]
+            ml_session.execute(
+                text(
+                    "INSERT INTO odds (match_id, odds_p1, odds_p2, snapshot_type) "
+                    "VALUES (:mid, :o1, :o2, 'opening')"
+                ),
+                {"mid": int(mid), "o1": float(o1), "o2": float(o2)},
+            )
+            added += 1
+        ml_session.commit()
+        return {
+            "added": int(added),
+            "fetched": int(len(rows)),
+            "last_match_id": int(rows[-1][0] or after_match_id or 0),
+            "wrapped": wrapped,
+            "fetched_from_api": int(fetched_from_api),
+        }
+    except Exception:
+        ml_session.rollback()
+        raise
+    finally:
+        ml_session.close()
+        if external_ids:
+            try:
+                main_engine.dispose()
+            except Exception:
+                pass
 
 
 async def backfill_duration_from_main_once(limit: int = 5000) -> int:
@@ -604,6 +841,134 @@ async def backfill_duration_from_main_once(limit: int = 5000) -> int:
         raise
     finally:
         ml_session.close()
+
+
+def _duration_load_missing_ml(limit: int, after_match_id: int) -> tuple[list, bool]:
+    """Синхронно загружает из ML список матчей без duration. Для вызова из to_thread."""
+    from sqlalchemy import text
+
+    s = get_ml_session()
+    try:
+        rows = s.execute(
+            text(
+                """
+                SELECT id, external_id
+                FROM matches
+                WHERE status = 'finished'
+                  AND id > :min_id
+                  AND (duration_minutes IS NULL OR duration_minutes = 0)
+                ORDER BY id ASC
+                LIMIT :lim
+                """
+            ),
+            {"min_id": int(after_match_id or 0), "lim": limit},
+        ).fetchall()
+    finally:
+        s.close()
+    wrapped = False
+    if not rows and int(after_match_id or 0) > 0:
+        s2 = get_ml_session()
+        try:
+            rows = s2.execute(
+                text(
+                    """
+                    SELECT id, external_id
+                    FROM matches
+                    WHERE status = 'finished'
+                      AND (duration_minutes IS NULL OR duration_minutes = 0)
+                    ORDER BY id ASC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": limit},
+            ).fetchall()
+            wrapped = True
+        finally:
+            s2.close()
+    return (rows or [], wrapped)
+
+
+def _duration_apply_ml_updates_sync(
+    rows: list,
+    main_by_external: dict[str, tuple[datetime, datetime]],
+    after_match_id: int,
+    wrapped: bool,
+) -> dict[str, int | bool]:
+    """Синхронно применяет duration в ML. Для вызова из to_thread."""
+    from sqlalchemy import text
+
+    ml_session = get_ml_session()
+    try:
+        updated = 0
+        for mid, external_id in rows:
+            e = str(external_id or "")
+            if e not in main_by_external:
+                continue
+            starts_at, finished_at = main_by_external[e]
+            if not starts_at or not finished_at:
+                continue
+            delta = finished_at - starts_at
+            dur = max(0, min(180, int(delta.total_seconds() / 60)))
+            res = ml_session.execute(
+                text(
+                    "UPDATE matches SET duration_minutes = :dur "
+                    "WHERE id = :mid AND (duration_minutes IS NULL OR duration_minutes = 0)"
+                ),
+                {"dur": dur, "mid": int(mid)},
+            )
+            if getattr(res, "rowcount", 0) and res.rowcount > 0:
+                updated += 1
+        ml_session.commit()
+        return {
+            "updated": int(updated),
+            "fetched": int(len(rows)),
+            "last_match_id": int(rows[-1][0] or after_match_id or 0) if rows else int(after_match_id or 0),
+            "wrapped": wrapped,
+        }
+    except Exception:
+        ml_session.rollback()
+        raise
+    finally:
+        ml_session.close()
+
+
+async def backfill_duration_from_main_incremental_once(limit: int = 5000, after_match_id: int = 0) -> dict[str, int | bool]:
+    """Инкрементальная догрузка duration_minutes с курсором по matches.id.
+    Тяжёлые sync-операции с ML выполняются в пуле потоков, чтобы не блокировать прогнозы."""
+    import asyncio
+    from sqlalchemy import text
+
+    rows, wrapped = await asyncio.to_thread(_duration_load_missing_ml, limit, after_match_id)
+    if not rows:
+        return {"updated": 0, "fetched": 0, "last_match_id": int(after_match_id or 0), "wrapped": wrapped}
+
+    external_ids = [str(r[1]) for r in rows if r[1]]
+    main_by_external: dict[str, tuple[datetime, datetime]] = {}
+    if external_ids:
+        async with async_session_maker() as main_session:
+            result = await main_session.execute(
+                text(
+                    """
+                    SELECT CAST(id AS TEXT) AS eid, starts_at, finished_at
+                    FROM table_tennis_line_events
+                    WHERE CAST(id AS TEXT) = ANY(:ids)
+                      AND status = 'finished'
+                      AND finished_at IS NOT NULL
+                      AND starts_at IS NOT NULL
+                    """
+                ),
+                {"ids": external_ids},
+            )
+            for r in result.fetchall():
+                main_by_external[str(r[0])] = (r[1], r[2])
+
+    return await asyncio.to_thread(
+        _duration_apply_ml_updates_sync,
+        rows,
+        main_by_external,
+        int(after_match_id or 0),
+        wrapped,
+    )
 
 
 def _backfill_chunk(chunk: list[tuple]) -> int:
@@ -702,6 +1067,113 @@ def backfill_features_once(limit: int = 5000, progress_callback: Any = None, wor
     if progress_callback:
         progress_callback(current=total, total=total, message=f"Готово: {count} фичей")
     return count
+
+
+def backfill_features_incremental_once(
+    limit: int = 5000,
+    after_match_id: int = 0,
+    progress_callback: Any = None,
+    workers: int = 1,
+) -> dict[str, int | bool]:
+    """Инкрементальный расчёт match_features с курсором по matches.id.
+
+    Берёт матчи без фичей, у которых id > after_match_id. Если таких нет, делает один проход с начала
+    (wrap), чтобы догрызть «дырки» в старых данных.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from sqlalchemy import text
+
+    def _load_rows(min_id: int) -> list[tuple]:
+        s = get_ml_session()
+        try:
+            return s.execute(
+                text(
+                    """
+                    SELECT m.id, m.player1_id, m.player2_id, m.start_time, m.league_id
+                    FROM matches m
+                    LEFT JOIN match_features mf ON mf.match_id = m.id
+                    WHERE m.status = 'finished' AND mf.match_id IS NULL
+                      AND m.id > :min_id
+                    ORDER BY m.id ASC
+                    LIMIT :lim
+                    """
+                ),
+                {"min_id": int(min_id or 0), "lim": limit},
+            ).fetchall()
+        finally:
+            s.close()
+
+    rows = _load_rows(after_match_id)
+    wrapped = False
+    if not rows and int(after_match_id or 0) > 0:
+        rows = _load_rows(0)
+        wrapped = True
+
+    total = len(rows)
+    if total == 0:
+        return {
+            "features_added": 0,
+            "fetched": 0,
+            "last_match_id": int(after_match_id or 0),
+            "wrapped": wrapped,
+        }
+
+    match_ids = [r[0] for r in rows]
+    odds_map: dict[int, tuple[float, float]] = {}
+    if match_ids:
+        session = get_ml_session()
+        try:
+            for i in range(0, len(match_ids), 5000):
+                batch = match_ids[i : i + 5000]
+                odds_rows = session.execute(
+                    text("""
+                        SELECT DISTINCT ON (match_id) match_id, odds_p1, odds_p2
+                        FROM odds WHERE match_id = ANY(:ids)
+                        ORDER BY match_id, created_at ASC
+                    """),
+                    {"ids": batch},
+                ).fetchall()
+                for o in odds_rows:
+                    odds_map[o[0]] = (float(o[1] or 1.9), float(o[2] or 1.9))
+        finally:
+            session.close()
+
+    tasks: list[tuple] = []
+    for r in rows:
+        match_id, p1, p2, st, lid = r[0], r[1], r[2], r[3], r[4]
+        o1, o2 = odds_map.get(match_id, (1.9, 1.9))
+        tasks.append((match_id, p1, p2, st, o1, o2, lid or ""))
+
+    num_workers = max(1, min(workers, 16))
+    chunk_size = max(50, (len(tasks) + num_workers - 1) // num_workers)
+    chunks = [tasks[i:i + chunk_size] for i in range(0, len(tasks), chunk_size)]
+
+    if num_workers <= 1 or len(chunks) <= 1:
+        count = _backfill_chunk(tasks)
+        return {
+            "features_added": int(count),
+            "fetched": total,
+            "last_match_id": int(rows[-1][0] or after_match_id or 0),
+            "wrapped": wrapped,
+        }
+
+    count = 0
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        futures = {ex.submit(_backfill_chunk, c): i for i, c in enumerate(chunks)}
+        done = 0
+        for fut in as_completed(futures):
+            count += int(fut.result() or 0)
+            done += 1
+            if progress_callback and done % max(1, len(chunks) // 20) == 0:
+                progress_callback(current=done * chunk_size, total=total, message=f"Backfill: {count} фичей")
+    if progress_callback:
+        progress_callback(current=total, total=total, message=f"Готово: {count} фичей")
+    return {
+        "features_added": int(count),
+        "fetched": total,
+        "last_match_id": int(rows[-1][0] or after_match_id or 0),
+        "wrapped": wrapped,
+    }
 
 
 def check_suspicious_matches_once(limit: int = 2000) -> int:

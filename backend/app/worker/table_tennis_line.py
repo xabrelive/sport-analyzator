@@ -56,7 +56,11 @@ async def start_pipeline() -> None:
     asyncio.create_task(subscription_expiry_loop())
     asyncio.create_task(telegram_channel_dispatcher_loop())
     asyncio.create_task(vip_channel_access_loop())
-    if settings.ml_sync_interval_sec > 0:
+    # Подтяжка ML: в том же процессе или отдельным сервисом (ml_sync). При ml_sync_standalone=true цикл не запускаем здесь.
+    if (
+        settings.ml_sync_interval_sec > 0
+        and not getattr(settings, "ml_sync_standalone", False)
+    ):
         asyncio.create_task(ml_sync_loop())
 
     logger.info(

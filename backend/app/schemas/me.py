@@ -14,6 +14,7 @@ class MeProfile(BaseModel):
     quiet_hours_end: str | None
     notify_telegram: bool
     notify_email: bool
+    notification_tz_offset_minutes: int = 0
     is_telegram_only: bool  # зарегистрирован через Telegram
     is_superadmin: bool
     has_analytics_subscription: bool = False
@@ -26,3 +27,4 @@ class MeSettingsUpdate(BaseModel):
     quiet_hours_end: str | None = None
     notify_telegram: bool | None = None
     notify_email: bool | None = None
+    notification_tz_offset_minutes: int | None = None

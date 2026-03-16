@@ -74,6 +74,14 @@ async def startup():
             settings.smtp_from_email or "(пусто)",
         )
 
+    # Директория очереди ML (backend ставит задачи, ml_worker выполняет). Проверяем доступность.
+    try:
+        from app.services.ml_queue import _queue_dir
+        _queue_dir().mkdir(parents=True, exist_ok=True)
+        logger.info("ML queue dir: %s", _queue_dir())
+    except Exception as e:
+        logger.warning("ML queue dir недоступна (переобучение по кнопке может не работать): %s", e)
+
     # Запускаем фоновые воркеры только если run_background_workers=True (отдельный tt_workers при масштабировании).
     if not settings.run_background_workers:
         logger.info("API-only режим: фоновые воркеры отключены (run_background_workers=false)")
@@ -81,12 +89,14 @@ async def startup():
         try:
             from app.worker.table_tennis_line import start_pipeline
 
-            if (settings.betsapi_token or "").strip():
-                await start_pipeline()
-            else:
-                logger.info("BetsAPI: betsapi_token пуст — опрос линии не запускаем.")
+            await start_pipeline()
+            if not (settings.betsapi_token or "").strip():
+                logger.info(
+                    "BetsAPI: betsapi_token пуст — опрос линии/лайва отключён; "
+                    "прогнозы, Telegram-каналы и личные уведомления работают."
+                )
         except Exception as e:  # noqa: BLE001
-            logger.warning("Не удалось запустить фоновый опрос BetsAPI: %s", e)
+            logger.warning("Не удалось запустить фоновые воркеры: %s", e)
 
 
 @app.exception_handler(Exception)

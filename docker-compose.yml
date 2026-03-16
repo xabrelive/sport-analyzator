@@ -1,4 +1,30 @@
+# Файл .env в корне проекта подключается к сервисам через env_file: .env.
+# Переменные из .env подставляются в environment через ${VAR}; для подстановки docker-compose читает .env при запуске.
+
 services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - sed -i 's#<http_port>8123</http_port>#<http_port>11003</http_port>#; s#<tcp_port>9000</tcp_port>#<tcp_port>11004</tcp_port>#' /etc/clickhouse-server/config.xml && exec /entrypoint.sh
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-ml}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+    ports:
+      - "11003:11003"
+      - "11004:11004"
+    volumes:
+      - pingwin_clickhouse_data:/var/lib/clickhouse
+      - ./ml_ch/schema:/docker-entrypoint-initdb.d:ro
+      - ./ml_ch/config/default-user.xml:/etc/clickhouse-server/users.d/default-user.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:11003/ping >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -7,7 +33,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-pingwin}
     ports:
       - "11002:11002"
-    command: ["postgres", "-c", "port=11002"]
+    command: ["postgres", "-c", "port=11002", "-c", "max_connections=300"]
     volumes:
       - pingwin_postgres_data:/var/lib/postgresql/data
       - ./ml_db/init:/docker-entrypoint-initdb.d:ro
@@ -23,24 +49,45 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     environment:
+      ML_ENGINE: ${ML_ENGINE:-v2}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 11003
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ml}
       DATABASE_URL: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/${POSTGRES_DB:-pingwin}
-      BETSAPI_TOKEN: ${BETSAPI_TOKEN:-}
       DATABASE_URL_ML: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/pingwin_ml
+      RUN_BACKGROUND_WORKERS: "false"
+      BETSAPI_TOKEN: ${BETSAPI_TOKEN:-}
       ML_MODEL_DIR: /app/ml_models
       ML_USE_GPU: ${ML_USE_GPU:-true}
-      RUN_BACKGROUND_WORKERS: "false"
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USE_SSL: ${SMTP_USE_SSL:-false}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+      TELEGRAM_SIGNALS_FREE_CHAT_ID: ${TELEGRAM_SIGNALS_FREE_CHAT_ID:-}
+      TELEGRAM_SIGNALS_VIP_CHAT_ID: ${TELEGRAM_SIGNALS_VIP_CHAT_ID:-}
+      TELEGRAM_SIGNALS_NO_ML_CHAT_ID: ${TELEGRAM_SIGNALS_NO_ML_CHAT_ID:-}
+      TELEGRAM_SIGNALS_FREE_BOT_TOKEN: ${TELEGRAM_SIGNALS_FREE_BOT_TOKEN:-}
+      TELEGRAM_SIGNALS_VIP_BOT_TOKEN: ${TELEGRAM_SIGNALS_VIP_BOT_TOKEN:-}
+      TELEGRAM_SIGNALS_NO_ML_BOT_TOKEN: ${TELEGRAM_SIGNALS_NO_ML_BOT_TOKEN:-}
+      TELEGRAM_CHANNELS_LOOP_INTERVAL_SEC: ${TELEGRAM_CHANNELS_LOOP_INTERVAL_SEC:-60}
+      NOTIFICATIONS_LOOP_INTERVAL_SEC: ${NOTIFICATIONS_LOOP_INTERVAL_SEC:-20}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:11000}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-}
+      SECRET_KEY: ${SECRET_KEY:-change-me}
     volumes:
       - pingwin_ml_models:/app/ml_models
     ports:
       - "11001:11001"
     depends_on:
       postgres:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "11001", "--workers", "1"]
     healthcheck:
@@ -63,12 +110,15 @@ services:
       dockerfile: Dockerfile
       args:
         BACKEND_URL: http://backend:11001
+    env_file: .env
     ports:
       - "11000:11000"
     environment:
       PORT: 11000
       NODE_ENV: production
       BACKEND_URL: http://backend:11001
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+      NEXT_PUBLIC_TELEGRAM_BOT_LINK: ${NEXT_PUBLIC_TELEGRAM_BOT_LINK:-https://t.me/}
 
   telegram_bot:
     build:
@@ -136,22 +186,40 @@ services:
   ml_worker:
     build:
       context: ./backend
-      dockerfile: Dockerfile.ml  # xgboost-cu12 для V100 (cu13 не поддерживает sm_70)
+      dockerfile: Dockerfile.ml  # база: ./scripts/build-ml-base.sh один раз, потом сборка ~секунды
     env_file: .env
     environment:
+      ML_ENGINE: ${ML_ENGINE:-v2}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 11003
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ml}
       PYTHONUNBUFFERED: "1"
       DATABASE_URL: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/${POSTGRES_DB:-pingwin}
       DATABASE_URL_ML: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/pingwin_ml
       ML_MODEL_DIR: /app/ml_models
       ML_USE_GPU: ${ML_USE_GPU:-true}
+      ML_GPU_ONLY: "false"
+      ML_RETRAIN_INTERVAL_SEC: ${ML_RETRAIN_INTERVAL_SEC:-1800}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
-      ML_SYNC_INTERVAL_SEC: ${ML_SYNC_INTERVAL_SEC:-60}
+      ML_SYNC_INTERVAL_SEC: ${ML_SYNC_INTERVAL_SEC:-600}
       ML_SYNC_BATCH_SIZE: ${ML_SYNC_BATCH_SIZE:-15000}
       ML_BACKFILL_WORKERS: ${ML_BACKFILL_WORKERS:-6}
+      # Параметры обучения (из .env): годы, лимиты матчей и сетов — чтобы прогнозы использовали ту же конфигурацию
+      ML_TRAIN_YEAR_START: ${ML_TRAIN_YEAR_START:-2017}
+      ML_TRAIN_YEAR_END: ${ML_TRAIN_YEAR_END:-2026}
+      ML_TRAIN_LIMIT: ${ML_TRAIN_LIMIT:-0}
+      ML_TRAIN_SET_LIMIT: ${ML_TRAIN_SET_LIMIT:-0}
+      ML_VAL_YEAR_START: ${ML_VAL_YEAR_START:-2023}
+      ML_VAL_YEAR_END: ${ML_VAL_YEAR_END:-2024}
+      ML_VAL_LIMIT: ${ML_VAL_LIMIT:-100000}
     volumes:
       - pingwin_ml_models:/app/ml_models
     depends_on:
       postgres:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     command: ["python", "-m", "app.ml.worker_cli", "run"]
     deploy:
@@ -162,25 +230,85 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # Подтяжка main→ML раз в 10 мин в отдельном процессе: не зависит от API, очередей и воркеров линии.
+  ml_sync:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      ML_ENGINE: ${ML_ENGINE:-v2}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 11003
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ml}
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/${POSTGRES_DB:-pingwin}
+      DATABASE_URL_ML: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/pingwin_ml
+      ML_MODEL_DIR: /app/ml_models
+      ML_SYNC_INTERVAL_SEC: ${ML_SYNC_INTERVAL_SEC:-600}
+      ML_SYNC_BATCH_SIZE: ${ML_SYNC_BATCH_SIZE:-15000}
+      ML_BACKFILL_WORKERS: ${ML_BACKFILL_WORKERS:-6}
+      ML_RETRAIN_MIN_NEW_MATCHES: ${ML_RETRAIN_MIN_NEW_MATCHES:-500}
+      ML_RETRAIN_INTERVAL_SEC: ${ML_RETRAIN_INTERVAL_SEC:-1800}
+      ML_SYNC_DAYS_BACK: ${ML_SYNC_DAYS_BACK:-0}
+    volumes:
+      - pingwin_ml_models:/app/ml_models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    command: ["python", "-m", "app.ml.worker_cli", "sync-loop"]
+    restart: unless-stopped
+
   tt_workers:
     build:
       context: ./backend
       dockerfile: Dockerfile
     env_file: .env
     environment:
+      ML_ENGINE: ${ML_ENGINE:-v2}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 11003
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ml}
       DATABASE_URL: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/${POSTGRES_DB:-pingwin}
       DATABASE_URL_ML: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/pingwin_ml
+      RUN_BACKGROUND_WORKERS: "true"
+      # Подтяжка ML идёт в отдельном сервисе ml_sync — в tt_workers цикл не запускаем
+      ML_SYNC_STANDALONE: "true"
+      BETSAPI_TOKEN: ${BETSAPI_TOKEN:-}
       ML_MODEL_DIR: /app/ml_models
       ML_USE_GPU: ${ML_USE_GPU:-true}
-      ML_SYNC_INTERVAL_SEC: ${ML_SYNC_INTERVAL_SEC:-60}
+      ML_SYNC_INTERVAL_SEC: ${ML_SYNC_INTERVAL_SEC:-600}
       ML_SYNC_BATCH_SIZE: ${ML_SYNC_BATCH_SIZE:-15000}
       ML_BACKFILL_WORKERS: ${ML_BACKFILL_WORKERS:-6}
-      RUN_BACKGROUND_WORKERS: "true"
-      BETSAPI_TOKEN: ${BETSAPI_TOKEN:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+      TELEGRAM_SIGNALS_FREE_CHAT_ID: ${TELEGRAM_SIGNALS_FREE_CHAT_ID:-}
+      TELEGRAM_SIGNALS_VIP_CHAT_ID: ${TELEGRAM_SIGNALS_VIP_CHAT_ID:-}
+      TELEGRAM_SIGNALS_NO_ML_CHAT_ID: ${TELEGRAM_SIGNALS_NO_ML_CHAT_ID:-}
+      TELEGRAM_SIGNALS_FREE_BOT_TOKEN: ${TELEGRAM_SIGNALS_FREE_BOT_TOKEN:-}
+      TELEGRAM_SIGNALS_VIP_BOT_TOKEN: ${TELEGRAM_SIGNALS_VIP_BOT_TOKEN:-}
+      TELEGRAM_SIGNALS_NO_ML_BOT_TOKEN: ${TELEGRAM_SIGNALS_NO_ML_BOT_TOKEN:-}
+      TELEGRAM_CHANNELS_LOOP_INTERVAL_SEC: ${TELEGRAM_CHANNELS_LOOP_INTERVAL_SEC:-60}
+      NOTIFICATIONS_LOOP_INTERVAL_SEC: ${NOTIFICATIONS_LOOP_INTERVAL_SEC:-20}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-}
+      SECRET_KEY: ${SECRET_KEY:-change-me}
     volumes:
       - pingwin_ml_models:/app/ml_models
     depends_on:
       postgres:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     command: ["python", "-m", "app.worker.runner"]
     deploy:
@@ -191,6 +319,58 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # Переобучение на GPU (LightGBM + cuML). Не стартует при обычном up -d (profile: train).
+  # Сборка: ./scripts/build-ml-base.sh  Запуск: docker compose run --rm ml_train_gpu
+  ml_train_gpu:
+    profiles:
+      - train
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.ml
+    image: sport-analyzator-ml-train:latest
+    env_file: .env
+    environment:
+      ML_ENGINE: ${ML_ENGINE:-v2}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 11003
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ml}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/${POSTGRES_DB:-pingwin}
+      DATABASE_URL_ML: postgresql://${POSTGRES_USER:-pingwin}:${POSTGRES_PASSWORD:-pingwin}@postgres:11002/pingwin_ml
+      ML_MODEL_DIR: /app/ml_models
+      ML_USE_GPU: "true"
+      # false = считаем калибровку и p_point (на CPU), чтобы модель была точнее
+      ML_GPU_ONLY: "false"
+      # Годы обучения и лимиты (матчей/сетов). При >1M сетов — ML_TRAIN_SET_LIMIT=2000000+
+      ML_TRAIN_YEAR_START: ${ML_TRAIN_YEAR_START:-2017}
+      ML_TRAIN_YEAR_END: ${ML_TRAIN_YEAR_END:-2026}
+      ML_TRAIN_LIMIT: ${ML_TRAIN_LIMIT:-0}
+      ML_TRAIN_SET_LIMIT: ${ML_TRAIN_SET_LIMIT:-0}
+      ML_VAL_YEAR_START: ${ML_VAL_YEAR_START:-2023}
+      ML_VAL_YEAR_END: ${ML_VAL_YEAR_END:-2024}
+      ML_VAL_LIMIT: ${ML_VAL_LIMIT:-100000}
+    volumes:
+      - pingwin_ml_models:/app/ml_models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Один запуск = полное переобучение (LightGBM на GPU, калибровка + p_point на CPU).
+    command:
+      - python
+      - -c
+      - "from app.ml.model_trainer import retrain_models_if_needed; r = retrain_models_if_needed(min_rows=500); print('Result:', r); exit(0 if r.get('trained') else 1)"
+
 volumes:
   pingwin_postgres_data:
   pingwin_ml_models:
+  pingwin_clickhouse_data:

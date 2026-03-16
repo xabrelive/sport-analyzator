@@ -49,6 +49,17 @@ def _str_to_time(s: str | None) -> time | None:
     return None
 
 
+def _normalize_tz_offset_minutes(value: int | None) -> int:
+    # IANA-совместимый practical range: UTC-12 .. UTC+14.
+    if value is None:
+        return 0
+    if value < -720:
+        return -720
+    if value > 840:
+        return 840
+    return int(value)
+
+
 @router.get("", response_model=MeProfile)
 async def get_me(
     user: User = Depends(get_current_user),
@@ -74,6 +85,9 @@ async def get_me(
         quiet_hours_end=_time_to_str(user.quiet_hours_end),
         notify_telegram=bool(user.notify_telegram),
         notify_email=bool(user.notify_email),
+        notification_tz_offset_minutes=_normalize_tz_offset_minutes(
+            getattr(user, "notification_tz_offset_minutes", 0)
+        ),
         is_telegram_only=is_tg_only,
         is_superadmin=bool(getattr(user, "is_superadmin", False)),
         has_analytics_subscription=has_analytics,
@@ -100,6 +114,10 @@ async def update_me(
         user.notify_telegram = bool(data.notify_telegram)
     if data.notify_email is not None:
         user.notify_email = bool(data.notify_email)
+    if data.notification_tz_offset_minutes is not None:
+        user.notification_tz_offset_minutes = _normalize_tz_offset_minutes(
+            data.notification_tz_offset_minutes
+        )
     await session.commit()
     await session.refresh(user)
     telegram_linked = user.telegram_id is not None
@@ -118,6 +136,9 @@ async def update_me(
         quiet_hours_end=_time_to_str(user.quiet_hours_end),
         notify_telegram=bool(user.notify_telegram),
         notify_email=bool(user.notify_email),
+        notification_tz_offset_minutes=_normalize_tz_offset_minutes(
+            getattr(user, "notification_tz_offset_minutes", 0)
+        ),
         is_telegram_only=is_tg_only,
         is_superadmin=bool(getattr(user, "is_superadmin", False)),
         has_analytics_subscription=has_analytics,

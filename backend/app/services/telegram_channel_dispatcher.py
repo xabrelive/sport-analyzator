@@ -230,12 +230,17 @@ async def _pick_late_appeared_candidates(
 async def _load_dispatch_cfg(session: AsyncSession) -> dict:
     row = (
         await session.execute(select(AppSetting).where(AppSetting.key == DISPATCH_CFG_KEY))
-    ).scalar_one_or_none()
-    if not row or not row.value:
+    ).scalars().one_or_none()
+    if not row or not (getattr(row, "value", None) or "").strip():
+        logger.warning(
+            "Telegram dispatch: конфиг из админки не найден в БД (app_setting.%s) — используются дефолты (пустые слоты). Сохраните расписание в админке.",
+            DISPATCH_CFG_KEY,
+        )
         return DEFAULT_DISPATCH_CFG
     try:
         parsed = json.loads(row.value)
         if not isinstance(parsed, dict):
+            logger.warning("Telegram dispatch: значение в БД не объект JSON — используются дефолты")
             return DEFAULT_DISPATCH_CFG
         cfg = json.loads(json.dumps(DEFAULT_DISPATCH_CFG))
         for key in ("free", "vip", "no_ml_channel"):
@@ -262,8 +267,20 @@ async def _load_dispatch_cfg(session: AsyncSession) -> dict:
                 no_ml["stream_interval_minutes"] = no_ml.get("interval_minutes")
             if "stream_group_limit" not in no_ml and "group_limit" in no_ml:
                 no_ml["stream_group_limit"] = no_ml.get("group_limit")
+        n_free = len(free.get("slots") or []) if isinstance(free, dict) else 0
+        n_vip = len(vip.get("slots") or []) if isinstance(vip, dict) else 0
+        logger.debug(
+            "Telegram dispatch: загружен конфиг из БД: free.slots=%s vip.slots=%s",
+            n_free,
+            n_vip,
+        )
         return cfg
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "Telegram dispatch: ошибка разбора конфига из БД (%s) — используются дефолты. Проверьте JSON в админке.",
+            e,
+            exc_info=True,
+        )
         return DEFAULT_DISPATCH_CFG
 
 
@@ -278,6 +295,7 @@ async def _send_telegram(chat_id: int, text: str, reply_to_message_id: int | Non
     else:
         token = ""
     if not token:
+        logger.warning("Telegram канал %s: не задан bot token, сообщение не отправлено", channel)
         return None
     payload: dict[str, object] = {
         "chat_id": chat_id,
@@ -290,11 +308,14 @@ async def _send_telegram(chat_id: int, text: str, reply_to_message_id: int | Non
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
     if r.status_code != 200:
-        logger.warning("Channel telegram send failed: %s %s", r.status_code, r.text[:300])
+        logger.warning(
+            "Telegram канал %s: отправка не удалась HTTP %s — %s",
+            channel, r.status_code, r.text[:300],
+        )
         return None
     data = r.json()
     if not data.get("ok"):
-        logger.warning("Channel telegram send not ok: %s", data)
+        logger.warning("Telegram канал %s: ответ not ok — %s", channel, data)
         return None
     return int((data.get("result") or {}).get("message_id") or 0) or None
 
@@ -413,6 +434,7 @@ async def _send_events_to_channel(
         return 0
     chat_id = _chat_id(channel)
     if chat_id is None:
+        logger.debug("Telegram канал %s: chat_id не задан, отправка пропущена (%s событий)", channel, len(events))
         return 0
     now = _utc_now()
     text = "\n\n".join(_build_event_text(e, f, now) for e, f in events) + "\n\n🐧 <a href=\"https://pingwin.pro\">pingwin.pro</a> — аналитический сервис"
@@ -722,6 +744,8 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                     picks = random.sample(candidates, k=k)
                     sent_vip += await _send_events_to_channel(session, CHANNEL_VIP, picks)
 
+            # FREE и VIP — только по расписанию из админки (слоты + daily_summary). Без захардкоженных fallback.
+
             # no_ml urgent: поздно появившиеся матчи отправляем вне расписания.
             if bool(no_ml_cfg.get("enabled", True)):
                 source = str(no_ml_cfg.get("stream_source") or "no_ml").strip().lower()
@@ -794,9 +818,31 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
     }
 
 
+def _log_channel_config_warnings() -> None:
+    """Один раз при старте: предупреждение, если не заданы токены или chat_id каналов."""
+    for ch, name in ((CHANNEL_FREE, "free"), (CHANNEL_VIP, "vip"), (CHANNEL_NO_ML, "no_ml")):
+        cid = _chat_id(ch)
+        if ch == CHANNEL_FREE:
+            token = (settings.telegram_signals_free_bot_token or "").strip()
+        elif ch == CHANNEL_VIP:
+            token = (settings.telegram_signals_vip_bot_token or "").strip()
+        else:
+            token = (settings.telegram_signals_no_ml_bot_token or "").strip()
+        if not token:
+            logger.warning("Telegram канал %s: не задан bot token — сообщения в канал не отправляются", name)
+        if cid is None:
+            logger.warning("Telegram канал %s: не задан chat_id — сообщения в канал не отправляются", name)
+        elif token and name == "vip":
+            logger.info(
+                "Telegram VIP: закрытый канал поддерживается — бот должен быть администратором канала (chat_id=%s).",
+                cid,
+            )
+
+
 async def telegram_channel_dispatcher_loop() -> None:
     interval = max(20, int(settings.telegram_channels_loop_interval_sec))
     logger.info("Telegram channels loop started: interval=%ss", interval)
+    _log_channel_config_warnings()
     while True:
         try:
             await dispatch_channel_notifications_once()

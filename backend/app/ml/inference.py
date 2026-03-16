@@ -1,14 +1,21 @@
-"""Inference: p_point → Monte Carlo (основной путь). XGB+аналитика — fallback."""
+"""Inference: Elo + ML ансамбль → Monte Carlo → P_match. Value filter на выходе."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
+from app.config import settings
 from app.ml.feature_engine import FeatureEngine, MatchFeatures
 from app.ml.model_trainer import FEATURE_COLS
 from app.ml.probability import p_point_from_features, run_monte_carlo
 from app.ml.value_detector import ValueDetector, expected_value
 from app.ml.signal_filter import SignalFilter, confidence_score
+
+
+def p_elo_from_diff(elo_diff: float) -> float:
+    """Базовая вероятность P1: P_elo = 1 / (1 + 10^(-elo_diff/400)). 65–68% accuracy на своих."""
+    return 1.0 / (1.0 + math.pow(10.0, -elo_diff / 400.0))
 
 
 @dataclass
@@ -29,6 +36,7 @@ def _feat_dict(features: MatchFeatures) -> dict[str, float]:
     """Словарь фичей для модели (базовые + v3 сильные фичи)."""
     base = {
         "elo_diff": features.elo_diff,
+        "elo_probability": p_elo_from_diff(features.elo_diff),
         "form_diff": features.form_diff,
         "fatigue_diff": features.fatigue_diff,
         "h2h_diff": features.h2h_diff,
@@ -58,6 +66,8 @@ def _feat_dict(features: MatchFeatures) -> dict[str, float]:
         "daily_performance_trend_diff": features.daily_performance_trend_diff,
         "dominance_trend_diff": getattr(features, "dominance_trend_diff", 0.0),
         "style_clash": getattr(features, "style_clash", 0.0),
+        "hours_since_last_h2h": getattr(features, "hours_since_last_h2h", 999.0),
+        "league_upset_rate": getattr(features, "league_upset_rate", 0.5),
     }
     return {c: base.get(c, 0.0) for c in FEATURE_COLS}
 
@@ -82,6 +92,13 @@ def predict_for_upcoming(
 
     session = get_ml_session()
     try:
+        match_id_int: int | None = None
+        if match_id is not None:
+            try:
+                match_id_int = int(match_id)
+            except Exception:
+                match_id_int = None
+
         p1_row = session.execute(
             text("SELECT id FROM players WHERE external_id = :eid"),
             {"eid": home_id},
@@ -114,7 +131,7 @@ def predict_for_upcoming(
 
         engine = FeatureEngine()
         features = engine.compute_for_match(
-            match_id or 0,
+            match_id_int or 0,
             p1_id,
             p2_id,
             start_time,
@@ -130,24 +147,47 @@ def predict_for_upcoming(
 
         feat_dict = _feat_dict(features)
 
-        # Приоритет: set_model (tree) → p_point_model (logistic) → ручная формула
-        # XGBoost predict не thread-safe — блокируем для GPU/CPU
+        # Каждый рынок использует свою модель: match_model → матч, set1_model → 1-й сет, set_model (MC) → 2-й сет
+        w_elo = float(getattr(settings, "ml_ensemble_elo_weight", 0.35))
+        p_elo = p_elo_from_diff(features.elo_diff)
         p_match = p_set1 = p_set2 = 0.5
         mc = None
+        model_used = False
         try:
             from app.ml.model_trainer import load_models, predict_proba
-            _, _, set_model, p_point_model = load_models()
+            match_model, set1_model, set_model, p_point_model = load_models()
+
+            # P(матч): своя модель match (ансамбль с Elo)
+            p_match_raw = predict_proba(match_model, feat_dict)
+            p_match = w_elo * p_elo + (1.0 - w_elo) * float(p_match_raw)
+
+            # P(1-й сет): своя модель set1
+            p_set1 = float(predict_proba(set1_model, feat_dict))
+
+            # P(2-й сет): set_model → Monte Carlo → p_set2; при отсутствии set — p_point → MC
             if set_model is not None:
                 p_set = predict_proba(set_model, feat_dict)
                 mc = run_monte_carlo(p_set=p_set, n_sims=20_000)
-                p_match, p_set1, p_set2 = mc.p_match, mc.p_set1, mc.p_set2
+                p_set2 = mc.p_set2
             elif p_point_model is not None:
                 p_set = predict_proba(p_point_model, feat_dict)
                 mc = run_monte_carlo(p_set=p_set, n_sims=20_000)
-                p_match, p_set1, p_set2 = mc.p_match, mc.p_set1, mc.p_set2
+                p_set2 = mc.p_set2
+            else:
+                p_point = p_point_from_features(
+                    features.elo_diff,
+                    features.form_diff,
+                    features.fatigue_diff,
+                    features.h2h_diff,
+                    momentum_diff=features.momentum_today_diff,
+                    fatigue_decay_diff=features.fatigue_decay_diff,
+                    hours_since_last_h2h=getattr(features, "hours_since_last_h2h", 999.0),
+                    matchup_strength_diff=getattr(features, "matchup_strength_diff", 0.0),
+                )
+                mc = run_monte_carlo(p_point=p_point, n_sims=20_000)
+                p_set2 = mc.p_set2
+            model_used = True
         except Exception:
-            pass
-        if mc is None or p_match == 0.5:
             p_point = p_point_from_features(
                 features.elo_diff,
                 features.form_diff,
@@ -159,13 +199,12 @@ def predict_for_upcoming(
                 matchup_strength_diff=getattr(features, "matchup_strength_diff", 0.0),
             )
             mc = run_monte_carlo(p_point=p_point, n_sims=20_000)
-            p_match, p_set1, p_set2 = mc.p_match, mc.p_set1, mc.p_set2
-        p_match = mc.p_match
-        p_set1 = mc.p_set1
-        p_set2 = mc.p_set2
-        model_used = True
+            p_match = w_elo * p_elo + (1.0 - w_elo) * mc.p_match
+            p_set1 = mc.p_set1
+            p_set2 = mc.p_set2
+            model_used = True
 
-        detector = ValueDetector(min_ev=0.08, min_odds=1.6, max_odds=2.6)
+        detector = ValueDetector(min_ev=0.08, min_odds=1.5, max_odds=3.0)
         values = detector.detect(p_match, p_set1, p_set2, odds_p1, odds_p2)
         filter_obj = SignalFilter()
         perf_volatility = max(0.3, 1.0 - (features.std_points_diff_last10_p1 + features.std_points_diff_last10_p2) / 20.0)
@@ -195,6 +234,8 @@ def predict_for_upcoming(
                 daily_performance_trend_p2=getattr(features, "daily_performance_trend_p2", None),
                 matches_played_p1=features.matches_played_p1,
                 matches_played_p2=features.matches_played_p2,
+                fatigue_ratio=features.fatigue_ratio,
+                league_upset_rate=getattr(features, "league_upset_rate", None),
             ):
                 signals.append({
                     "market": v.market,

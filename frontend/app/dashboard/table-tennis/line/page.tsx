@@ -61,6 +61,26 @@ function hasVisibleForecast(value: string | null | undefined): boolean {
   return cleaned !== "" && cleaned !== "—" && cleaned !== "Недостаточно данных для расчёта";
 }
 
+function getMlForecastText(ev: TableTennisLineEvent): string | null {
+  const raw = ev.forecast_ml ?? ev.forecast;
+  return hasVisibleForecast(raw) ? cleanForecastText(raw) : null;
+}
+
+function getNoMlForecastText(ev: TableTennisLineEvent): string | null {
+  return hasVisibleForecast(ev.forecast_no_ml) ? cleanForecastText(ev.forecast_no_ml) : null;
+}
+
+function hasAnyVisibleForecast(ev: TableTennisLineEvent): boolean {
+  return Boolean(getMlForecastText(ev) || getNoMlForecastText(ev));
+}
+
+function getForecastSortValue(ev: TableTennisLineEvent): string {
+  const ml = getMlForecastText(ev);
+  const noMl = getNoMlForecastText(ev);
+  if (ml && noMl) return `${ml}/${noMl}`;
+  return ml || noMl || "";
+}
+
 type StartFilter = "all" | "upcoming" | "live";
 type SortKey =
   | "time"
@@ -97,7 +117,7 @@ function getEventValue(ev: TableTennisLineEvent, key: SortKey): string | number 
     case "away_name":
       return ev.away_name ?? "";
     case "forecast":
-      return (ev.forecast && ev.forecast !== "—" ? ev.forecast : "") || "";
+      return getForecastSortValue(ev);
     default:
       return null;
   }
@@ -195,7 +215,7 @@ export default function TableTennisLinePage() {
       }
       if (filterWithForecastOnly) {
         const hasOdds = ev.odds_1 != null && ev.odds_2 != null;
-        const hasForecastText = hasVisibleForecast(ev.forecast);
+        const hasForecastText = hasAnyVisibleForecast(ev);
         if (!(hasOdds && hasForecastText)) return false;
       }
       return true;
@@ -438,16 +458,31 @@ export default function TableTennisLinePage() {
                       >
                         {data.forecast_locked_message ?? "Для просмотра приобретите подписку"}
                       </Link>
-                    ) : hasVisibleForecast(ev.forecast) ? (
-                      <Link
-                        href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
-                        className="block rounded-md border border-sky-400/40 bg-sky-500/10 px-2 py-1 text-sky-200 hover:border-sky-300/70 hover:text-sky-100"
-                      >
-                        <span className="mr-1 inline-flex rounded bg-sky-400/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-100">
-                          Прогноз
-                        </span>
-                        {cleanForecastText(ev.forecast)}
-                      </Link>
+                    ) : hasAnyVisibleForecast(ev) ? (
+                      <div className="flex flex-col gap-1.5">
+                        {getMlForecastText(ev) && (
+                          <Link
+                            href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
+                            className="inline-flex items-center rounded-md border border-sky-400/40 bg-sky-500/10 px-2 py-1 text-sky-200 hover:border-sky-300/70 hover:text-sky-100 w-fit"
+                          >
+                            <span className="mr-1.5 inline-flex rounded bg-sky-400/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-100">
+                              ML
+                            </span>
+                            <span className="text-sky-100">{getMlForecastText(ev)}</span>
+                          </Link>
+                        )}
+                        {getNoMlForecastText(ev) && (
+                          <Link
+                            href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
+                            className="inline-flex items-center rounded-md border border-amber-400/40 bg-amber-500/10 px-2 py-1 text-amber-200 hover:border-amber-300/70 hover:text-amber-100 w-fit"
+                          >
+                            <span className="mr-1.5 inline-flex rounded bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-100">
+                              no_ML
+                            </span>
+                            <span className="text-amber-100">{getNoMlForecastText(ev)}</span>
+                          </Link>
+                        )}
+                      </div>
                     ) : (
                       <span className="text-slate-400">Недостаточно данных для расчёта</span>
                     )
@@ -637,16 +672,31 @@ export default function TableTennisLinePage() {
                           >
                             {data.forecast_locked_message ?? "Для просмотра приобретите подписку"}
                           </Link>
-                        ) : hasVisibleForecast(ev.forecast) ? (
-                          <Link
-                            href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
-                            className={`inline-flex items-center rounded-md border border-sky-400/35 bg-sky-500/10 px-2 py-1 text-sky-200 hover:border-sky-300/70 hover:text-sky-100 ${compactMode ? "text-[11px] leading-4" : "text-xs leading-5"}`}
-                          >
-                            <span className="mr-1 inline-flex rounded bg-sky-400/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-100">
-                              Прогноз
-                            </span>
-                            {cleanForecastText(ev.forecast)}
-                          </Link>
+                        ) : hasAnyVisibleForecast(ev) ? (
+                          <div className={`flex flex-col gap-1 ${compactMode ? "text-[11px] leading-4" : "text-xs leading-5"}`}>
+                            {getMlForecastText(ev) && (
+                              <Link
+                                href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
+                                className={`inline-flex items-center rounded-md border border-sky-400/35 bg-sky-500/10 px-2 py-1 text-sky-200 hover:border-sky-300/70 hover:text-sky-100 w-fit ${compactMode ? "text-[11px] leading-4" : "text-xs leading-5"}`}
+                              >
+                                <span className="mr-1.5 inline-flex rounded bg-sky-400/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-100">
+                                  ML
+                                </span>
+                                <span className="text-sky-100">{getMlForecastText(ev)}</span>
+                              </Link>
+                            )}
+                            {getNoMlForecastText(ev) && (
+                              <Link
+                                href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
+                                className={`inline-flex items-center rounded-md border border-amber-400/35 bg-amber-500/10 px-2 py-1 text-amber-200 hover:border-amber-300/70 hover:text-amber-100 w-fit ${compactMode ? "text-[11px] leading-4" : "text-xs leading-5"}`}
+                              >
+                                <span className="mr-1.5 inline-flex rounded bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-100">
+                                  no_ML
+                                </span>
+                                <span className="text-amber-100">{getNoMlForecastText(ev)}</span>
+                              </Link>
+                            )}
+                          </div>
                         ) : (
                           <span className={`text-slate-400 ${compactMode ? "text-[11px] leading-4" : "text-xs leading-5"}`}>
                             Недостаточно данных для расчёта
