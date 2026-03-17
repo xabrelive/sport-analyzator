@@ -303,6 +303,7 @@ def _build_line_response(
     rows: list,
     forecast_map_ml: dict[str, str] | None = None,
     forecast_map_no_ml: dict[str, str] | None = None,
+    forecast_map_nn: dict[str, str] | None = None,
 ) -> dict:
     """Собирает ответ с событиями, лигами и игроками по лигам."""
     events = []
@@ -340,6 +341,7 @@ def _build_line_response(
             "forecast": (forecast_map_ml or {}).get(str(r.id)) or r.forecast,
             "forecast_ml": (forecast_map_ml or {}).get(str(r.id)) or r.forecast,
             "forecast_no_ml": (forecast_map_no_ml or {}).get(str(r.id)),
+            "forecast_nn": (forecast_map_nn or {}).get(str(r.id)),
         })
 
     leagues = list(leagues_map.values())
@@ -398,6 +400,7 @@ async def get_table_tennis_live(
     if not access["can_see_forecasts"]:
         forecast_map_ml = None
         forecast_map_no_ml = None
+        forecast_map_nn = None
         forecast_placeholder = FORECAST_LOCKED_ANALYTICS
         forecast_locked = True
         forecast_purchase_url = DASHBOARD_PURCHASE_URL
@@ -417,6 +420,12 @@ async def get_table_tennis_live(
             )
         else:
             forecast_map_no_ml = None
+        if access.get("has_analytics", False):
+            forecast_map_nn = await _load_v2_forecast_map(
+                session, [str(r.id) for r in rows], channel="nn"
+            )
+        else:
+            forecast_map_nn = None
         forecast_placeholder = None
         forecast_locked = False
         forecast_purchase_url = None
@@ -424,6 +433,7 @@ async def get_table_tennis_live(
         rows,
         forecast_map_ml=forecast_map_ml,
         forecast_map_no_ml=forecast_map_no_ml,
+        forecast_map_nn=forecast_map_nn,
     )
     if forecast_locked:
         for ev in resp.get("events", []):
@@ -438,6 +448,7 @@ def _build_live_response(
     rows: list[TableTennisLineEvent],
     forecast_map_ml: dict[str, str] | None = None,
     forecast_map_no_ml: dict[str, str] | None = None,
+    forecast_map_nn: dict[str, str] | None = None,
 ) -> dict:
     events = []
     for r in rows:
@@ -457,6 +468,7 @@ def _build_live_response(
                 "forecast": (forecast_map_ml or {}).get(str(r.id)) or r.forecast,
                 "forecast_ml": (forecast_map_ml or {}).get(str(r.id)) or r.forecast,
                 "forecast_no_ml": (forecast_map_no_ml or {}).get(str(r.id)),
+                "forecast_nn": (forecast_map_nn or {}).get(str(r.id)),
                 "sets_score": r.live_sets_score,
                 "sets": r.live_score or {},
                 "last_score_changed_at": int(r.last_score_changed_at.timestamp()) if r.last_score_changed_at else None,
@@ -561,6 +573,7 @@ async def get_table_tennis_line(
     if not access["can_see_forecasts"]:
         forecast_map_ml = None
         forecast_map_no_ml = None
+        forecast_map_nn = None
         forecast_placeholder = FORECAST_LOCKED_ANALYTICS
         forecast_locked = True
         forecast_purchase_url = DASHBOARD_PURCHASE_URL
@@ -580,6 +593,12 @@ async def get_table_tennis_line(
             )
         else:
             forecast_map_no_ml = None
+        if access.get("has_analytics", False):
+            forecast_map_nn = await _load_v2_forecast_map(
+                session, [str(r.id) for r in rows], channel="nn"
+            )
+        else:
+            forecast_map_nn = None
         forecast_placeholder = None
         forecast_locked = False
         forecast_purchase_url = None
@@ -587,6 +606,7 @@ async def get_table_tennis_line(
         rows,
         forecast_map_ml=forecast_map_ml,
         forecast_map_no_ml=forecast_map_no_ml,
+        forecast_map_nn=forecast_map_nn,
     )
     if forecast_locked:
         for ev in resp.get("events", []):
@@ -878,7 +898,7 @@ async def _build_player_match_context(
     }
 
 
-ALL_CHANNELS = ["free", "paid", "vip", "bot_signals", "no_ml"]
+ALL_CHANNELS = ["free", "paid", "vip", "bot_signals", "no_ml", "nn"]
 
 
 def _allowed_channels_and_resolved(access: dict, channel: str) -> tuple[list[str], bool]:
@@ -902,6 +922,8 @@ def _allowed_channels_and_resolved(access: dict, channel: str) -> tuple[list[str
         # Аналитика без ML: отдельная услуга, доступ только при подписке analytics_no_ml.
         # Без неё показываем только уже завершённые прогнозы (hit/miss), без pending.
         only_resolved = not has_no_ml
+    elif channel == "nn":
+        only_resolved = not has_analytics
     else:
         only_resolved = True
 
@@ -1870,6 +1892,7 @@ async def _line_sse_generator(user: User):
                 if not access["can_see_forecasts"]:
                     forecast_map_ml = None
                     forecast_map_no_ml = None
+                    forecast_map_nn = None
                     forecast_placeholder = FORECAST_LOCKED_ANALYTICS
                     forecast_locked = True
                     forecast_purchase_url = DASHBOARD_PURCHASE_URL
@@ -1889,6 +1912,12 @@ async def _line_sse_generator(user: User):
                         )
                     else:
                         forecast_map_no_ml = None
+                    if access.get("has_analytics", False):
+                        forecast_map_nn = await _load_v2_forecast_map(
+                            session, [str(r.id) for r in rows], channel="nn"
+                        )
+                    else:
+                        forecast_map_nn = None
                     forecast_placeholder = None
                     forecast_locked = False
                     forecast_purchase_url = None
@@ -1896,6 +1925,7 @@ async def _line_sse_generator(user: User):
                 rows,
                 forecast_map_ml=forecast_map_ml,
                 forecast_map_no_ml=forecast_map_no_ml,
+                forecast_map_nn=forecast_map_nn,
             )
             if forecast_locked:
                 for ev in payload.get("events", []):
@@ -2024,6 +2054,7 @@ async def _live_sse_generator(user: User):
                 if not access["can_see_forecasts"]:
                     forecast_map_ml = None
                     forecast_map_no_ml = None
+                    forecast_map_nn = None
                     forecast_placeholder = FORECAST_LOCKED_ANALYTICS
                     forecast_locked = True
                     forecast_purchase_url = DASHBOARD_PURCHASE_URL
@@ -2043,6 +2074,12 @@ async def _live_sse_generator(user: User):
                         )
                     else:
                         forecast_map_no_ml = None
+                    if access.get("has_analytics", False):
+                        forecast_map_nn = await _load_v2_forecast_map(
+                            session, [str(r.id) for r in rows], channel="nn"
+                        )
+                    else:
+                        forecast_map_nn = None
                     forecast_placeholder = None
                     forecast_locked = False
                     forecast_purchase_url = None
@@ -2050,6 +2087,7 @@ async def _live_sse_generator(user: User):
                 rows,
                 forecast_map_ml=forecast_map_ml,
                 forecast_map_no_ml=forecast_map_no_ml,
+                forecast_map_nn=forecast_map_nn,
             )
             if forecast_locked:
                 for ev in payload.get("events", []):

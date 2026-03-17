@@ -1,7 +1,9 @@
 """Admin API: superadmin-only service management."""
 from __future__ import annotations
 
+import asyncio
 import os
+import subprocess
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -748,6 +750,147 @@ async def put_telegram_dispatch_config(
     return {"ok": True}
 
 
+NN_ENV_KEYS = {
+    "ML_V2_ENABLE_NN",
+    "BETSAPI_TABLE_TENNIS_FORECAST_TOLERANCE_MINUTES",
+    "BETSAPI_TABLE_TENNIS_FORECAST_WINDOW_MIN_MINUTES_BEFORE",
+    "BETSAPI_TABLE_TENNIS_FORECAST_ML_MAX_MINUTES_BEFORE",
+    "BETSAPI_TABLE_TENNIS_NN_FORECAST_INTERVAL_SEC",
+    "BETSAPI_TABLE_TENNIS_NN_MIN_CONFIDENCE_TO_PUBLISH",
+    "BETSAPI_TABLE_TENNIS_NN_MIN_MATCH_CONFIDENCE_PCT",
+    "BETSAPI_TABLE_TENNIS_NN_MIN_SET1_CONFIDENCE_PCT",
+    "BETSAPI_TABLE_TENNIS_NN_ALLOW_HARD_CONFIDENCE_FALLBACK",
+    "ML_V2_NN_HIDDEN_LAYERS",
+    "ML_V2_NN_LEARNING_RATE",
+    "ML_V2_NN_ALPHA",
+    "ML_V2_NN_BATCH_SIZE",
+    "ML_V2_NN_MAX_ITER",
+}
+
+
+class AdminNnEnvApplyBody(BaseModel):
+    values: dict[str, str]
+
+
+def _apply_nn_env_values(raw_values: dict[str, str]) -> dict[str, Any]:
+    raw_values = raw_values or {}
+    invalid = sorted([k for k in raw_values.keys() if k not in NN_ENV_KEYS])
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Недопустимые ключи: {', '.join(invalid)}")
+
+    # Allow partial updates: merge only keys provided by frontend.
+    values = {k: str(v).strip() for k, v in raw_values.items() if k in NN_ENV_KEYS}
+    for key, val in values.items():
+        if "\n" in val or "\r" in val:
+            raise HTTPException(status_code=400, detail=f"Недопустимое значение для {key}: перенос строки не разрешен")
+
+    env_path_raw = (os.environ.get("ADMIN_ENV_FILE_PATH") or "").strip()
+    env_path = Path(env_path_raw) if env_path_raw else Path("/app/.env")
+    if not env_path.exists():
+        raise HTTPException(status_code=404, detail=f".env не найден: {env_path}")
+
+    try:
+        content = env_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Не удалось прочитать .env: {exc}") from exc
+
+    lines = content.splitlines()
+    seen: set[str] = set()
+    changed = 0
+    new_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            new_lines.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in values:
+            new_line = f"{key}={values[key]}"
+            new_lines.append(new_line)
+            seen.add(key)
+            if line != new_line:
+                changed += 1
+        else:
+            new_lines.append(line)
+
+    appended = 0
+    for key, val in values.items():
+        if key in seen:
+            continue
+        new_lines.append(f"{key}={val}")
+        appended += 1
+        changed += 1
+
+    try:
+        final_text = "\n".join(new_lines).rstrip("\n") + "\n"
+        env_path.write_text(final_text, encoding="utf-8")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Не удалось записать .env: {exc}") from exc
+
+    return {
+        "path": str(env_path),
+        "updated": changed,
+        "appended": appended,
+    }
+
+
+@router.put("/nn-config/apply-env")
+async def apply_nn_env_config(
+    body: AdminNnEnvApplyBody,
+    _: User = Depends(require_superadmin),
+):
+    result = _apply_nn_env_values(body.values or {})
+    return {
+        "ok": True,
+        **result,
+        "message": "NN-конфиг применен в .env. Перезапустите контейнеры для подхвата.",
+    }
+
+
+@router.put("/nn-config/apply-env-and-restart")
+async def apply_nn_env_and_restart(
+    body: AdminNnEnvApplyBody,
+    _: User = Depends(require_superadmin),
+):
+    result = _apply_nn_env_values(body.values or {})
+
+    compose_file = (os.environ.get("ADMIN_DOCKER_COMPOSE_FILE") or "").strip()
+    cmd = ["docker", "compose"]
+    if compose_file:
+        cmd.extend(["-f", compose_file])
+    cmd.extend(["restart", "backend", "tt_workers"])
+
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"Команда docker недоступна: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail=f"Таймаут перезапуска контейнеров: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Ошибка перезапуска контейнеров: {exc}") from exc
+
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        detail = "\n".join([x for x in [out, err] if x]) or "docker compose restart завершился с ошибкой"
+        raise HTTPException(status_code=500, detail=detail)
+
+    return {
+        "ok": True,
+        **result,
+        "message": "NN-конфиг применен в .env и контейнеры backend/tt_workers перезапущены.",
+        "restart_output": out or err or "restart: ok",
+    }
+
+
 BOT_INFO_KEY = "telegram_bot_info_message"
 
 
@@ -1198,7 +1341,7 @@ async def admin_forecasts_clear_all(
 
     return {
         "ok": True,
-        "message": "Все прогнозы и статистика каналов удалены. Прогнозы будут заново рассчитаны в следующих циклах forecast_v2_loop и no_ml_forecast_loop.",
+        "message": "Все прогнозы и статистика каналов удалены. Прогнозы будут заново рассчитаны в следующих циклах forecast_v2_loop, no_ml_forecast_loop и nn_forecast_loop.",
         "deleted": {
             "telegram_channel_notifications": n_notif,
             "user_forecast_notifications": n_user_notif,
@@ -1332,6 +1475,63 @@ async def admin_forecasts_clear_no_ml(
     return {
         "ok": True,
         "message": "no_ml прогнозы и no_ml статистика очищены. ML данные сохранены.",
+        "deleted": {
+            "telegram_channel_notifications": n_notif,
+            "user_forecast_notifications": n_user_notif,
+            "telegram_channel_markers": n_markers,
+            "table_tennis_forecasts_v2": n_forecasts,
+        },
+    }
+
+
+@router.post("/forecasts/clear-nn")
+async def admin_forecasts_clear_nn(
+    _: User = Depends(require_superadmin),
+):
+    """Удаляет только nn прогнозы/статистику, не трогая ML и no_ml."""
+    from app.db.session import async_session_maker
+
+    nn_channels = ("nn", "nn_channel")
+    nn_channel_notifications = ("nn_channel",)
+
+    async with async_session_maker() as session:
+        nn_forecast_ids_subq = select(TableTennisForecastV2.id).where(
+            TableTennisForecastV2.channel.in_(nn_channels)
+        )
+
+        r1 = await session.execute(
+            delete(TelegramChannelNotification).where(
+                TelegramChannelNotification.channel.in_(nn_channel_notifications)
+            )
+        )
+        n_notif = r1.rowcount
+
+        r2 = await session.execute(
+            delete(UserForecastNotification).where(
+                UserForecastNotification.forecast_v2_id.in_(nn_forecast_ids_subq)
+            )
+        )
+        n_user_notif = r2.rowcount
+
+        r3 = await session.execute(
+            delete(TelegramChannelMarker).where(
+                TelegramChannelMarker.channel.in_(nn_channel_notifications)
+            )
+        )
+        n_markers = r3.rowcount
+
+        r4 = await session.execute(
+            delete(TableTennisForecastV2).where(
+                TableTennisForecastV2.channel.in_(nn_channels)
+            )
+        )
+        n_forecasts = r4.rowcount
+
+        await session.commit()
+
+    return {
+        "ok": True,
+        "message": "nn прогнозы и nn статистика очищены. ML/no_ml данные сохранены.",
         "deleted": {
             "telegram_channel_notifications": n_notif,
             "user_forecast_notifications": n_user_notif,
@@ -1625,6 +1825,20 @@ async def admin_ml_v2_status(
             "betsapi_table_tennis_v2_min_confidence_to_publish": float(getattr(settings, "betsapi_table_tennis_v2_min_confidence_to_publish", 0) or 0),
             "betsapi_table_tennis_v2_allow_hard_confidence_fallback": bool(getattr(settings, "betsapi_table_tennis_v2_allow_hard_confidence_fallback", False)),
             "ml_v2_train_max_league_upset_rate": float(getattr(settings, "ml_v2_train_max_league_upset_rate", 0.45)),
+            "ml_v2_enable_nn": bool(getattr(settings, "ml_v2_enable_nn", False)),
+            "betsapi_table_tennis_forecast_tolerance_minutes": int(getattr(settings, "betsapi_table_tennis_forecast_tolerance_minutes", 5)),
+            "betsapi_table_tennis_forecast_window_min_minutes_before": int(getattr(settings, "betsapi_table_tennis_forecast_window_min_minutes_before", 1)),
+            "betsapi_table_tennis_forecast_ml_max_minutes_before": int(getattr(settings, "betsapi_table_tennis_forecast_ml_max_minutes_before", 60)),
+            "betsapi_table_tennis_nn_forecast_interval_sec": int(getattr(settings, "betsapi_table_tennis_nn_forecast_interval_sec", 60)),
+            "betsapi_table_tennis_nn_min_confidence_to_publish": float(getattr(settings, "betsapi_table_tennis_nn_min_confidence_to_publish", 0) or 0),
+            "betsapi_table_tennis_nn_min_match_confidence_pct": float(getattr(settings, "betsapi_table_tennis_nn_min_match_confidence_pct", 0) or 0),
+            "betsapi_table_tennis_nn_min_set1_confidence_pct": float(getattr(settings, "betsapi_table_tennis_nn_min_set1_confidence_pct", 0) or 0),
+            "betsapi_table_tennis_nn_allow_hard_confidence_fallback": bool(getattr(settings, "betsapi_table_tennis_nn_allow_hard_confidence_fallback", False)),
+            "ml_v2_nn_hidden_layers": str(getattr(settings, "ml_v2_nn_hidden_layers", "")),
+            "ml_v2_nn_learning_rate": float(getattr(settings, "ml_v2_nn_learning_rate", 0) or 0),
+            "ml_v2_nn_alpha": float(getattr(settings, "ml_v2_nn_alpha", 0) or 0),
+            "ml_v2_nn_batch_size": int(getattr(settings, "ml_v2_nn_batch_size", 0) or 0),
+            "ml_v2_nn_max_iter": int(getattr(settings, "ml_v2_nn_max_iter", 0) or 0),
         },
         "v2_meta": v2_meta,
     }

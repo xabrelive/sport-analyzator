@@ -680,6 +680,8 @@ async def revalidate_cancelled_forecast_events_once(limit: int = 100) -> dict[st
     3) При валидном счёте/статусе обновляем line_events и сразу резолвим прогноз.
     """
     now = datetime.now(timezone.utc)
+    # Нужны правила лиг (max_sets_wins/stale_after_minutes), как в result-check воркере.
+    rules_map = await _load_league_rules_map()
     async with async_session_maker() as session:
         ids_result = await session.execute(
             select(TableTennisLineEvent.id, func.max(TableTennisLineEvent.updated_at).label("u"))
@@ -1096,29 +1098,38 @@ async def _fetch_event_result(client: httpx.AsyncClient, event_id: str) -> Dict[
 
     # 1) Пробуем v2 /event.
     url_v2 = f"{BETSAPI_BASE_URL}/event"
-    r = await client.get(url_v2, params=params, timeout=15.0)
-    await _log_betsapi_request("event", r.status_code, r.status_code == 200)
-    if r.status_code == 200:
-        try:
-            data = r.json()
-        except ValueError:
-            logger.warning("BetsAPI: invalid JSON on event result for %s (v2)", event_id)
-            data = {}
-        results = data.get("results")
-        if isinstance(results, list) and results:
-            return results[0]
-        if isinstance(results, dict):
-            return results
+    try:
+        r = await client.get(url_v2, params=params, timeout=15.0)
+    except httpx.TimeoutException:
+        logger.warning("BetsAPI: timeout on event result for %s (v2)", event_id)
+        r = None
+    if r is not None:
+        await _log_betsapi_request("event", r.status_code, r.status_code == 200)
+        if r.status_code == 200:
+            try:
+                data = r.json()
+            except ValueError:
+                logger.warning("BetsAPI: invalid JSON on event result for %s (v2)", event_id)
+                data = {}
+            results = data.get("results")
+            if isinstance(results, list) and results:
+                return results[0]
+            if isinstance(results, dict):
+                return results
 
     # 2) Fallback: b365api v3 /event/view (часто содержит scores для завершённых матчей).
     url_v3 = f"{BET365API_BASE_URL}/v3/event/view"
-    r3 = await client.get(url_v3, params=params, timeout=15.0)
+    try:
+        r3 = await client.get(url_v3, params=params, timeout=15.0)
+    except httpx.TimeoutException:
+        logger.warning("BetsAPI: timeout on event result for %s (v3)", event_id)
+        return None
     await _log_betsapi_request("event/view", r3.status_code, r3.status_code == 200)
     if r3.status_code != 200:
         logger.warning(
             "BetsAPI: event fallback failed for %s: v2=%s, v3=%s",
             event_id,
-            r.status_code,
+            getattr(r, "status_code", None),
             r3.status_code,
         )
         return None

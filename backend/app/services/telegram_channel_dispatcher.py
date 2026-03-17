@@ -126,8 +126,10 @@ def _slot_time(slot_item: dict) -> str:
 
 
 def _slot_source(slot_item: dict) -> str:
-    src = str(slot_item.get("source") or "no_ml").strip().lower()
-    return "paid" if src == "paid" else "no_ml"
+    src = str(slot_item.get("source") or "paid").strip().lower()
+    if src in {"paid", "no_ml", "nn"}:
+        return src
+    return "paid"
 
 
 def _is_late_appeared(
@@ -160,6 +162,13 @@ async def _pick_candidates(
             min_lead_minutes=min_lead_minutes,
             limit=limit,
         )
+    if source == "nn":
+        return await _get_nn_candidates_for_channel(
+            session=session,
+            channel=target_channel,
+            min_lead_minutes=min_lead_minutes,
+            limit=limit,
+        )
     return await _get_no_ml_candidates_for_channel(
         session=session,
         channel=target_channel,
@@ -177,7 +186,7 @@ async def _pick_late_appeared_candidates(
 ) -> list[tuple[TableTennisLineEvent, TableTennisForecastV2]]:
     now = _utc_now()
     max_starts = now + timedelta(minutes=max(0, min_lead_minutes))
-    src_channel = "paid" if source == "paid" else "no_ml"
+    src_channel = "paid" if source == "paid" else ("nn" if source == "nn" else "no_ml")
     rows = (
         await session.execute(
             select(TableTennisLineEvent, TableTennisForecastV2)
@@ -377,6 +386,22 @@ async def _get_candidates(
     min_lead_minutes: int,
     limit: int,
 ) -> list[tuple[TableTennisLineEvent, TableTennisForecastV2]]:
+    return await _get_source_candidates_for_channel(
+        session=session,
+        channel=channel,
+        source_channel="paid",
+        min_lead_minutes=min_lead_minutes,
+        limit=limit,
+    )
+
+
+async def _get_source_candidates_for_channel(
+    session: AsyncSession,
+    channel: str,
+    source_channel: str,
+    min_lead_minutes: int,
+    limit: int,
+) -> list[tuple[TableTennisLineEvent, TableTennisForecastV2]]:
     now = _utc_now()
     min_starts = now + timedelta(minutes=max(0, min_lead_minutes))
     rows = (
@@ -386,7 +411,7 @@ async def _get_candidates(
                 TableTennisForecastV2,
                 and_(
                     TableTennisForecastV2.event_id == TableTennisLineEvent.id,
-                    TableTennisForecastV2.channel == "paid",
+                    TableTennisForecastV2.channel == source_channel,
                     TableTennisForecastV2.status == "pending",
                 ),
             )
@@ -474,53 +499,30 @@ async def _get_no_ml_candidates_for_channel(
     min_lead_minutes: int,
     limit: int,
 ) -> list[tuple[TableTennisLineEvent, TableTennisForecastV2]]:
-    """Кандидаты из канала analytics без ML для отправки в указанный Telegram-канал."""
-    now = _utc_now()
-    min_starts = now + timedelta(minutes=max(0, min_lead_minutes))
-    rows = (
-        await session.execute(
-            select(TableTennisLineEvent, TableTennisForecastV2)
-            .join(
-                TableTennisForecastV2,
-                and_(
-                    TableTennisForecastV2.event_id == TableTennisLineEvent.id,
-                    TableTennisForecastV2.channel == "no_ml",
-                    TableTennisForecastV2.status == "pending",
-                ),
-            )
-            .where(
-                TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
-                TableTennisLineEvent.starts_at > min_starts,
-            )
-            .order_by(TableTennisLineEvent.starts_at.asc(), TableTennisForecastV2.created_at.desc())
-            .limit(limit)
-        )
-    ).all()
-    if not rows:
-        return []
+    """Кандидаты из no_ml канала для отправки в указанный Telegram-канал."""
+    return await _get_source_candidates_for_channel(
+        session=session,
+        channel=channel,
+        source_channel="no_ml",
+        min_lead_minutes=min_lead_minutes,
+        limit=limit,
+    )
 
-    uniq: list[tuple[TableTennisLineEvent, TableTennisForecastV2]] = []
-    seen: set[str] = set()
-    for e, f in rows:
-        eid = str(e.id)
-        if eid in seen:
-            continue
-        seen.add(eid)
-        uniq.append((e, f))
 
-    # Исключаем матчи, которые уже отправлялись в данный канал.
-    already = {
-        str(x[0])
-        for x in (
-            await session.execute(
-                select(TelegramChannelNotification.event_id).where(
-                    TelegramChannelNotification.channel == channel,
-                    TelegramChannelNotification.event_id.in_([str(e.id) for e, _ in uniq]),
-                )
-            )
-        ).all()
-    }
-    return [(e, f) for e, f in uniq if str(e.id) not in already]
+async def _get_nn_candidates_for_channel(
+    session: AsyncSession,
+    channel: str,
+    min_lead_minutes: int,
+    limit: int,
+) -> list[tuple[TableTennisLineEvent, TableTennisForecastV2]]:
+    """Кандидаты из nn канала для отправки в указанный Telegram-канал."""
+    return await _get_source_candidates_for_channel(
+        session=session,
+        channel=channel,
+        source_channel="nn",
+        min_lead_minutes=min_lead_minutes,
+        limit=limit,
+    )
 
 
 async def _ensure_marker(
@@ -544,6 +546,13 @@ async def _ensure_marker(
         )
     )
     return True
+
+
+async def _marker_exists(session: AsyncSession, marker_key: str) -> bool:
+    existing = (
+        await session.execute(select(TelegramChannelMarker.id).where(TelegramChannelMarker.marker_key == marker_key))
+    ).scalar_one_or_none()
+    return existing is not None
 
 
 async def _send_daily_summary(session: AsyncSession, channel: str, hour_utc: int) -> bool:
@@ -699,8 +708,7 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                     if not slot_name or not _slot_passed(now_msk, slot_name):
                         continue
                     marker_key = f"free_slot_msk_{msk_day}_{slot_name}"
-                    created = await _ensure_marker(session, marker_key, CHANNEL_FREE, "slot")
-                    if not created:
+                    if await _marker_exists(session, marker_key):
                         continue
                     source = _slot_source(slot_item)
                     per_slot = max(1, int(slot_item.get("count") or 1))
@@ -716,6 +724,8 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                     k = min(len(candidates), per_slot)
                     picks = random.sample(candidates, k=k)
                     sent_now = await _send_events_to_channel(session, CHANNEL_FREE, picks)
+                    if sent_now > 0:
+                        await _ensure_marker(session, marker_key, CHANNEL_FREE, "slot")
                     sent_free += sent_now
 
             # VIP (paid ML) slots: источник и количество настраиваются по каждому слоту.
@@ -726,8 +736,7 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                     if not slot_name or not _slot_passed(now_msk, slot_name):
                         continue
                     marker_key = f"vip_slot_msk_{vip_day}_{slot_name}"
-                    created = await _ensure_marker(session, marker_key, CHANNEL_VIP, "slot")
-                    if not created:
+                    if await _marker_exists(session, marker_key):
                         continue
                     source = _slot_source(slot_item)
                     per_slot = max(1, int(slot_item.get("count") or 1))
@@ -742,7 +751,10 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                         continue
                     k = min(len(candidates), per_slot)
                     picks = random.sample(candidates, k=k)
-                    sent_vip += await _send_events_to_channel(session, CHANNEL_VIP, picks)
+                    sent_now = await _send_events_to_channel(session, CHANNEL_VIP, picks)
+                    if sent_now > 0:
+                        await _ensure_marker(session, marker_key, CHANNEL_VIP, "slot")
+                    sent_vip += sent_now
 
             # FREE и VIP — только по расписанию из админки (слоты + daily_summary). Без захардкоженных fallback.
 
@@ -755,7 +767,7 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                 urgent_candidates = await _pick_late_appeared_candidates(
                     session=session,
                     target_channel=CHANNEL_NO_ML,
-                    source=("paid" if source == "paid" else "no_ml"),
+                    source=(source if source in {"paid", "no_ml", "nn"} else "no_ml"),
                     min_lead_minutes=min_lead,
                     limit=fetch_limit,
                 )
@@ -778,7 +790,7 @@ async def dispatch_channel_notifications_once() -> dict[str, int]:
                     candidates = await _pick_candidates(
                         session=session,
                         target_channel=CHANNEL_NO_ML,
-                        source=("paid" if source == "paid" else "no_ml"),
+                        source=(source if source in {"paid", "no_ml", "nn"} else "no_ml"),
                         min_lead_minutes=max(0, int(no_ml_cfg.get("min_lead_minutes", settings.telegram_free_min_lead_minutes))),
                         limit=fetch_limit,
                     )

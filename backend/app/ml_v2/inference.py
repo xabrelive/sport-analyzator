@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Any
 import logging
@@ -189,5 +190,133 @@ def predict_for_upcoming_v2(
         )
     except Exception as e:
         logger.warning("ML v2 inference failed (home=%s away=%s): %s", home_id, away_id, e)
+        return None
+
+
+def _load_models_nn_v2() -> tuple[Any, Any, list[str]]:
+    model_dir = Path(getattr(settings, "ml_model_dir", "/tmp/pingwin_ml_models"))
+    m_match = model_dir / "tt_nn_v2_match.joblib"
+    m_set1 = model_dir / "tt_nn_v2_set1.joblib"
+    meta_path = model_dir / "tt_nn_v2_meta.json"
+    if not (m_match.exists() and m_set1.exists()):
+        raise FileNotFoundError("NN v2 models not found")
+    features = list(FEATURE_COLS_V2_TRAIN)
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            f = meta.get("features")
+            if isinstance(f, list) and f:
+                features = [str(x) for x in f]
+        except Exception:
+            pass
+    return joblib.load(m_match), joblib.load(m_set1), features
+
+
+def predict_for_upcoming_nn_v2(
+    home_id: str,
+    away_id: str,
+    league_id: str,
+    odds_p1: float,
+    odds_p2: float,
+    start_time: Any,
+) -> V2Prediction | None:
+    if isinstance(start_time, str):
+        try:
+            start_time = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        except ValueError:
+            start_time = datetime.now(timezone.utc)
+    if start_time is None:
+        start_time = datetime.now(timezone.utc)
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=timezone.utc)
+    try:
+        feat = build_upcoming_feature_vector(
+            home_id=home_id,
+            away_id=away_id,
+            league_id=league_id or "",
+            start_time=start_time,
+            odds_p1=float(odds_p1 or 1.9),
+            odds_p2=float(odds_p2 or 1.9),
+        )
+        feat = _apply_clock_feature_guard(feat)
+        model_match, model_set1, cols = _load_models_nn_v2()
+
+        def _predict_pair(features: dict[str, float]) -> tuple[float, float]:
+            x = pd.DataFrame([{c: float(features.get(c, 0.0)) for c in cols}])
+            p_match_raw = float(model_match.predict_proba(x)[0, 1])
+            p_set1_raw = float(model_set1.predict_proba(x)[0, 1])
+            # Temper NN extremes with Elo prior, same policy as ML v2.
+            p_elo = float(1.0 / (1.0 + 10.0 ** (-(float(features.get("elo_diff", 0.0)) / 400.0))))
+            w_elo = float(getattr(settings, "ml_v2_ensemble_elo_weight", 0.3))
+            w_elo = max(0.0, min(1.0, w_elo))
+            p_match = float((1.0 - w_elo) * p_match_raw + w_elo * p_elo)
+            p_set1 = float((1.0 - w_elo) * p_set1_raw + w_elo * p_elo)
+            return p_match, p_set1
+
+        # Positional-bias correction: direct + swapped complement.
+        p_match_direct, p_set1_direct = _predict_pair(feat)
+        feat_swap = build_upcoming_feature_vector(
+            home_id=away_id,
+            away_id=home_id,
+            league_id=league_id or "",
+            start_time=start_time,
+            odds_p1=float(odds_p2 or 1.9),
+            odds_p2=float(odds_p1 or 1.9),
+        )
+        feat_swap = _apply_clock_feature_guard(feat_swap)
+        p_match_swap_home, p_set1_swap_home = _predict_pair(feat_swap)
+        p_match = float((p_match_direct + (1.0 - p_match_swap_home)) / 2.0)
+        p_set1 = float((p_set1_direct + (1.0 - p_set1_swap_home)) / 2.0)
+        asym_match = abs((p_match_direct + p_match_swap_home) - 1.0)
+        asym_set1 = abs((p_set1_direct + p_set1_swap_home) - 1.0)
+        if asym_match > 0.08 or asym_set1 > 0.08:
+            logger.info(
+                "NN v2 positional asymmetry corrected: match=%.4f set1=%.4f home=%s away=%s",
+                asym_match,
+                asym_set1,
+                str(home_id),
+                str(away_id),
+            )
+        p_set2 = p_set1
+        quality = 0.5 + min(0.45, abs(p_match - 0.5) + abs(p_set1 - 0.5))
+        def _f(key: str, label: str, value: float, norm: float = 1.0) -> dict[str, Any]:
+            direction = "home" if value > 0 else ("away" if value < 0 else "neutral")
+            return {
+                "factor_key": key,
+                "factor_label": label,
+                "factor_value": f"{value:+.4f}" if abs(value) < 10 else f"{value:+.1f}",
+                "contribution": float(value / max(1e-6, norm)),
+                "direction": direction,
+            }
+
+        factors = [
+            {"factor_key": "engine", "factor_label": "Движок", "factor_value": "NN v2", "contribution": 0.0, "direction": "neutral"},
+            _f("elo_diff", "Разница Elo", float(feat.get("elo_diff", 0.0)), 150.0),
+            _f("latent_strength_diff", "Скрытая сила", float(feat.get("latent_strength_diff", 0.0)), 0.2),
+            _f("temporal_strength_diff", "Динамика силы", float(feat.get("temporal_strength_diff", 0.0)), 0.2),
+            _f("form_diff", "Форма", float(feat.get("form_diff", 0.0)), 0.2),
+            _f("winrate_20_diff", "Winrate 20", float(feat.get("winrate_20_diff", 0.0)), 0.15),
+            _f("points_ratio_20_diff", "Points ratio 20", float(feat.get("points_ratio_20_diff", 0.0)), 0.12),
+            _f("sets_ratio_20_diff", "Sets ratio 20", float(feat.get("sets_ratio_20_diff", 0.0)), 0.12),
+            _f("strength_trend_diff", "Тренд силы", float(feat.get("strength_trend_diff", 0.0)), 0.1),
+            _f("fatigue_index_diff", "Усталость", float(feat.get("fatigue_index_diff", 0.0)), 12.0),
+            _f("fatigue_pressure_diff", "Нагрузка 24/48/72h", float(feat.get("fatigue_pressure_diff", 0.0)), 4.0),
+            _f("elo_momentum_diff", "ELO momentum", float(feat.get("elo_momentum_diff", 0.0)), 0.06),
+            _f("h2h_diff", "Личные встречи", float(feat.get("h2h_diff", 0.0)), 0.6),
+            _f("set1_strength_diff", "Сила 1-го сета", float(feat.get("set1_strength_diff", 0.0)), 0.2),
+            _f("league_rating", "Сила лиги", float(feat.get("league_rating", 0.0)) - 0.5, 0.3),
+            _f("style_clash", "Стилевой конфликт", float(feat.get("style_clash", 0.0)), 0.2),
+        ]
+        return V2Prediction(
+            p_match=p_match,
+            p_set1=p_set1,
+            p_set2=p_set2,
+            model_used=True,
+            quality_score=float(max(0.0, min(1.0, quality))),
+            factors=factors,
+            regime_bucket=None,
+        )
+    except Exception as e:
+        logger.warning("NN v2 inference failed (home=%s away=%s): %s", home_id, away_id, e)
         return None
 

@@ -65,8 +65,12 @@ function getNoMlForecastText(ev: TableTennisLiveEvent): string | null {
   return hasVisibleForecast(ev.forecast_no_ml) ? cleanForecastText(ev.forecast_no_ml) : null;
 }
 
+function getNnForecastText(ev: TableTennisLiveEvent): string | null {
+  return hasVisibleForecast(ev.forecast_nn) ? cleanForecastText(ev.forecast_nn) : null;
+}
+
 function hasAnyVisibleForecast(ev: TableTennisLiveEvent): boolean {
-  return Boolean(getMlForecastText(ev) || getNoMlForecastText(ev));
+  return Boolean(getMlForecastText(ev) || getNoMlForecastText(ev) || getNnForecastText(ev));
 }
 
 type StartFilter = "all" | "under_hour" | "over_hour";
@@ -310,6 +314,17 @@ export default function TableTennisLivePage() {
                               <span className="text-amber-100">{getNoMlForecastText(ev)}</span>
                             </Link>
                           )}
+                          {getNnForecastText(ev) && (
+                            <Link
+                              href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
+                              className="inline-flex items-center rounded-md border border-fuchsia-400/40 bg-fuchsia-500/10 px-2 py-1 text-fuchsia-200 hover:border-fuchsia-300/70 hover:text-fuchsia-100 w-fit"
+                            >
+                              <span className="mr-1.5 inline-flex rounded bg-fuchsia-400/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-fuchsia-100">
+                                NN
+                              </span>
+                              <span className="text-fuchsia-100">{getNnForecastText(ev)}</span>
+                            </Link>
+                          )}
                         </div>
                       ) : (
                         <span className="text-slate-400">Недостаточно данных для расчёта</span>
@@ -412,6 +427,17 @@ export default function TableTennisLivePage() {
                                       no_ML
                                     </span>
                                     <span className="text-amber-100">{getNoMlForecastText(ev)}</span>
+                                  </Link>
+                                )}
+                                {getNnForecastText(ev) && (
+                                  <Link
+                                    href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
+                                    className={`inline-flex items-center rounded-md border border-fuchsia-400/35 bg-fuchsia-500/10 px-2 py-1 text-fuchsia-200 hover:border-fuchsia-300/70 hover:text-fuchsia-100 w-fit ${compactMode ? "text-[11px] leading-4" : "text-xs leading-5"}`}
+                                  >
+                                    <span className="mr-1.5 inline-flex rounded bg-fuchsia-400/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-fuchsia-100">
+                                      NN
+                                    </span>
+                                    <span className="text-fuchsia-100">{getNnForecastText(ev)}</span>
                                   </Link>
                                 )}
                               </div>
@@ -545,6 +571,17 @@ export default function TableTennisLivePage() {
                                       no_ML
                                     </span>
                                     <span className="text-amber-100">{getNoMlForecastText(ev)}</span>
+                                  </Link>
+                                )}
+                                {getNnForecastText(ev) && (
+                                  <Link
+                                    href={`/dashboard/table-tennis/matches/${encodeURIComponent(String(ev.id))}`}
+                                    className={`inline-flex items-center rounded-md border border-fuchsia-400/35 bg-fuchsia-500/10 px-2 py-1 text-fuchsia-200 hover:border-fuchsia-300/70 hover:text-fuchsia-100 w-fit ${compactMode ? "text-[11px] leading-4" : "text-xs leading-5"}`}
+                                  >
+                                    <span className="mr-1.5 inline-flex rounded bg-fuchsia-400/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-fuchsia-100">
+                                      NN
+                                    </span>
+                                    <span className="text-fuchsia-100">{getNnForecastText(ev)}</span>
                                   </Link>
                                 )}
                               </div>

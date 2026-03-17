@@ -114,3 +114,42 @@ def score_match_for_forecast(event: "TableTennisLineEvent") -> tuple[ScoredForec
     except Exception as e:
         logger.warning("ML scoring failed for event %s (home=%s away=%s): %s", event.id, getattr(event, "home_id", ""), getattr(event, "away_id", ""), e)
         return None
+
+
+def score_match_for_forecast_nn(event: "TableTennisLineEvent") -> tuple[ScoredForecast, bool] | None:
+    """NN-скоринг для прематча (MLP в ML v2 feature space)."""
+    try:
+        from app.ml_v2.inference import predict_for_upcoming_nn_v2
+
+        pred = predict_for_upcoming_nn_v2(
+            home_id=event.home_id,
+            away_id=event.away_id,
+            league_id=event.league_id or "",
+            odds_p1=float(event.odds_1 or 1.9),
+            odds_p2=float(event.odds_2 or 1.9),
+            start_time=event.starts_at,
+        )
+        if pred is None:
+            return None
+        return (
+            ScoredForecast(
+                p_home_match=round(pred.p_match, 6),
+                p_away_match=round(1.0 - pred.p_match, 6),
+                p_home_set1=round(pred.p_set1, 6),
+                p_away_set1=round(1.0 - pred.p_set1, 6),
+                p_home_set2=round(pred.p_set2, 6),
+                p_away_set2=round(1.0 - pred.p_set2, 6),
+                quality_score=float(pred.quality_score),
+                factors=list(pred.factors[:5]),
+            ),
+            True,
+        )
+    except Exception as e:
+        logger.warning(
+            "NN scoring failed for event %s (home=%s away=%s): %s",
+            event.id,
+            getattr(event, "home_id", ""),
+            getattr(event, "away_id", ""),
+            e,
+        )
+        return None

@@ -4,11 +4,10 @@ import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
-  getTableTennisForecastStats,
   getTableTennisForecasts,
   type TableTennisForecastItem,
-  type TableTennisForecastStats,
 } from "@/lib/api";
+import { forecastMarkKey, getMarkedKeySet, setBetMarked, setBetMarkedBulk } from "@/lib/betMarks";
 
 const STORAGE_KEY_STATS_COMPACT = "tt_stats_compact_mode_v1";
 type PeriodFilter = "today" | "1d" | "7d" | "30d";
@@ -53,22 +52,35 @@ function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-function getRange(period: PeriodFilter): { date_from: string; date_to: string } {
-  const end = new Date();
-  const start = new Date();
+function periodLocalWindow(period: PeriodFilter): { fromSec: number; toSec: number } {
+  const nowMs = Date.now();
   if (period === "today") {
-    return { date_from: isoDate(end), date_to: isoDate(end) };
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+    return { fromSec: Math.floor(start.getTime() / 1000), toSec: Math.floor(end.getTime() / 1000) };
   }
   if (period === "1d") {
-    start.setUTCDate(start.getUTCDate() - 1);
-    return { date_from: isoDate(start), date_to: isoDate(end) };
+    return { fromSec: Math.floor((nowMs - 24 * 60 * 60 * 1000) / 1000), toSec: Math.floor(nowMs / 1000) };
   }
   if (period === "7d") {
-    start.setUTCDate(start.getUTCDate() - 6);
-    return { date_from: isoDate(start), date_to: isoDate(end) };
+    return { fromSec: Math.floor((nowMs - 7 * 24 * 60 * 60 * 1000) / 1000), toSec: Math.floor(nowMs / 1000) };
   }
-  start.setUTCDate(start.getUTCDate() - 29);
-  return { date_from: isoDate(start), date_to: isoDate(end) };
+  return { fromSec: Math.floor((nowMs - 30 * 24 * 60 * 60 * 1000) / 1000), toSec: Math.floor(nowMs / 1000) };
+}
+
+function periodApiRange(period: PeriodFilter): { date_from: string; date_to: string } {
+  const w = periodLocalWindow(period);
+  const from = new Date((w.fromSec - 24 * 60 * 60) * 1000);
+  const to = new Date((w.toSec + 24 * 60 * 60) * 1000);
+  return { date_from: isoDate(from), date_to: isoDate(to) };
+}
+
+function inLocalWindow(item: TableTennisForecastItem, window: { fromSec: number; toSec: number }): boolean {
+  const ts = item.created_at ?? item.starts_at ?? 0;
+  if (!ts) return false;
+  return ts >= window.fromSec && ts < window.toSec;
 }
 
 function cleanForecastText(value: string | null | undefined): string {
@@ -87,15 +99,56 @@ function getQualityTierLabel(item: TableTennisForecastItem): string {
   return m?.[1] || "—";
 }
 
-function sortByMatchStart(list: TableTennisForecastItem[], dir: "asc" | "desc"): TableTennisForecastItem[] {
+function sortByBetGivenAt(list: TableTennisForecastItem[], dir: "asc" | "desc"): TableTennisForecastItem[] {
   return [...list].sort((a, b) => {
-    const aTs = a.starts_at ?? 0;
-    const bTs = b.starts_at ?? 0;
+    const aTs = a.created_at ?? a.starts_at ?? 0;
+    const bTs = b.created_at ?? b.starts_at ?? 0;
     if (aTs !== bTs) return dir === "desc" ? bTs - aTs : aTs - bTs;
-    const aCreated = a.created_at ?? 0;
-    const bCreated = b.created_at ?? 0;
-    return dir === "desc" ? bCreated - aCreated : aCreated - bCreated;
+    const aStart = a.starts_at ?? 0;
+    const bStart = b.starts_at ?? 0;
+    return dir === "desc" ? bStart - aStart : aStart - bStart;
   });
+}
+
+type LoadForecastsResult = {
+  items: TableTennisForecastItem[];
+  only_resolved?: boolean;
+  forecast_purchase_url?: string;
+};
+
+async function loadAllForecasts(params: {
+  channel: "free" | "paid" | "vip" | "bot_signals" | "no_ml" | "nn";
+  quality_tier?: string;
+  date_from?: string;
+  date_to?: string;
+}): Promise<LoadForecastsResult> {
+  const pageSize = 250;
+  const first = await getTableTennisForecasts({
+    page: 1,
+    page_size: pageSize,
+    channel: params.channel,
+    quality_tier: params.quality_tier,
+    date_from: params.date_from,
+    date_to: params.date_to,
+  });
+  const all = [...(first.items || [])];
+  const totalPages = Math.max(1, Math.ceil((first.total || 0) / pageSize));
+  for (let page = 2; page <= totalPages; page += 1) {
+    const next = await getTableTennisForecasts({
+      page,
+      page_size: pageSize,
+      channel: params.channel,
+      quality_tier: params.quality_tier,
+      date_from: params.date_from,
+      date_to: params.date_to,
+    });
+    if (next.items?.length) all.push(...next.items);
+  }
+  return {
+    items: all,
+    only_resolved: first.only_resolved,
+    forecast_purchase_url: first.forecast_purchase_url,
+  };
 }
 
 const ALL_TABS = [
@@ -104,13 +157,13 @@ const ALL_TABS = [
   { id: "bot_signals" as const, label: "Сигналы из бота" },
   { id: "vip" as const, label: "Вип канал" },
   { id: "no_ml" as const, label: "Аналитика без ML" },
+  { id: "nn" as const, label: "Аналитика Нейросетью" },
 ];
 
 export default function TableTennisStatsPage() {
   const searchParams = useSearchParams();
-  const [activeTab, setActiveTab] = useState<"free" | "paid" | "vip" | "bot_signals" | "no_ml">("paid");
+  const [activeTab, setActiveTab] = useState<"free" | "paid" | "vip" | "bot_signals" | "no_ml" | "nn">("paid");
   const [period, setPeriod] = useState<PeriodFilter>("7d");
-  const [stats, setStats] = useState<TableTennisForecastStats | null>(null);
   const [items, setItems] = useState<TableTennisForecastItem[]>([]);
   const [forecastPurchaseUrl, setForecastPurchaseUrl] = useState<string | null>(null);
   const [onlyResolved, setOnlyResolved] = useState(false);
@@ -124,8 +177,10 @@ export default function TableTennisStatsPage() {
   const [qualityTier, setQualityTier] = useState<string>("");
   const [compactMode, setCompactMode] = useState(false);
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
-  const [sortByStart, setSortByStart] = useState<"asc" | "desc">("desc");
+  const [sortByBetTime, setSortByBetTime] = useState<"asc" | "desc">("desc");
   const [phaseFilter, setPhaseFilter] = useState<PhaseFilter>("all");
+  const [markedKeys, setMarkedKeys] = useState<Set<string>>(new Set());
+  const [onlyMarked, setOnlyMarked] = useState(false);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -138,8 +193,12 @@ export default function TableTennisStatsPage() {
   }, [compactMode]);
 
   useEffect(() => {
+    setMarkedKeys(getMarkedKeySet());
+  }, []);
+
+  useEffect(() => {
     const ch = (searchParams.get("channel") || "").toLowerCase();
-    if (ch === "free" || ch === "paid" || ch === "vip" || ch === "bot_signals" || ch === "no_ml") {
+    if (ch === "free" || ch === "paid" || ch === "vip" || ch === "bot_signals" || ch === "no_ml" || ch === "nn") {
       setActiveTab(ch);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -151,30 +210,19 @@ export default function TableTennisStatsPage() {
       setLoading(true);
       setError(null);
       try {
-        const range = getRange(period);
-        const [s, f] = await Promise.all([
-          getTableTennisForecastStats({
-            channel: activeTab,
-            quality_tier: qualityTier || undefined,
-            date_from: range.date_from,
-            date_to: range.date_to,
-          }),
-          getTableTennisForecasts({
-            page,
-            page_size: pageSize,
-            status: statusFilter || undefined,
-            channel: activeTab,
-            quality_tier: qualityTier || undefined,
-            date_from: range.date_from,
-            date_to: range.date_to,
-          }),
-        ]);
+        const range = periodApiRange(period);
+        const localRange = periodLocalWindow(period);
+        const f = await loadAllForecasts({
+          channel: activeTab,
+          quality_tier: qualityTier || undefined,
+          date_from: range.date_from,
+          date_to: range.date_to,
+        });
         if (cancelled) return;
-        setStats(s);
-        setItems(f.items ?? []);
-        setTotal(f.total ?? 0);
-        setForecastPurchaseUrl(s.forecast_purchase_url ?? f.forecast_purchase_url ?? null);
-        setOnlyResolved(Boolean(s.only_resolved ?? f.only_resolved));
+        setItems((f.items ?? []).filter((it) => inLocalWindow(it, localRange)));
+        setTotal(0);
+        setForecastPurchaseUrl(f.forecast_purchase_url ?? null);
+        setOnlyResolved(Boolean(f.only_resolved));
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : "Ошибка загрузки статистики");
       } finally {
@@ -185,27 +233,52 @@ export default function TableTennisStatsPage() {
     return () => {
       cancelled = true;
     };
-  }, [page, pageSize, statusFilter, activeTab, qualityTier, period]);
+  }, [activeTab, qualityTier, period]);
+
+  const isMarked = (item: TableTennisForecastItem): boolean => markedKeys.has(forecastMarkKey(item));
 
   const sortedItems = useMemo(() => {
     const filtered = items.filter((it) => {
+      if (statusFilter && it.status !== statusFilter) return false;
+      if (onlyMarked && !isMarked(it)) return false;
       if (phaseFilter === "all") return true;
       if (phaseFilter === "live") return it.event_status === "live";
       if (phaseFilter === "upcoming") return it.event_status === "scheduled";
       return true;
     });
-    return sortByMatchStart(filtered, sortByStart);
-  }, [items, sortByStart, phaseFilter]);
+    return sortByBetGivenAt(filtered, sortByBetTime);
+  }, [items, statusFilter, onlyMarked, sortByBetTime, phaseFilter, markedKeys]);
 
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const pagedItems = useMemo(
+    () => sortedItems.slice((page - 1) * pageSize, page * pageSize),
+    [sortedItems, page, pageSize],
+  );
+  const totalItems = sortedItems.length;
+  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
   const cellPadClass = compactMode ? "px-2 py-1.5" : "px-3 py-2";
   const tableTextClass = compactMode ? "text-[11px]" : "text-xs md:text-sm";
 
-  const hit = stats?.by_status?.hit ?? 0;
-  const miss = stats?.by_status?.miss ?? 0;
-  const pending = stats?.by_status?.pending ?? 0;
-  const cancelledCount = stats?.by_status?.cancelled ?? 0;
-  const noResult = stats?.by_status?.no_result ?? 0;
+  const hit = items.filter((x) => x.status === "hit").length;
+  const miss = items.filter((x) => x.status === "miss").length;
+  const pending = items.filter((x) => x.status === "pending").length;
+  const cancelledCount = items.filter((x) => x.status === "cancelled").length;
+  const noResult = items.filter((x) => x.status === "no_result").length;
+  const resolvedTotal = hit + miss + cancelledCount + noResult;
+  const hitRate = resolvedTotal > 0 ? (hit / resolvedTotal) * 100 : null;
+  const oddsValues = items
+    .map((x) => x.forecast_odds)
+    .filter((x): x is number => typeof x === "number" && Number.isFinite(x) && x > 0);
+  const avgOdds = oddsValues.length ? oddsValues.reduce((a, b) => a + b, 0) / oddsValues.length : null;
+
+  const toggleMarked = (item: TableTennisForecastItem, marked: boolean) => {
+    setBetMarked(item, marked);
+    setMarkedKeys(getMarkedKeySet());
+  };
+
+  const markVisible = (marked: boolean) => {
+    setBetMarkedBulk(sortedItems, marked);
+    setMarkedKeys(getMarkedKeySet());
+  };
 
   const formatStatus = (item: TableTennisForecastItem): string => {
     if (item.status === "pending") {
@@ -376,7 +449,7 @@ export default function TableTennisStatsPage() {
       <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8 gap-3">
         <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
           <p className="text-slate-400 text-xs mb-1">Всего прогнозов</p>
-          <p className="text-xl font-semibold text-white">{stats?.total ?? 0}</p>
+          <p className="text-xl font-semibold text-white">{items.length}</p>
         </div>
         <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
           <p className="text-slate-400 text-xs mb-1">Угадано</p>
@@ -393,7 +466,7 @@ export default function TableTennisStatsPage() {
         <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
           <p className="text-slate-400 text-xs mb-1">Hit‑rate (все завершённые)</p>
           <p className="text-xl font-semibold text-emerald-300">
-            {stats?.hit_rate != null ? `${stats.hit_rate.toFixed(1)}%` : "—"}
+            {hitRate != null ? `${hitRate.toFixed(1)}%` : "—"}
           </p>
         </div>
         <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
@@ -407,7 +480,7 @@ export default function TableTennisStatsPage() {
         <div className="rounded-lg bg-slate-800/80 border border-slate-700/60 px-4 py-3">
           <p className="text-slate-400 text-xs mb-1">Средний кф</p>
           <p className="text-xl font-semibold text-slate-200">
-            {stats?.avg_odds != null ? stats.avg_odds.toFixed(2) : "—"}
+            {avgOdds != null ? avgOdds.toFixed(2) : "—"}
           </p>
         </div>
       </section>
@@ -488,6 +561,34 @@ export default function TableTennisStatsPage() {
             />
             <span className="text-slate-500">Компактный режим</span>
           </label>
+          <label className="flex items-center gap-2 text-slate-300 text-sm cursor-pointer">
+            <input
+              type="checkbox"
+              checked={onlyMarked}
+              onChange={(e) => {
+                setOnlyMarked(e.target.checked);
+                setPage(1);
+              }}
+              className="rounded border-slate-600 bg-slate-700"
+            />
+            <span className="text-slate-500">Только отмеченные (ставил)</span>
+          </label>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => markVisible(true)}
+              className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800"
+            >
+              Отметить видимые как “ставил”
+            </button>
+            <button
+              type="button"
+              onClick={() => markVisible(false)}
+              className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+            >
+              Снять отметки видимых
+            </button>
+          </div>
           </div>
         </div>
 
@@ -532,6 +633,15 @@ export default function TableTennisStatsPage() {
                       </span>
                       <span className={`font-medium ${statusTextClass(f)}`}>{formatStatus(f)}</span>
                     </div>
+                    <label className="mt-2 inline-flex items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={isMarked(f)}
+                        onChange={(e) => toggleMarked(f, e.target.checked)}
+                        className="h-4 w-4 rounded border-slate-600 bg-slate-800"
+                      />
+                      Ставил
+                    </label>
                     <div className="mt-1 text-xs text-slate-400">
                       {formatMatchPhase(f)} · {formatLeadTime(f.forecast_lead_seconds ?? null)}
                     </div>
@@ -543,13 +653,14 @@ export default function TableTennisStatsPage() {
                   <table className={`w-full ${tableTextClass}`}>
                     <thead>
                       <tr className="border-b border-slate-700 bg-slate-800/80 text-slate-300">
+                        <th className={`${cellPadClass} text-center font-medium whitespace-nowrap`}>Ставил</th>
                         <th className={`${cellPadClass} text-left font-medium`}>Статус матча</th>
                         <th
                           className={`${cellPadClass} text-left font-medium cursor-pointer hover:text-white select-none`}
-                          onClick={() => setSortByStart((d) => (d === "desc" ? "asc" : "desc"))}
-                          title="Сортировка по дате и времени начала матча"
+                          onClick={() => setSortByBetTime((d) => (d === "desc" ? "asc" : "desc"))}
+                          title="Сортировка по дате и времени, когда прогноз был дан"
                         >
-                          Начало матча {sortByStart === "desc" ? "↓" : "↑"}
+                          Дата ставки {sortByBetTime === "desc" ? "↓" : "↑"}
                         </th>
                         <th className={`${cellPadClass} text-center font-medium whitespace-nowrap`}>За сколько до начала</th>
                         <th className={`${cellPadClass} text-left font-medium`}>Матч</th>
@@ -567,13 +678,21 @@ export default function TableTennisStatsPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {sortedItems.map((f, idx) => (
+                      {pagedItems.map((f, idx) => (
                         <tr
                           key={`${f.id ?? f.event_id}-${f.market ?? "match"}-${f.channel ?? "paid"}`}
                           className={`border-b border-slate-700/60 hover:bg-slate-700/25 transition ${
                             idx % 2 === 0 ? "bg-slate-900/5" : "bg-transparent"
                           }`}
                         >
+                          <td className={`${cellPadClass} text-center`}>
+                            <input
+                              type="checkbox"
+                              checked={isMarked(f)}
+                              onChange={(e) => toggleMarked(f, e.target.checked)}
+                              className="h-4 w-4 rounded border-slate-600 bg-slate-800"
+                            />
+                          </td>
                           <td className={`${cellPadClass} whitespace-nowrap text-slate-300 tabular-nums`}>
                             <Link
                               href={`/dashboard/table-tennis/matches/${encodeURIComponent(f.event_id)}`}
@@ -587,7 +706,7 @@ export default function TableTennisStatsPage() {
                               href={`/dashboard/table-tennis/matches/${encodeURIComponent(f.event_id)}`}
                               className="hover:text-emerald-200"
                             >
-                              {formatDateTime(f.starts_at)}
+                              {formatDateTime(f.created_at ?? f.starts_at)}
                             </Link>
                           </td>
                           <td className={`${cellPadClass} text-center text-slate-300 tabular-nums whitespace-nowrap`}>
@@ -654,6 +773,7 @@ export default function TableTennisStatsPage() {
               </button>
               <span className="text-slate-400 text-xs md:text-sm">
                 Страница {page} из {totalPages} · прогнозов {total}
+                Страница {page} из {totalPages} · прогнозов {totalItems}
               </span>
               <button
                 className="rounded-md border border-slate-700 px-3 py-1.5 text-slate-300 disabled:opacity-50"

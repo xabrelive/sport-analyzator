@@ -20,7 +20,7 @@ from app.models.table_tennis_line_event import (
     TableTennisLineEvent,
 )
 from app.models.table_tennis_model_run import TableTennisModelRun
-from app.services.ml_scorer import score_match_for_forecast
+from app.services.ml_scorer import score_match_for_forecast, score_match_for_forecast_nn
 from app.services.outcome_resolver_v2 import resolve_forecast_outcomes_once
 from app.services.pick_selector import select_best_confidence_pick, select_pick
 from app.services.table_tennis_analytics import compute_forecast_for_event
@@ -126,9 +126,15 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
                 .limit(limit)
             )
         ).scalars().all()
+        exclude_names = (getattr(settings, "betsapi_table_tennis_v2_exclude_league_names", "") or "").strip()
+        exclude_parts = [x.strip() for x in exclude_names.split(",") if x.strip()] if exclude_names else []
 
         created = 0
         for event in events:
+            if exclude_parts:
+                league_name = (getattr(event, "league_name", None) or "").strip()
+                if any(part in league_name for part in exclude_parts):
+                    continue
             existing = (
                 await session.execute(
                     select(TableTennisForecastV2)
@@ -180,7 +186,12 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
                         float(_kpi_runtime_state["dynamic_min_edge_pct"]) * 0.4,
                     ),
                 )
-            if not selected and settings.betsapi_table_tennis_v2_allow_hard_confidence_fallback:
+            allow_hard_fallback = bool(
+                getattr(settings, "betsapi_table_tennis_v2_allow_hard_confidence_fallback", False)
+            ) and not bool(
+                getattr(settings, "betsapi_table_tennis_v2_prioritize_quality_over_volume", True)
+            )
+            if not selected and allow_hard_fallback:
                 # Hard fallback: лучший по уверенности; min_odds ниже (1.5), чтобы чаще был хотя бы один прогноз.
                 fallback_min_odds = min(
                     effective_min_odds,
@@ -201,6 +212,45 @@ async def run_forecast_v2_once(limit: int = 400, channel: str = "paid") -> int:
                     scored.p_home_match, scored.p_home_set1,
                 )
                 continue
+
+            # Правило для ML: если коэффициент на выбранную сторону слишком низкий (< threshold),
+            # переворачиваем сторону и текст (П1↔П2), чтобы избегать перекоса в сторону суперфаворита.
+            invert_low_odds_threshold = float(
+                getattr(settings, "betsapi_table_tennis_v2_invert_low_odds_threshold", 0.0) or 0.0
+            )
+            if invert_low_odds_threshold > 1e-9 and selected.odds_used and selected.odds_used < invert_low_odds_threshold:
+                old_odds_used = float(selected.odds_used or 0.0)
+                original_side = selected.side
+                selected.side = "away" if selected.side == "home" else "home"
+                # После инверта пересчитываем всё под новую сторону (иначе conf/edge становятся неконсистентными).
+                selected.odds_used = float(event.odds_1 or 0.0) if selected.side == "home" else float(event.odds_2 or 0.0)
+                if selected.market == "match":
+                    p_new = float(scored.p_home_match if selected.side == "home" else scored.p_away_match)
+                    label = "П1 победа в матче" if selected.side == "home" else "П2 победа в матче"
+                elif selected.market == "set1":
+                    p_new = float(scored.p_home_set1 if selected.side == "home" else scored.p_away_set1)
+                    label = "П1 выиграет 1-й сет" if selected.side == "home" else "П2 выиграет 1-й сет"
+                else:
+                    p_new = float(scored.p_home_set2 if selected.side == "home" else scored.p_away_set2)
+                    label = "П1 выиграет 2-й сет" if selected.side == "home" else "П2 выиграет 2-й сет"
+                implied = (1.0 / selected.odds_used) if selected.odds_used > 1e-9 else 0.0
+                selected.probability_pct = round(p_new * 100.0, 2)
+                selected.edge_pct = round((p_new - implied) * 100.0, 2)
+                selected.confidence_score = round(
+                    selected.probability_pct * (0.4 + 0.6 * float(scored.quality_score)),
+                    2,
+                )
+                selected.forecast_text = f"{label} ({round(selected.probability_pct, 1)}%)"
+                logger.debug(
+                    "ML v2 event %s: invert by low odds (%.2f < %.2f) side %s->%s, new_p=%.2f edge=%.2f",
+                    event.id,
+                    old_odds_used,
+                    invert_low_odds_threshold,
+                    original_side,
+                    selected.side,
+                    selected.probability_pct,
+                    selected.edge_pct,
+                )
 
             # Только уверенные: не публикуем прогноз, если модель не уверена в результате (матч или 1-й сет).
             min_publish = float(getattr(settings, "betsapi_table_tennis_v2_min_confidence_to_publish", 0) or 0)
@@ -419,6 +469,189 @@ async def run_no_ml_forecast_once(limit: int = 400, channel: str = "no_ml") -> i
             )
         elif not created:
             logger.debug("No-ML forecast: 0 событий в окне %s мин – %s ч до старта", min_min, max_hours)
+        return created
+
+
+async def run_forecast_nn_once(limit: int = 400, channel: str = "nn") -> int:
+    """Creates NN forecasts for upcoming scheduled matches."""
+    _init_kpi_runtime_defaults()
+    model_run_id = await _ensure_active_model_run()
+    now = _utc_now()
+    delay_minutes = max(0, settings.betsapi_table_tennis_forecast_delay_minutes)
+    earliest_created_at = now - timedelta(minutes=delay_minutes)
+    window_min = max(1, int(getattr(settings, "betsapi_table_tennis_forecast_window_min_minutes_before", 1)))
+    window_max = max(1, int(getattr(settings, "betsapi_table_tennis_forecast_ml_max_minutes_before", 60)))
+    window_start = now + timedelta(minutes=window_min)
+    window_end = now + timedelta(minutes=min(window_max, 300))
+
+    async with async_session_maker() as session:
+        events = (
+            await session.execute(
+                select(TableTennisLineEvent).where(
+                    and_(
+                        TableTennisLineEvent.status == LINE_EVENT_STATUS_SCHEDULED,
+                        TableTennisLineEvent.starts_at > now,
+                        TableTennisLineEvent.starts_at >= window_start,
+                        TableTennisLineEvent.starts_at <= window_end,
+                        TableTennisLineEvent.created_at <= earliest_created_at,
+                        TableTennisLineEvent.odds_1.is_not(None),
+                        TableTennisLineEvent.odds_2.is_not(None),
+                    )
+                )
+                # NN: приоритет свежим событиям, затем ближайшим к старту.
+                .order_by(TableTennisLineEvent.created_at.desc(), TableTennisLineEvent.starts_at.asc())
+                .limit(limit)
+            )
+        ).scalars().all()
+
+        created = 0
+        min_publish = float(getattr(settings, "betsapi_table_tennis_nn_min_confidence_to_publish", 62.0) or 62.0)
+        min_match_conf = float(getattr(settings, "betsapi_table_tennis_nn_min_match_confidence_pct", 66.0) or 66.0)
+        min_set1_conf = float(getattr(settings, "betsapi_table_tennis_nn_min_set1_confidence_pct", 67.0) or 67.0)
+        allow_nn_hard_fallback = bool(
+            getattr(settings, "betsapi_table_tennis_nn_allow_hard_confidence_fallback", False)
+        )
+        conf_floor = float(
+            getattr(
+                settings,
+                "betsapi_table_tennis_nn_confidence_filter_min_pct",
+                getattr(settings, "betsapi_table_tennis_v2_confidence_filter_min_pct", 0),
+            )
+            or 0
+        )
+        effective_min_conf = max(float(_kpi_runtime_state["dynamic_min_confidence_pct"]), conf_floor)
+        # Для NN держим строгий порог публикации: не ниже min_publish и не ниже базового NN confidence-гейта.
+        nn_pick_min_conf = max(min_publish, min(min_match_conf, min_set1_conf), effective_min_conf)
+        effective_min_odds = max(
+            float(_kpi_runtime_state["dynamic_min_odds"]),
+            float(
+                getattr(
+                    settings,
+                    "betsapi_table_tennis_nn_preferred_min_odds",
+                    getattr(settings, "betsapi_table_tennis_v2_preferred_min_odds", 1.75),
+                )
+            ),
+        )
+
+        skip_low_nn_conf = 0
+        for event in events:
+            existing = (
+                await session.execute(
+                    select(TableTennisForecastV2)
+                    .where(
+                        and_(
+                            TableTennisForecastV2.event_id == event.id,
+                            TableTennisForecastV2.channel == channel,
+                        )
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing:
+                continue
+
+            scored_result = score_match_for_forecast_nn(event)
+            if scored_result is None:
+                continue
+            scored, _ = scored_result
+            nn_match_conf = max(scored.p_home_match, scored.p_away_match) * 100.0
+            nn_set1_conf = max(scored.p_home_set1, scored.p_away_set1) * 100.0
+            # NN публикуем только если уверена в матче или в 1-м сете.
+            if nn_match_conf < min_match_conf and nn_set1_conf < min_set1_conf:
+                skip_low_nn_conf += 1
+                continue
+            # NN: выбираем один рынок с максимальной уверенностью между match и set1.
+            selected = select_best_confidence_pick(
+                scored=scored,
+                odds_home=float(event.odds_1 or 0.0),
+                odds_away=float(event.odds_2 or 0.0),
+                min_odds=effective_min_odds,
+            )
+            if not selected and allow_nn_hard_fallback:
+                selected = select_best_confidence_pick(
+                    scored=scored,
+                    odds_home=float(event.odds_1 or 0.0),
+                    odds_away=float(event.odds_2 or 0.0),
+                    min_odds=min(effective_min_odds, float(getattr(settings, "betsapi_table_tennis_min_odds_for_forecast", 1.5))),
+                )
+            if not selected or selected.probability_pct < nn_pick_min_conf:
+                skip_low_nn_conf += 1
+                continue
+            # NN: рынок должен проходить именно свой confidence-гейт, а не «любой из match/set1».
+            if selected.market == "match" and nn_match_conf < min_match_conf:
+                skip_low_nn_conf += 1
+                continue
+            if selected.market == "set1" and nn_set1_conf < min_set1_conf:
+                skip_low_nn_conf += 1
+                continue
+            if selected.market not in {"match", "set1"}:
+                skip_low_nn_conf += 1
+                continue
+
+            if selected.market == "match":
+                chosen_market = "match"
+                chosen_conf = nn_match_conf
+                alt_market = "set1"
+                alt_conf = nn_set1_conf
+            else:
+                chosen_market = "set1"
+                chosen_conf = nn_set1_conf
+                alt_market = "match"
+                alt_conf = nn_match_conf
+
+            row = TableTennisForecastV2(
+                event_id=event.id,
+                channel=channel,
+                model_run_id=model_run_id,
+                market=selected.market,
+                pick_side=selected.side,
+                forecast_text=selected.forecast_text,
+                probability_pct=selected.probability_pct,
+                edge_pct=selected.edge_pct,
+                confidence_score=selected.confidence_score,
+                odds_used=selected.odds_used,
+                status="pending",
+                final_status=None,
+                final_sets_score=None,
+                explanation_summary=(
+                    f"Tier {selected.quality_tier} [NN]: edge {selected.edge_pct:.2f}%, "
+                    f"conf {selected.confidence_score:.2f}% | match={nn_match_conf:.1f}% set1={nn_set1_conf:.1f}% "
+                    f"| picked {chosen_market} ({chosen_conf:.1f}%) over {alt_market} ({alt_conf:.1f}%)"
+                ),
+            )
+            session.add(row)
+            await session.flush()
+            await session.execute(
+                delete(TableTennisForecastExplanation).where(
+                    TableTennisForecastExplanation.forecast_v2_id == row.id
+                )
+            )
+            for factor in scored.factors[:5]:
+                session.add(
+                    TableTennisForecastExplanation(
+                        forecast_v2_id=row.id,
+                        factor_key=str(factor.get("factor_key") or "unknown"),
+                        factor_label=str(factor.get("factor_label") or "Фактор"),
+                        factor_value=str(factor.get("factor_value") or ""),
+                        contribution=float(factor.get("contribution") or 0.0),
+                        direction=str(factor.get("direction") or "neutral"),
+                        rank=int(factor.get("rank") or 0),
+                    )
+                )
+            created += 1
+        if created:
+            await session.commit()
+        elif events:
+            logger.info(
+                "NN forecast: 0 created for %s events (strict confidence gate). "
+                "min_match=%.1f min_set1=%.1f min_publish=%.1f pick_min=%.1f skipped=%s",
+                len(events),
+                min_match_conf,
+                min_set1_conf,
+                min_publish,
+                nn_pick_min_conf,
+                skip_low_nn_conf,
+            )
         return created
 
 
@@ -667,6 +900,21 @@ async def no_ml_forecast_loop() -> None:
         except Exception:
             logger.exception("No-ML forecast loop failed")
         await asyncio.sleep(interval_no_ml)
+
+
+async def nn_forecast_loop() -> None:
+    """NN forecast loop (third analytics channel)."""
+    interval_nn = max(30, int(getattr(settings, "betsapi_table_tennis_nn_forecast_interval_sec", 60)))
+    while True:
+        try:
+            cnt = await run_forecast_nn_once(
+                limit=settings.betsapi_table_tennis_v2_forecast_batch_size,
+                channel="nn",
+            )
+            logger.info("NN forecast loop created/updated=%s", cnt)
+        except Exception:
+            logger.exception("NN forecast loop failed")
+        await asyncio.sleep(interval_nn)
 
 
 async def result_priority_loop() -> None:

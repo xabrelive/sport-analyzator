@@ -83,19 +83,26 @@ class Settings(BaseSettings):
     betsapi_table_tennis_no_ml_invert_pick_league_names: str = "Czech Liga Pro,TT cup,ТТ cup,Setka Cup,Сетка Кап"
     # Лиги, для которых no_ML прогноз не выдаём (низкий % угадывания); через запятую, подстрока в league_name.
     betsapi_table_tennis_no_ml_exclude_league_names: str = ""
+    # no_ML quality controls (усиление/ослабление без правок кода)
+    betsapi_table_tennis_no_ml_confidence_threshold_set: float = 0.65
+    betsapi_table_tennis_no_ml_confidence_threshold_match: float = 0.65
+    betsapi_table_tennis_no_ml_min_matches_for_recommendation: int = 2
+    betsapi_table_tennis_no_ml_min_matches_for_match_recommendation: int = 4
+    betsapi_table_tennis_no_ml_min_confidence_margin: float = 0.03
     # V2 loops and KPI targets
     betsapi_table_tennis_v2_features_interval_sec: int = 300
     betsapi_table_tennis_v2_forecast_interval_sec: int = 60  # ML-прогнозы: интервал цикла (сек). 60 = раз в минуту
-    betsapi_table_tennis_no_ml_forecast_interval_sec: int = 180  # no_ML прогнозы: интервал цикла (сек). 180 = раз в 3 мин
+    betsapi_table_tennis_nn_forecast_interval_sec: int = 60  # NN-прогнозы: интервал цикла (сек). 60 = раз в минуту
+    betsapi_table_tennis_no_ml_forecast_interval_sec: int = 60  # no_ML прогнозы: интервал цикла (сек). 60 = раз в минуту
     betsapi_table_tennis_early_scan_interval_sec: int = 600  # Stage 1: раз в 10 мин
     betsapi_table_tennis_v2_result_priority_interval_sec: int = 20
     betsapi_table_tennis_v2_kpi_guard_interval_sec: int = 60
     betsapi_table_tennis_v2_forecast_batch_size: int = 400
     betsapi_table_tennis_v2_target_hit_rate: float = 85.0
     betsapi_table_tennis_v2_target_picks_per_day: int = 300
-    betsapi_table_tennis_v2_min_confidence_floor: float = 60.0
+    betsapi_table_tennis_v2_min_confidence_floor: float = 55.0
     betsapi_table_tennis_v2_min_confidence_ceiling: float = 88.0
-    betsapi_table_tennis_v2_base_min_confidence: float = 68.0  # только кандидаты с P >= 68% (меньше прогнозов, выше уверенность)
+    betsapi_table_tennis_v2_base_min_confidence: float = 60.0  # кандидаты с P >= 60%
     betsapi_table_tennis_v2_min_edge_floor: float = 0.0
     betsapi_table_tennis_v2_min_edge_ceiling: float = 8.0
     betsapi_table_tennis_v2_base_min_edge: float = 0.0
@@ -104,11 +111,22 @@ class Settings(BaseSettings):
     # Paid ML: quality-first профиль (меньше сигналов, выше средний коэффициент/уверенность).
     betsapi_table_tennis_v2_preferred_min_odds: float = 1.75
     betsapi_table_tennis_v2_allow_soft_fallback: bool = False
-    betsapi_table_tennis_v2_allow_hard_confidence_fallback: bool = False  # false = не брать «лучший по уверенности», если нет пика с высоким P — прогноз не даём
-    betsapi_table_tennis_v2_min_confidence_to_publish: float = 68.0  # публикуем только если P >= 68% (меньше прогнозов, выше точность)
+    betsapi_table_tennis_v2_allow_hard_confidence_fallback: bool = False  # quality-first: fallback только при явном включении
+    betsapi_table_tennis_v2_min_confidence_to_publish: float = 60.0  # публикуем если P >= 60%
+    betsapi_table_tennis_nn_min_confidence_to_publish: float = 62.0  # NN: публикуем только уверенные сигналы
+    betsapi_table_tennis_nn_min_match_confidence_pct: float = 66.0  # NN: минимум уверенности по исходу матча
+    betsapi_table_tennis_nn_min_set1_confidence_pct: float = 67.0  # NN: минимум уверенности по 1-му сету
+    betsapi_table_tennis_nn_allow_hard_confidence_fallback: bool = False  # false = не публиковать NN "любой ценой", только строгие сигналы
+    # NN thresholds (отдельно от ML paid), чтобы NN-канал не зажимался quality-фильтрами ML.
+    betsapi_table_tennis_nn_confidence_filter_min_pct: float = 62.0
+    betsapi_table_tennis_nn_preferred_min_odds: float = 1.6
     betsapi_table_tennis_v2_prioritize_quality_over_volume: bool = True
-    # Доп. порог в селекторе: только кандидаты с P >= этого % (0 = выкл). Задаёт нижнюю границу уверенности.
+    # Доп. порог в селекторе: только кандидаты с P >= этого %.
     betsapi_table_tennis_v2_confidence_filter_min_pct: float = 65.0
+    # ML: исключить лиги из публикации (через запятую, подстрока в league_name).
+    betsapi_table_tennis_v2_exclude_league_names: str = ""
+    # Если коэффициент на выбранную сторону < этого порога — для ML переворачиваем сторону (дом/гость) и текст.
+    betsapi_table_tennis_v2_invert_low_odds_threshold: float = 1.5
     table_tennis_match_sets_to_win: int = 3
     # ML pipeline: синхронизация main→ML и переобучение, интервал в секундах (0 = отключено)
     ml_sync_interval_sec: int = 600  # 10 мин: подтяжка данных + retrain
@@ -169,6 +187,12 @@ class Settings(BaseSettings):
     ml_v2_train_max_league_upset_rate: float = 0.45  # лиги с upset rate > — исключаем из train (chaos leagues)
     ml_v2_use_experience_regimes: bool = True  # True = обучать 4 модели (rookie/low/mid/pro); инференс всегда использует bucket-модели при наличии файлов
     ml_v2_experience_regime_min_train: int = 500  # минимум строк в bucket для обучения отдельной модели
+    ml_v2_enable_nn: bool = True  # обучать и использовать NN-модели (MLP) как отдельный канал "nn"
+    ml_v2_nn_hidden_layers: str = "128,64"
+    ml_v2_nn_learning_rate: float = 0.001
+    ml_v2_nn_alpha: float = 0.0001
+    ml_v2_nn_batch_size: int = 256
+    ml_v2_nn_max_iter: int = 120
     # Guard against time-of-day leakage: disable clock-derived features in v2 model.
     ml_v2_disable_clock_features: bool = True
 

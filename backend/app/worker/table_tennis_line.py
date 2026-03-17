@@ -28,6 +28,7 @@ async def start_pipeline() -> None:
     from app.services.forecast_v2_pipeline import (
         early_scan_loop,
         forecast_v2_loop,
+        nn_forecast_loop,
         no_ml_forecast_loop,
         result_priority_loop,
         kpi_guard_loop,
@@ -49,6 +50,7 @@ async def start_pipeline() -> None:
     asyncio.create_task(table_tennis_results_loop())
     asyncio.create_task(early_scan_loop())
     asyncio.create_task(forecast_v2_loop())
+    asyncio.create_task(nn_forecast_loop())
     asyncio.create_task(no_ml_forecast_loop())
     asyncio.create_task(result_priority_loop())
     asyncio.create_task(kpi_guard_loop())

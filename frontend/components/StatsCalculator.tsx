@@ -3,8 +3,9 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { getTableTennisForecasts, type TableTennisForecastItem } from "@/lib/api";
+import { isBetMarked } from "@/lib/betMarks";
 
-type CalcChannel = "free" | "paid" | "vip" | "bot_signals" | "no_ml";
+type CalcChannel = "free" | "paid" | "vip" | "bot_signals" | "no_ml" | "nn";
 type CalcItem = TableTennisForecastItem & { selected: boolean };
 
 const PER_PAGE_OPTIONS = [20, 50, 100];
@@ -18,26 +19,52 @@ const PERIODS: Array<{ id: PeriodFilter; label: string }> = [
   { id: "30d", label: "30 дней" },
 ];
 
-function isoDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
+function parseLocalDateAtStart(value: string): Date | null {
+  if (!value) return null;
+  const [y, m, d] = value.split("-").map((x) => Number(x));
+  if (!y || !m || !d) return null;
+  const dt = new Date(y, m - 1, d, 0, 0, 0, 0);
+  return Number.isNaN(dt.getTime()) ? null : dt;
 }
 
-function getRange(period: PeriodFilter): { date_from: string; date_to: string } {
-  const end = new Date();
-  const start = new Date();
+function localWindow(period: PeriodFilter | null, dateFrom: string, dateTo: string): { fromSec: number; toSec: number } {
+  const nowMs = Date.now();
   if (period === "today") {
-    return { date_from: isoDate(end), date_to: isoDate(end) };
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+    return { fromSec: Math.floor(start.getTime() / 1000), toSec: Math.floor(end.getTime() / 1000) };
   }
   if (period === "1d") {
-    start.setUTCDate(start.getUTCDate() - 1);
-    return { date_from: isoDate(start), date_to: isoDate(end) };
+    return { fromSec: Math.floor((nowMs - 24 * 60 * 60 * 1000) / 1000), toSec: Math.floor(nowMs / 1000) };
   }
   if (period === "7d") {
-    start.setUTCDate(start.getUTCDate() - 6);
-    return { date_from: isoDate(start), date_to: isoDate(end) };
+    return { fromSec: Math.floor((nowMs - 7 * 24 * 60 * 60 * 1000) / 1000), toSec: Math.floor(nowMs / 1000) };
   }
-  start.setUTCDate(start.getUTCDate() - 29);
-  return { date_from: isoDate(start), date_to: isoDate(end) };
+  if (period === "30d") {
+    return { fromSec: Math.floor((nowMs - 30 * 24 * 60 * 60 * 1000) / 1000), toSec: Math.floor(nowMs / 1000) };
+  }
+
+  const fromLocal = parseLocalDateAtStart(dateFrom);
+  const toLocal = parseLocalDateAtStart(dateTo);
+  if (fromLocal && toLocal) {
+    const toExclusive = new Date(toLocal);
+    toExclusive.setDate(toExclusive.getDate() + 1);
+    return {
+      fromSec: Math.floor(fromLocal.getTime() / 1000),
+      toSec: Math.floor(toExclusive.getTime() / 1000),
+    };
+  }
+
+  // Fallback: последние 7 суток.
+  return { fromSec: Math.floor((nowMs - 7 * 24 * 60 * 60 * 1000) / 1000), toSec: Math.floor(nowMs / 1000) };
+}
+
+function inLocalWindow(item: TableTennisForecastItem, window: { fromSec: number; toSec: number }): boolean {
+  const ts = item.created_at ?? item.starts_at ?? 0;
+  if (!ts) return false;
+  return ts >= window.fromSec && ts < window.toSec;
 }
 
 const CALC_TABS: Array<{ id: CalcChannel; label: string }> = [
@@ -46,6 +73,7 @@ const CALC_TABS: Array<{ id: CalcChannel; label: string }> = [
   { id: "bot_signals", label: "Сигналы из бота" },
   { id: "vip", label: "Вип канал" },
   { id: "no_ml", label: "Расчёт без ML" },
+  { id: "nn", label: "Аналитика Нейросетью" },
 ];
 
 function formatDateTime(ts: number | null | undefined): string {
@@ -72,6 +100,10 @@ function cleanForecastText(value: string | null | undefined): string {
     .replace(/%/g, "")
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+function betGivenAtTs(item: TableTennisForecastItem): number {
+  return item.created_at ?? item.starts_at ?? 0;
 }
 
 type LoadForecastsResult = {
@@ -146,31 +178,18 @@ export default function StatsCalculator() {
       setError(null);
       setPage(1);
       try {
-        let from: string | undefined;
-        let to: string | undefined;
-        if (period) {
-          const range = getRange(period);
-          from = range.date_from;
-          to = range.date_to;
-        } else if (dateFrom && dateTo) {
-          from = dateFrom;
-          to = dateTo;
-        } else {
-          const range = getRange("7d");
-          from = range.date_from;
-          to = range.date_to;
-        }
         const result = await loadAllForecasts({
           channel,
-          date_from: from,
-          date_to: to,
+          // Фильтруем окно на клиенте по локальному часовому поясу пользователя.
+          // API-период здесь не задаем, чтобы избежать смещения по UTC.
         });
         if (cancelled) return;
+        const window = localWindow(period, dateFrom, dateTo);
         const mapped = result.items.map((it) => ({
           ...it,
           selected: it.status === "hit" || it.status === "miss",
         }));
-        setItems(mapped);
+        setItems(mapped.filter((it) => inLocalWindow(it, window)));
         setOnlyResolved(Boolean(result.only_resolved));
         setForecastPurchaseUrl(result.forecast_purchase_url ?? null);
       } catch (e) {
@@ -228,8 +247,8 @@ export default function StatsCalculator() {
   const sortedItems = useMemo(
     () =>
       [...items].sort((a, b) => {
-        const ta = a.starts_at ?? 0;
-        const tb = b.starts_at ?? 0;
+        const ta = betGivenAtTs(a);
+        const tb = betGivenAtTs(b);
         return sortByStart === "desc" ? tb - ta : ta - tb;
       }),
     [items, sortByStart],
@@ -243,6 +262,15 @@ export default function StatsCalculator() {
 
   const toggleAll = (checked: boolean) => {
     setItems((prev) => prev.map((x) => ({ ...x, selected: checked })));
+  };
+
+  const applyMarksFromStats = () => {
+    setItems((prev) =>
+      prev.map((x) => ({
+        ...x,
+        selected: isBetMarked(x),
+      })),
+    );
   };
 
 
@@ -377,6 +405,14 @@ export default function StatsCalculator() {
             <div className="flex gap-2">
               <button type="button" onClick={() => toggleAll(true)} className="px-3 py-1.5 rounded border border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700 text-sm">Отметить все</button>
               <button type="button" onClick={() => toggleAll(false)} className="px-3 py-1.5 rounded border border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700 text-sm">Снять все</button>
+              <button
+                type="button"
+                onClick={applyMarksFromStats}
+                className="px-3 py-1.5 rounded border border-sky-600/70 bg-sky-900/30 text-sky-200 hover:bg-sky-900/50 text-sm"
+                title="Применить отметки 'Ставил' из статистики к чекбоксам калькулятора"
+              >
+                Подтянуть отметки из статистики
+              </button>
             </div>
           </div>
         </div>
@@ -393,12 +429,13 @@ export default function StatsCalculator() {
                   <tr className="border-b border-slate-700 bg-slate-800/80 text-slate-300">
                   <th className="px-4 py-3 text-left font-medium" />
                   <th className="px-4 py-3 text-left font-medium">Матч</th>
+                  <th className="px-4 py-3 text-left font-medium">Лига</th>
                   <th
                     className="px-4 py-3 text-left font-medium cursor-pointer hover:text-white select-none"
                     onClick={() => setSortByStart((d) => (d === "desc" ? "asc" : "desc"))}
-                    title="Сортировка по дате и времени начала матча"
+                    title="Сортировка по дате и времени, когда прогноз был дан"
                   >
-                    Начало {sortByStart === "desc" ? "↓" : "↑"}
+                    Дата ставки {sortByStart === "desc" ? "↓" : "↑"}
                   </th>
                   <th className="px-4 py-3 text-left font-medium">Прогноз</th>
                   <th className="px-4 py-3 text-left font-medium">Кф для расчёта</th>
@@ -421,7 +458,8 @@ export default function StatsCalculator() {
                         />
                       </td>
                       <td className="px-4 py-3 text-slate-200">{it.home_name} — {it.away_name}</td>
-                      <td className="px-4 py-3 text-slate-400 whitespace-nowrap">{formatDateTime(it.starts_at)}</td>
+                      <td className="px-4 py-3 text-slate-400 whitespace-nowrap">{it.league_name ?? "—"}</td>
+                      <td className="px-4 py-3 text-slate-400 whitespace-nowrap">{formatDateTime(it.created_at ?? it.starts_at)}</td>
                       <td className="px-4 py-3 text-slate-300">{cleanForecastText(it.forecast_text)}</td>
                       <td className="px-4 py-3 text-slate-300 tabular-nums">{getForecastOdds(it).toFixed(2)}</td>
                       <td className="px-4 py-3">

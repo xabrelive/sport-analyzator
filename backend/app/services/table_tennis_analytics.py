@@ -30,12 +30,22 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Пороги no-ML: прогноз только при максимальной уверенности (не на каждый матч).
-CONFIDENCE_THRESHOLD = 0.72           # для сетов — только если уверенность >= 72%
-CONFIDENCE_THRESHOLD_MATCH = 0.75    # для победы в матче — >= 75%
-MIN_MATCHES_FOR_RECOMMENDATION = 3    # минимум матчей у каждого для любых выводов
-MIN_MATCHES_FOR_MATCH_RECOMMENDATION = 6  # для прогноза на матч — больше истории
-MIN_CONFIDENCE_MARGIN = 0.05         # минимальный отрыв лучшего исхода от альтернативы (5%)
+# Пороги no-ML (управляются через .env): сеты/матч, минимум матчей, отрыв.
+CONFIDENCE_THRESHOLD = float(
+    getattr(settings, "betsapi_table_tennis_no_ml_confidence_threshold_set", 0.65) or 0.65
+)  # для сетов
+CONFIDENCE_THRESHOLD_MATCH = float(
+    getattr(settings, "betsapi_table_tennis_no_ml_confidence_threshold_match", 0.65) or 0.65
+)  # для победы в матче
+MIN_MATCHES_FOR_RECOMMENDATION = int(
+    getattr(settings, "betsapi_table_tennis_no_ml_min_matches_for_recommendation", 2) or 2
+)  # минимум матчей у каждого для выводов
+MIN_MATCHES_FOR_MATCH_RECOMMENDATION = int(
+    getattr(settings, "betsapi_table_tennis_no_ml_min_matches_for_match_recommendation", 4) or 4
+)  # для прогноза на матч — больше истории
+MIN_CONFIDENCE_MARGIN = float(
+    getattr(settings, "betsapi_table_tennis_no_ml_min_confidence_margin", 0.03) or 0.03
+)  # минимальный отрыв лучшего исхода от альтернативы
 
 # Окна для статистики.
 RECOMMENDATION_LOOKBACK_DAYS = 180

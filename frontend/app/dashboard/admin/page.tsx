@@ -33,11 +33,14 @@ import {
   postAdminMlRequestFullSync,
   postAdminForecastsClearAll,
   postAdminForecastsClearMl,
+  postAdminForecastsClearNn,
   postAdminForecastsClearNoMl,
   postAdminMlSync,
   postAdminMlSyncLeagues,
   postAdminMlSyncPlayers,
   postAdminMlV2BackfillMatchSets,
+  putAdminApplyNnEnv,
+  putAdminApplyNnEnvAndRestart,
   putAdminTelegramBotInfo,
   putAdminTelegramDispatchConfig,
   sendAdminMessage,
@@ -211,7 +214,7 @@ function DispatchConfigPreview({ cfgText }: { cfgText: string }) {
       .map((s) => {
         const it = (s as Record<string, unknown>) || {};
         const t = String(it.time_msk || "??:??");
-        const src = String(it.source || "no_ml");
+        const src = String(it.source || "paid");
         const count = Number(it.count || 1);
         return `${t} · ${count} шт · source=${src}`;
       })
@@ -241,7 +244,7 @@ function DispatchConfigHelp() {
     <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300 space-y-2">
       <p className="font-medium text-slate-200">Подсказка по ключам расписания</p>
       <p>
-        <span className="text-slate-100">Источники (`source`):</span> <code>no_ml</code> или <code>paid</code>.
+        <span className="text-slate-100">Источники (`source`):</span> <code>paid</code>, <code>no_ml</code> или <code>nn</code>.
       </p>
       <p>
         <span className="text-slate-100">Формат времени:</span> <code>time_msk</code> в виде <code>HH:MM</code> (MSK, 24ч), пример: <code>11:00</code>.
@@ -257,7 +260,7 @@ function DispatchConfigHelp() {
       <p>
         <span className="text-slate-100">NO_ML stream:</span> <code>stream_enabled</code> (boolean),{" "}
         <code>stream_interval_minutes</code> (&gt;=5), <code>stream_group_limit</code> (&gt;=1),{" "}
-        <code>stream_fetch_limit</code> (&gt;=1), <code>stream_source</code> (<code>no_ml</code> | <code>paid</code>).
+        <code>stream_fetch_limit</code> (&gt;=1), <code>stream_source</code> (<code>no_ml</code> | <code>paid</code> | <code>nn</code>).
       </p>
       <p>
         <span className="text-slate-100">Внеочередная отправка:</span> если матч/прогноз появился позже чем за{" "}
@@ -346,6 +349,25 @@ export default function AdminPage() {
   const [mlNoMlStats, setMlNoMlStats] = useState<AdminMlNoMlStats | null>(null);
   const [matchSetsBackfillLoading, setMatchSetsBackfillLoading] = useState(false);
   const [matchSetsBackfillResult, setMatchSetsBackfillResult] = useState<string | null>(null);
+  const [nnEditorCopied, setNnEditorCopied] = useState<string | null>(null);
+  const [nnApplyLoading, setNnApplyLoading] = useState(false);
+  const [nnApplyRestartLoading, setNnApplyRestartLoading] = useState(false);
+  const [nnEditorDraft, setNnEditorDraft] = useState({
+    ml_v2_enable_nn: "true",
+    betsapi_table_tennis_nn_allow_hard_confidence_fallback: "false",
+    betsapi_table_tennis_forecast_tolerance_minutes: "5",
+    betsapi_table_tennis_forecast_window_min_minutes_before: "1",
+    betsapi_table_tennis_forecast_ml_max_minutes_before: "60",
+    betsapi_table_tennis_nn_forecast_interval_sec: "60",
+    betsapi_table_tennis_nn_min_confidence_to_publish: "62",
+    betsapi_table_tennis_nn_min_match_confidence_pct: "66",
+    betsapi_table_tennis_nn_min_set1_confidence_pct: "67",
+    ml_v2_nn_hidden_layers: "128,64",
+    ml_v2_nn_learning_rate: "0.001",
+    ml_v2_nn_alpha: "0.0001",
+    ml_v2_nn_batch_size: "256",
+    ml_v2_nn_max_iter: "120",
+  });
 
   const pageSize = 20;
   const totalPages = useMemo(() => Math.max(1, Math.ceil(usersTotal / pageSize)), [usersTotal]);
@@ -421,6 +443,27 @@ export default function AdminPage() {
   }, [allowed]);
 
   useEffect(() => {
+    const cfg = mlV2Status?.v2_config;
+    if (!cfg) return;
+    setNnEditorDraft({
+      ml_v2_enable_nn: String(Boolean(cfg.ml_v2_enable_nn)),
+      betsapi_table_tennis_nn_allow_hard_confidence_fallback: String(Boolean(cfg.betsapi_table_tennis_nn_allow_hard_confidence_fallback)),
+      betsapi_table_tennis_forecast_tolerance_minutes: String(cfg.betsapi_table_tennis_forecast_tolerance_minutes ?? 5),
+      betsapi_table_tennis_forecast_window_min_minutes_before: String(cfg.betsapi_table_tennis_forecast_window_min_minutes_before ?? 1),
+      betsapi_table_tennis_forecast_ml_max_minutes_before: String(cfg.betsapi_table_tennis_forecast_ml_max_minutes_before ?? 60),
+      betsapi_table_tennis_nn_forecast_interval_sec: String(cfg.betsapi_table_tennis_nn_forecast_interval_sec ?? 60),
+      betsapi_table_tennis_nn_min_confidence_to_publish: String(cfg.betsapi_table_tennis_nn_min_confidence_to_publish ?? 0),
+      betsapi_table_tennis_nn_min_match_confidence_pct: String(cfg.betsapi_table_tennis_nn_min_match_confidence_pct ?? 0),
+      betsapi_table_tennis_nn_min_set1_confidence_pct: String(cfg.betsapi_table_tennis_nn_min_set1_confidence_pct ?? 0),
+      ml_v2_nn_hidden_layers: String(cfg.ml_v2_nn_hidden_layers ?? "128,64"),
+      ml_v2_nn_learning_rate: String(cfg.ml_v2_nn_learning_rate ?? 0.001),
+      ml_v2_nn_alpha: String(cfg.ml_v2_nn_alpha ?? 0.0001),
+      ml_v2_nn_batch_size: String(cfg.ml_v2_nn_batch_size ?? 256),
+      ml_v2_nn_max_iter: String(cfg.ml_v2_nn_max_iter ?? 120),
+    });
+  }, [mlV2Status]);
+
+  useEffect(() => {
     if (!allowed) return;
     const poll = async () => {
       const [progress, v2] = await Promise.all([
@@ -472,6 +515,27 @@ export default function AdminPage() {
       {label}
     </button>
   );
+
+  const nnEnvValues: Record<string, string> = {
+    ML_V2_ENABLE_NN: nnEditorDraft.ml_v2_enable_nn.trim() || "true",
+    BETSAPI_TABLE_TENNIS_NN_ALLOW_HARD_CONFIDENCE_FALLBACK:
+      nnEditorDraft.betsapi_table_tennis_nn_allow_hard_confidence_fallback.trim() || "false",
+    BETSAPI_TABLE_TENNIS_FORECAST_TOLERANCE_MINUTES: nnEditorDraft.betsapi_table_tennis_forecast_tolerance_minutes.trim() || "5",
+    BETSAPI_TABLE_TENNIS_FORECAST_WINDOW_MIN_MINUTES_BEFORE: nnEditorDraft.betsapi_table_tennis_forecast_window_min_minutes_before.trim() || "1",
+    BETSAPI_TABLE_TENNIS_FORECAST_ML_MAX_MINUTES_BEFORE: nnEditorDraft.betsapi_table_tennis_forecast_ml_max_minutes_before.trim() || "60",
+    BETSAPI_TABLE_TENNIS_NN_FORECAST_INTERVAL_SEC: nnEditorDraft.betsapi_table_tennis_nn_forecast_interval_sec.trim() || "60",
+    BETSAPI_TABLE_TENNIS_NN_MIN_CONFIDENCE_TO_PUBLISH: nnEditorDraft.betsapi_table_tennis_nn_min_confidence_to_publish.trim() || "62",
+    BETSAPI_TABLE_TENNIS_NN_MIN_MATCH_CONFIDENCE_PCT: nnEditorDraft.betsapi_table_tennis_nn_min_match_confidence_pct.trim() || "66",
+    BETSAPI_TABLE_TENNIS_NN_MIN_SET1_CONFIDENCE_PCT: nnEditorDraft.betsapi_table_tennis_nn_min_set1_confidence_pct.trim() || "67",
+    ML_V2_NN_HIDDEN_LAYERS: nnEditorDraft.ml_v2_nn_hidden_layers.trim() || "128,64",
+    ML_V2_NN_LEARNING_RATE: nnEditorDraft.ml_v2_nn_learning_rate.trim() || "0.001",
+    ML_V2_NN_ALPHA: nnEditorDraft.ml_v2_nn_alpha.trim() || "0.0001",
+    ML_V2_NN_BATCH_SIZE: nnEditorDraft.ml_v2_nn_batch_size.trim() || "256",
+    ML_V2_NN_MAX_ITER: nnEditorDraft.ml_v2_nn_max_iter.trim() || "120",
+  };
+  const nnEnvBlock = Object.entries(nnEnvValues)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n");
 
   return (
     <div className="p-4 md:p-6">
@@ -872,12 +936,208 @@ export default function AdminPage() {
               <p>Данных во входе обучения: {(Number(mlV2Status.meta?.ml_v2_last_retrain_rows || 0)).toLocaleString()}</p>
               <p>KPI: match={(Number(mlV2Status.kpi?.match_hit_rate || 0) * 100).toFixed(2)}%, set1={(Number(mlV2Status.kpi?.set1_hit_rate || 0) * 100).toFixed(2)}%, sample={Number(mlV2Status.kpi?.sample_size || 0).toLocaleString()}</p>
               {mlV2Status.v2_config && (
-                <p className="mt-2 pt-2 border-t border-slate-600/50">
-                  v2: experience_regimes={String(mlV2Status.v2_config.ml_v2_use_experience_regimes)}, confidence_filter_min_pct={mlV2Status.v2_config.betsapi_table_tennis_v2_confidence_filter_min_pct || 0}, league_upset_cap={mlV2Status.v2_config.ml_v2_train_max_league_upset_rate}
-                  {mlV2Status.v2_meta && (mlV2Status.v2_meta as { experience_regimes?: boolean; bucket_train_counts?: Record<number, number> }).experience_regimes
-                    ? ` · bucket counts: ${JSON.stringify((mlV2Status.v2_meta as { bucket_train_counts?: Record<number, number> }).bucket_train_counts ?? {})}`
-                    : null}
-                </p>
+                <div className="mt-2 pt-2 border-t border-slate-600/50 space-y-2">
+                  <p className="text-slate-200 font-medium">Конфигурация расчета</p>
+                  <div className="grid gap-2 lg:grid-cols-2">
+                    <div className="rounded border border-slate-700/70 bg-slate-900/50 p-2">
+                      <p className="text-slate-200 font-medium">ML v2</p>
+                      <p>experience_regimes: {String(mlV2Status.v2_config.ml_v2_use_experience_regimes)}</p>
+                      <p>confidence_filter_min_pct: {mlV2Status.v2_config.betsapi_table_tennis_v2_confidence_filter_min_pct || 0}</p>
+                      <p>league_upset_cap: {mlV2Status.v2_config.ml_v2_train_max_league_upset_rate}</p>
+                    </div>
+                    <div className="rounded border border-fuchsia-700/50 bg-fuchsia-950/20 p-2">
+                      <p className="text-fuchsia-200 font-medium">NN</p>
+                      <p>enabled: {String(Boolean(mlV2Status.v2_config.ml_v2_enable_nn))}</p>
+                      <p>interval_sec: {mlV2Status.v2_config.betsapi_table_tennis_nn_forecast_interval_sec ?? 60}</p>
+                      <p>publish_min_pct: {mlV2Status.v2_config.betsapi_table_tennis_nn_min_confidence_to_publish ?? 0}</p>
+                      <p>match_min_pct: {mlV2Status.v2_config.betsapi_table_tennis_nn_min_match_confidence_pct ?? 0}</p>
+                      <p>set1_min_pct: {mlV2Status.v2_config.betsapi_table_tennis_nn_min_set1_confidence_pct ?? 0}</p>
+                      <p>allow_hard_fallback: {String(Boolean(mlV2Status.v2_config.betsapi_table_tennis_nn_allow_hard_confidence_fallback))}</p>
+                      <p>layers: {mlV2Status.v2_config.ml_v2_nn_hidden_layers ?? "—"}</p>
+                      <p>learning_rate: {mlV2Status.v2_config.ml_v2_nn_learning_rate ?? 0}</p>
+                      <p>alpha: {mlV2Status.v2_config.ml_v2_nn_alpha ?? 0}</p>
+                      <p>batch_size: {mlV2Status.v2_config.ml_v2_nn_batch_size ?? 0}</p>
+                      <p>max_iter: {mlV2Status.v2_config.ml_v2_nn_max_iter ?? 0}</p>
+                    </div>
+                  </div>
+                  <div className="rounded border border-fuchsia-700/40 bg-fuchsia-950/10 p-3 space-y-2">
+                    <p className="text-fuchsia-200 font-medium">Редактор NN настроек (.env)</p>
+                    <p className="text-slate-400">
+                      Измените значения ниже, затем скопируйте блок и вставьте в <code className="bg-slate-800 px-1 rounded">.env</code>. После изменения перезапустите контейнеры.
+                    </p>
+                    <div className="grid gap-2 md:grid-cols-2">
+                      <label>
+                        <span className="text-slate-300">ML_V2_ENABLE_NN</span>
+                        <select
+                          value={nnEditorDraft.ml_v2_enable_nn}
+                          onChange={(e) => setNnEditorDraft((p) => ({ ...p, ml_v2_enable_nn: e.target.value }))}
+                          className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white"
+                        >
+                          <option value="true">true</option>
+                          <option value="false">false</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span className="text-slate-300">BETSAPI_TABLE_TENNIS_NN_ALLOW_HARD_CONFIDENCE_FALLBACK</span>
+                        <select
+                          value={nnEditorDraft.betsapi_table_tennis_nn_allow_hard_confidence_fallback}
+                          onChange={(e) =>
+                            setNnEditorDraft((p) => ({
+                              ...p,
+                              betsapi_table_tennis_nn_allow_hard_confidence_fallback: e.target.value,
+                            }))
+                          }
+                          className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white"
+                        >
+                          <option value="false">false</option>
+                          <option value="true">true</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span className="text-slate-300">ML_V2_NN_HIDDEN_LAYERS</span>
+                        <input value={nnEditorDraft.ml_v2_nn_hidden_layers} onChange={(e) => setNnEditorDraft((p) => ({ ...p, ml_v2_nn_hidden_layers: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">ML_V2_NN_LEARNING_RATE</span>
+                        <input value={nnEditorDraft.ml_v2_nn_learning_rate} onChange={(e) => setNnEditorDraft((p) => ({ ...p, ml_v2_nn_learning_rate: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">ML_V2_NN_ALPHA</span>
+                        <input value={nnEditorDraft.ml_v2_nn_alpha} onChange={(e) => setNnEditorDraft((p) => ({ ...p, ml_v2_nn_alpha: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">ML_V2_NN_BATCH_SIZE</span>
+                        <input value={nnEditorDraft.ml_v2_nn_batch_size} onChange={(e) => setNnEditorDraft((p) => ({ ...p, ml_v2_nn_batch_size: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">ML_V2_NN_MAX_ITER</span>
+                        <input value={nnEditorDraft.ml_v2_nn_max_iter} onChange={(e) => setNnEditorDraft((p) => ({ ...p, ml_v2_nn_max_iter: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">BETSAPI_TABLE_TENNIS_NN_FORECAST_INTERVAL_SEC</span>
+                        <input value={nnEditorDraft.betsapi_table_tennis_nn_forecast_interval_sec} onChange={(e) => setNnEditorDraft((p) => ({ ...p, betsapi_table_tennis_nn_forecast_interval_sec: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">BETSAPI_TABLE_TENNIS_NN_MIN_CONFIDENCE_TO_PUBLISH</span>
+                        <input value={nnEditorDraft.betsapi_table_tennis_nn_min_confidence_to_publish} onChange={(e) => setNnEditorDraft((p) => ({ ...p, betsapi_table_tennis_nn_min_confidence_to_publish: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">BETSAPI_TABLE_TENNIS_NN_MIN_MATCH_CONFIDENCE_PCT</span>
+                        <input value={nnEditorDraft.betsapi_table_tennis_nn_min_match_confidence_pct} onChange={(e) => setNnEditorDraft((p) => ({ ...p, betsapi_table_tennis_nn_min_match_confidence_pct: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">BETSAPI_TABLE_TENNIS_NN_MIN_SET1_CONFIDENCE_PCT</span>
+                        <input value={nnEditorDraft.betsapi_table_tennis_nn_min_set1_confidence_pct} onChange={(e) => setNnEditorDraft((p) => ({ ...p, betsapi_table_tennis_nn_min_set1_confidence_pct: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">BETSAPI_TABLE_TENNIS_FORECAST_WINDOW_MIN_MINUTES_BEFORE</span>
+                        <input value={nnEditorDraft.betsapi_table_tennis_forecast_window_min_minutes_before} onChange={(e) => setNnEditorDraft((p) => ({ ...p, betsapi_table_tennis_forecast_window_min_minutes_before: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">BETSAPI_TABLE_TENNIS_FORECAST_ML_MAX_MINUTES_BEFORE</span>
+                        <input value={nnEditorDraft.betsapi_table_tennis_forecast_ml_max_minutes_before} onChange={(e) => setNnEditorDraft((p) => ({ ...p, betsapi_table_tennis_forecast_ml_max_minutes_before: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                      <label>
+                        <span className="text-slate-300">BETSAPI_TABLE_TENNIS_FORECAST_TOLERANCE_MINUTES</span>
+                        <input value={nnEditorDraft.betsapi_table_tennis_forecast_tolerance_minutes} onChange={(e) => setNnEditorDraft((p) => ({ ...p, betsapi_table_tennis_forecast_tolerance_minutes: e.target.value }))} className="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-white" />
+                      </label>
+                    </div>
+                    <textarea
+                      value={nnEnvBlock}
+                      readOnly
+                      rows={14}
+                      className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-200"
+                    />
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        disabled={nnApplyLoading}
+                        onClick={async () => {
+                          try {
+                            setNnApplyLoading(true);
+                            const r = await putAdminApplyNnEnv(nnEnvValues);
+                            setNnEditorCopied(`${r.message} (${r.updated} изменено, ${r.appended} добавлено)`);
+                          } catch (e) {
+                            setNnEditorCopied(e instanceof Error ? e.message : "Ошибка применения .env");
+                          } finally {
+                            setNnApplyLoading(false);
+                          }
+                        }}
+                        className="rounded border border-emerald-600/70 px-2 py-1 text-xs text-emerald-200 hover:bg-emerald-950/30 disabled:opacity-50"
+                      >
+                        {nnApplyLoading ? "Применение..." : "Применить в .env автоматически"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={nnApplyRestartLoading}
+                        onClick={async () => {
+                          if (!confirm("Применить NN настройки в .env и перезапустить backend + tt_workers?")) return;
+                          try {
+                            setNnApplyRestartLoading(true);
+                            const r = await putAdminApplyNnEnvAndRestart(nnEnvValues);
+                            setNnEditorCopied(`${r.message} (${r.updated} изменено, ${r.appended} добавлено)`);
+                          } catch (e) {
+                            setNnEditorCopied(e instanceof Error ? e.message : "Ошибка применения/перезапуска");
+                          } finally {
+                            setNnApplyRestartLoading(false);
+                          }
+                        }}
+                        className="rounded border border-amber-600/70 px-2 py-1 text-xs text-amber-200 hover:bg-amber-950/30 disabled:opacity-50"
+                      >
+                        {nnApplyRestartLoading ? "Применение + рестарт..." : "Применить и перезапустить backend+tt_workers"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            await navigator.clipboard.writeText(nnEnvBlock);
+                            setNnEditorCopied("Блок .env скопирован");
+                          } catch {
+                            setNnEditorCopied("Не удалось скопировать автоматически");
+                          }
+                        }}
+                        className="rounded border border-fuchsia-600/70 px-2 py-1 text-xs text-fuchsia-200 hover:bg-fuchsia-950/40"
+                      >
+                        Скопировать блок .env
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const cfg = mlV2Status.v2_config;
+                          if (!cfg) return;
+                          setNnEditorDraft({
+                            ml_v2_enable_nn: String(Boolean(cfg.ml_v2_enable_nn)),
+                            betsapi_table_tennis_nn_allow_hard_confidence_fallback: String(
+                              Boolean(cfg.betsapi_table_tennis_nn_allow_hard_confidence_fallback)
+                            ),
+                            betsapi_table_tennis_forecast_tolerance_minutes: String(cfg.betsapi_table_tennis_forecast_tolerance_minutes ?? 5),
+                            betsapi_table_tennis_forecast_window_min_minutes_before: String(cfg.betsapi_table_tennis_forecast_window_min_minutes_before ?? 1),
+                            betsapi_table_tennis_forecast_ml_max_minutes_before: String(cfg.betsapi_table_tennis_forecast_ml_max_minutes_before ?? 60),
+                            betsapi_table_tennis_nn_forecast_interval_sec: String(cfg.betsapi_table_tennis_nn_forecast_interval_sec ?? 60),
+                            betsapi_table_tennis_nn_min_confidence_to_publish: String(cfg.betsapi_table_tennis_nn_min_confidence_to_publish ?? 0),
+                            betsapi_table_tennis_nn_min_match_confidence_pct: String(cfg.betsapi_table_tennis_nn_min_match_confidence_pct ?? 0),
+                            betsapi_table_tennis_nn_min_set1_confidence_pct: String(cfg.betsapi_table_tennis_nn_min_set1_confidence_pct ?? 0),
+                            ml_v2_nn_hidden_layers: String(cfg.ml_v2_nn_hidden_layers ?? "128,64"),
+                            ml_v2_nn_learning_rate: String(cfg.ml_v2_nn_learning_rate ?? 0.001),
+                            ml_v2_nn_alpha: String(cfg.ml_v2_nn_alpha ?? 0.0001),
+                            ml_v2_nn_batch_size: String(cfg.ml_v2_nn_batch_size ?? 256),
+                            ml_v2_nn_max_iter: String(cfg.ml_v2_nn_max_iter ?? 120),
+                          });
+                          setNnEditorCopied("Черновик сброшен к текущим значениям");
+                        }}
+                        className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-300 hover:bg-slate-900/60"
+                      >
+                        Сбросить к текущим
+                      </button>
+                      {nnEditorCopied && <span className="text-xs text-slate-400">{nnEditorCopied}</span>}
+                    </div>
+                  </div>
+                  {mlV2Status.v2_meta && (mlV2Status.v2_meta as { experience_regimes?: boolean; bucket_train_counts?: Record<number, number> }).experience_regimes ? (
+                    <p className="text-slate-400">
+                      bucket counts: {JSON.stringify((mlV2Status.v2_meta as { bucket_train_counts?: Record<number, number> }).bucket_train_counts ?? {})}
+                    </p>
+                  ) : null}
+                </div>
               )}
         </div>
           )}
@@ -1112,6 +1372,22 @@ export default function AdminPage() {
             title="Удалить только no_ml прогнозы и no_ml статистику."
           >
             Очистить no-ML статистику
+          </button>
+          <button
+            type="button"
+            onClick={async () => {
+              if (!confirm("Очистить только NN прогнозы и NN статистику? ML/no_ml не будут затронуты.")) return;
+              try {
+                const r = await postAdminForecastsClearNn();
+                setMlAuditResult(r.message || `Готово: ${JSON.stringify(r.deleted ?? {})}`);
+              } catch (e) {
+                setMlAuditResult(e instanceof Error ? e.message : "Ошибка");
+              }
+            }}
+            className="rounded border border-violet-700/70 px-2 py-1 text-xs text-violet-300 hover:bg-violet-950/40"
+            title="Удалить только nn прогнозы и nn статистику."
+          >
+            Очистить NN статистику
           </button>
           {mlSyncPlayersResult && <span className="text-xs text-slate-400">{mlSyncPlayersResult}</span>}
           {mlAuditResult && <span className="text-xs text-slate-400">{mlAuditResult}</span>}
@@ -1626,8 +1902,8 @@ export default function AdminPage() {
                       className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
                     />
                     <select
-                      value={String(slot.source ?? "no_ml")}
-                      title="Источник прогнозов для слота: no_ml или paid."
+                      value={String(slot.source ?? "paid")}
+                      title="Источник прогнозов для слота: paid, no_ml или nn."
                       onChange={(e) =>
                         updateDispatchCfg((cfg) => {
                           const free = (cfg.free as Record<string, unknown>) || {};
@@ -1641,6 +1917,7 @@ export default function AdminPage() {
                     >
                       <option value="no_ml">no_ml</option>
                       <option value="paid">paid</option>
+                      <option value="nn">nn</option>
                     </select>
                     <input
                       type="number"
@@ -1684,7 +1961,7 @@ export default function AdminPage() {
                   updateDispatchCfg((cfg) => {
                     const free = (cfg.free as Record<string, unknown>) || {};
                     const slots = Array.isArray(free.slots) ? ([...free.slots] as Array<Record<string, unknown>>) : [];
-                    slots.push({ time_msk: "11:00", source: "no_ml", count: 1 });
+                    slots.push({ time_msk: "11:00", source: "paid", count: 1 });
                     free.slots = slots;
                     cfg.free = free;
                   })
@@ -1777,8 +2054,8 @@ export default function AdminPage() {
                       className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
                     />
                     <select
-                      value={String(slot.source ?? "no_ml")}
-                      title="Источник прогнозов для слота: no_ml или paid."
+                      value={String(slot.source ?? "paid")}
+                      title="Источник прогнозов для слота: paid, no_ml или nn."
                       onChange={(e) =>
                         updateDispatchCfg((cfg) => {
                           const vip = (cfg.vip as Record<string, unknown>) || {};
@@ -1792,6 +2069,7 @@ export default function AdminPage() {
                     >
                       <option value="no_ml">no_ml</option>
                       <option value="paid">paid</option>
+                      <option value="nn">nn</option>
                     </select>
                     <input
                       type="number"
@@ -1986,10 +2264,10 @@ export default function AdminPage() {
                     className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-white"
                   />
                 </label>
-                <label title="Источник для потока: no_ml или paid.">
+                <label title="Источник для потока: no_ml, paid или nn.">
                   <span className="inline-flex items-center gap-1">
                     source
-                    <HintBadge text="Источник прогнозов: no_ml или paid." />
+                    <HintBadge text="Источник прогнозов: no_ml, paid или nn." />
                   </span>
                   <select
                     value={String((dispatchCfgObj.no_ml_channel as Record<string, unknown> | undefined)?.stream_source ?? "no_ml")}
@@ -2004,6 +2282,7 @@ export default function AdminPage() {
                   >
                     <option value="no_ml">no_ml</option>
                     <option value="paid">paid</option>
+                    <option value="nn">nn</option>
                   </select>
                 </label>
               </div>
@@ -2025,8 +2304,8 @@ export default function AdminPage() {
               free: {
                 enabled: true,
                 slots: [
-                  { time_msk: "11:00", source: "no_ml", count: 1 },
-                  { time_msk: "15:00", source: "no_ml", count: 1 },
+                  { time_msk: "11:00", source: "paid", count: 1 },
+                  { time_msk: "15:00", source: "nn", count: 1 },
                   { time_msk: "17:00", source: "no_ml", count: 1 },
                 ],
                 min_lead_minutes: 60,
@@ -2035,8 +2314,8 @@ export default function AdminPage() {
               vip: {
                 enabled: true,
                 slots: [
-                  { time_msk: "12:00", source: "no_ml", count: 3 },
-                  { time_msk: "16:00", source: "no_ml", count: 3 },
+                  { time_msk: "12:00", source: "paid", count: 3 },
+                  { time_msk: "16:00", source: "nn", count: 3 },
                   { time_msk: "19:00", source: "no_ml", count: 3 },
                 ],
                 min_lead_minutes: 60,
@@ -2046,7 +2325,7 @@ export default function AdminPage() {
                 enabled: true,
                 stream_enabled: true,
                 stream_interval_minutes: 30,
-                stream_source: "no_ml",
+                stream_source: "nn",
                 stream_group_limit: 20,
                 stream_fetch_limit: 500,
                 min_lead_minutes: 60,

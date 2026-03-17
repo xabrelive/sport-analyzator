@@ -237,6 +237,14 @@ export function DashboardSidebar({
               {Icons.stats}
               Аналитика без ML
             </Link>
+            <Link
+              href="/dashboard/table-tennis/line-nn"
+              className={subLinkClasses(isActive("/dashboard/table-tennis/line-nn"))}
+              onClick={onNavigate}
+            >
+              {Icons.stats}
+              Аналитика Нейросетью
+            </Link>
           </div>
         )}
 

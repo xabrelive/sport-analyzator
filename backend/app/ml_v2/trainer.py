@@ -16,6 +16,9 @@ import numpy as np
 import pandas as pd
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.metrics import accuracy_score, log_loss, brier_score_loss
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from app.config import settings
 from app.ml_v2.calibration import BinaryProbabilityCalibrator
@@ -481,6 +484,54 @@ def _metrics(
     }
 
 
+def _fit_nn_binary(
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    target: str,
+    feature_cols: list[str],
+) -> Pipeline:
+    """Train a compact MLP pipeline for prematch NN channel."""
+    X_train = train[feature_cols].astype(float)
+    y_train = train[target].astype(int)
+    X_val = val[feature_cols].astype(float)
+    y_val = val[target].astype(int)
+
+    hidden = tuple(
+        int(x.strip())
+        for x in str(getattr(settings, "ml_v2_nn_hidden_layers", "128,64")).split(",")
+        if x.strip().isdigit()
+    ) or (128, 64)
+    clf = MLPClassifier(
+        hidden_layer_sizes=hidden,
+        activation="relu",
+        solver="adam",
+        alpha=float(getattr(settings, "ml_v2_nn_alpha", 1e-4)),
+        learning_rate_init=float(getattr(settings, "ml_v2_nn_learning_rate", 1e-3)),
+        batch_size=int(getattr(settings, "ml_v2_nn_batch_size", 256)),
+        max_iter=int(getattr(settings, "ml_v2_nn_max_iter", 120)),
+        early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=10,
+        random_state=42,
+    )
+    pipe = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("mlp", clf),
+        ]
+    )
+    pipe.fit(X_train, y_train)
+    try:
+        p_val = pipe.predict_proba(X_val)[:, 1]
+        ll = float(log_loss(y_val.values, np.clip(p_val, 1e-9, 1 - 1e-9)))
+        acc = float(accuracy_score(y_val.values, (p_val >= 0.5).astype(int)))
+        logger.info("NN v2 train [%s]: val_logloss=%.6f val_acc=%.4f", target, ll, acc)
+        print(f"NN v2 train [{target}] val_logloss={ll:.6f} val_acc={acc:.4f}", flush=True)
+    except Exception as exc:
+        logger.warning("NN v2 metrics [%s] failed: %s", target, exc)
+    return pipe
+
+
 def retrain_models_v2(min_rows: int = 1000) -> dict[str, Any]:
     ensure_schema()
     df = _load_feature_frame()
@@ -631,6 +682,29 @@ def retrain_models_v2(min_rows: int = 1000) -> dict[str, Any]:
         print("ML v2 experience regimes: bucket models saved (tt_ml_v2_b1..b4_*). Inference will use them when present.", flush=True)
     else:
         print("ML v2 experience regimes: disabled. Set ML_V2_USE_EXPERIENCE_REGIMES=true and retrain to get 4 bucket models (rookie/low/mid/pro).", flush=True)
+
+    nn_enabled = bool(getattr(settings, "ml_v2_enable_nn", True))
+    if nn_enabled:
+        nn_match = _fit_nn_binary(train, val, "target_match", feature_cols_used)
+        nn_set1 = _fit_nn_binary(train, val, "target_set1", feature_cols_used)
+        nn_prefix = model_dir / "tt_nn_v2"
+        joblib.dump(nn_match, f"{nn_prefix}_match.joblib")
+        joblib.dump(nn_set1, f"{nn_prefix}_set1.joblib")
+        with open(f"{nn_prefix}_meta.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "version": "nn_v2",
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                    "features": feature_cols_used,
+                    "n_features": int(len(feature_cols_used)),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        print(f"NN v2 models saved: {nn_prefix}_match/set1.joblib", flush=True)
+    else:
+        print("NN v2 training disabled (ML_V2_ENABLE_NN=false).", flush=True)
 
     metrics = {
         "match": {

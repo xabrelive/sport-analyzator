@@ -344,6 +344,7 @@ export interface TableTennisLineEvent {
   forecast?: string | null;
   forecast_ml?: string | null;
   forecast_no_ml?: string | null;
+  forecast_nn?: string | null;
 }
 
 export interface TableTennisLeague {
@@ -387,6 +388,7 @@ export interface TableTennisLiveEvent {
   forecast?: string | null;
   forecast_ml?: string | null;
   forecast_no_ml?: string | null;
+  forecast_nn?: string | null;
   sets_score?: string | null; // общий счёт по сетам, например "2-1"
   sets?: Record<string, { home: string; away: string }>; // счёт по каждому сету
   last_score_changed_at?: number | null;
@@ -1475,6 +1477,20 @@ export interface AdminMlV2Status {
     ml_v2_experience_regime_min_train: number;
     betsapi_table_tennis_v2_confidence_filter_min_pct: number;
     ml_v2_train_max_league_upset_rate: number;
+    ml_v2_enable_nn?: boolean;
+    betsapi_table_tennis_forecast_tolerance_minutes?: number;
+    betsapi_table_tennis_forecast_window_min_minutes_before?: number;
+    betsapi_table_tennis_forecast_ml_max_minutes_before?: number;
+    betsapi_table_tennis_nn_forecast_interval_sec?: number;
+    betsapi_table_tennis_nn_min_confidence_to_publish?: number;
+    betsapi_table_tennis_nn_min_match_confidence_pct?: number;
+    betsapi_table_tennis_nn_min_set1_confidence_pct?: number;
+    betsapi_table_tennis_nn_allow_hard_confidence_fallback?: boolean;
+    ml_v2_nn_hidden_layers?: string;
+    ml_v2_nn_learning_rate?: number;
+    ml_v2_nn_alpha?: number;
+    ml_v2_nn_batch_size?: number;
+    ml_v2_nn_max_iter?: number;
   };
   v2_meta?: Record<string, unknown>;
 }
@@ -1625,6 +1641,52 @@ export async function postAdminForecastsClearNoMl(): Promise<{
   const res = await fetch(apiUrl("admin/forecasts/clear-no-ml"), {
     method: "POST",
     headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function postAdminForecastsClearNn(): Promise<{
+  ok: boolean;
+  message: string;
+  deleted: Record<string, number>;
+}> {
+  const res = await fetch(apiUrl("admin/forecasts/clear-nn"), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function putAdminApplyNnEnv(values: Record<string, string>): Promise<{
+  ok: boolean;
+  message: string;
+  path: string;
+  updated: number;
+  appended: number;
+}> {
+  const res = await fetch(apiUrl("admin/nn-config/apply-env"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ values }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
+  return res.json();
+}
+
+export async function putAdminApplyNnEnvAndRestart(values: Record<string, string>): Promise<{
+  ok: boolean;
+  message: string;
+  path: string;
+  updated: number;
+  appended: number;
+  restart_output: string;
+}> {
+  const res = await fetch(apiUrl("admin/nn-config/apply-env-and-restart"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ values }),
   });
   if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { detail?: string }).detail || res.statusText);
   return res.json();
